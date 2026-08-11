@@ -1,0 +1,24 @@
+# Python bytecode and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Runtime configuration and generated alarm data
+config.json
+events/
+*.log
+gui-*.png
+
+# Local models and video sources
+*.pt
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.flv
+*.wmv
+
+# IDE files
+.idea/
+.vscode/
