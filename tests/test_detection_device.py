@@ -6,6 +6,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 from detection_engine import DetectionEngine
+from inference_profiles import InferencePolicy
 from models import ZoneDefinition
 
 
@@ -52,6 +53,128 @@ class DetectionDeviceTests(unittest.TestCase):
             verbose=False,
             device="cuda:1",
         )
+
+    def test_process_can_skip_rendering_for_benchmarking(self) -> None:
+        model = Mock(return_value=[object()])
+        tracker = Mock()
+        tracker.update.return_value = EmptyDetections()
+        frame = np.zeros((16, 16, 3), dtype=np.uint8)
+
+        with (
+            patch("detection_engine.YOLO", return_value=model),
+            patch.object(DetectionEngine, "_new_tracker", return_value=tracker),
+            patch("detection_engine.sv.Detections.from_ultralytics", return_value=object()),
+            patch.object(DetectionEngine, "_annotate") as annotate,
+        ):
+            engine = DetectionEngine("model.pt", [], "cpu")
+            output, events = engine.process(frame, 0.0, "test.mp4", render=False)
+
+        self.assertIs(output, frame)
+        self.assertEqual(events, [])
+        annotate.assert_not_called()
+
+    def test_low_power_mode_detects_every_fourth_frame_and_uses_predictions(self) -> None:
+        model = Mock(return_value=[object()])
+        tracker = Mock()
+        detector_detections = EmptyDetections()
+        predicted_detections = TrackedDetections([10, 10, 30, 50])
+        tracker.update.return_value = detector_detections
+        tracker.tracked_objects = predicted_detections
+        policy = InferencePolicy(
+            model_path="model_openvino",
+            device="cpu",
+            imgsz=512,
+            detector_interval=4,
+            label="CPU 低功耗模式",
+        )
+        frame = np.zeros((120, 120, 3), dtype=np.uint8)
+
+        with (
+            patch("detection_engine.YOLO", return_value=model),
+            patch.object(DetectionEngine, "_new_tracker", return_value=tracker),
+            patch(
+                "detection_engine.sv.Detections.from_ultralytics",
+                return_value=object(),
+            ),
+        ):
+            engine = DetectionEngine("model.pt", [], "cpu", policy)
+            for index in range(5):
+                engine.process(frame, float(index), "test.mp4")
+
+        self.assertEqual(model.call_count, 2)
+        self.assertEqual(model.call_args.kwargs["imgsz"], 512)
+        self.assertEqual(model.call_args.kwargs["device"], "cpu")
+        self.assertEqual(tracker.update.call_count, 2)
+        self.assertEqual(
+            [call.kwargs["timestamp"] for call in tracker.update.call_args_list],
+            [0.0, 4.0],
+        )
+
+    def test_low_power_mode_keeps_zone_entry_and_emits_dwell_alarm(self) -> None:
+        model = Mock(return_value=[object()])
+        tracker = Mock()
+        tracked = TrackedDetections([10, 10, 30, 50], track_id=7)
+        tracker.update.return_value = tracked
+        tracker.tracked_objects = tracked
+        policy = InferencePolicy("model_openvino", "cpu", imgsz=512, detector_interval=4)
+        zone = ZoneDefinition(
+            name="警戒区",
+            polygon=[[0, 0], [100, 0], [100, 100], [0, 100]],
+            closed=True,
+            dwell_seconds=2.0,
+            cooldown_seconds=30.0,
+        )
+        frame = np.zeros((120, 120, 3), dtype=np.uint8)
+
+        with (
+            patch("detection_engine.YOLO", return_value=model),
+            patch.object(DetectionEngine, "_new_tracker", return_value=tracker),
+            patch("detection_engine.sv.Detections.from_ultralytics", return_value=object()),
+        ):
+            engine = DetectionEngine("model.pt", [zone], "cpu", policy)
+            events = []
+            for timestamp in range(5):
+                _, frame_events = engine.process(frame, float(timestamp), "test.mp4")
+                events.extend(frame_events)
+
+        self.assertEqual(tracker.update.call_count, 2)
+        self.assertEqual(engine.entry_times, {("警戒区", 7): 0.0})
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].track_id, "7")
+        self.assertEqual(events[0].entered_at_seconds, 0.0)
+        self.assertEqual(events[0].alarm_at_seconds, 2.0)
+
+    def test_low_power_tracking_reset_restarts_detector_cadence(self) -> None:
+        model = Mock(return_value=[object()])
+        first_tracker = Mock()
+        second_tracker = Mock()
+        first_tracker.update.return_value = EmptyDetections()
+        second_tracker.update.return_value = EmptyDetections()
+        first_tracker.tracked_objects = EmptyDetections()
+        second_tracker.tracked_objects = EmptyDetections()
+        policy = InferencePolicy("model_openvino", "cpu", imgsz=512, detector_interval=4)
+        frame = np.zeros((16, 16, 3), dtype=np.uint8)
+
+        with (
+            patch("detection_engine.YOLO", return_value=model),
+            patch.object(
+                DetectionEngine,
+                "_new_tracker",
+                side_effect=[first_tracker, second_tracker],
+            ),
+            patch(
+                "detection_engine.sv.Detections.from_ultralytics",
+                return_value=object(),
+            ),
+        ):
+            engine = DetectionEngine("model.pt", [], "cpu", policy)
+            engine.process(frame, 0.0, "test.mp4")
+            engine.process(frame, 1.0, "test.mp4")
+            engine.reset_tracking()
+            engine.process(frame, 2.0, "test.mp4")
+
+        self.assertEqual(model.call_count, 2)
+        second_tracker.update.assert_called_once()
 
     def test_format_elapsed_uses_seconds_and_milliseconds(self) -> None:
         self.assertEqual(DetectionEngine._format_elapsed(0), "0.000s")

@@ -10,6 +10,7 @@ from PySide6.QtCore import QThread, Signal
 
 from alarm_service import AlarmPlayer, EventStore
 from detection_engine import DetectionEngine
+from inference_profiles import InferencePolicy
 from models import AlarmEvent, ZoneDefinition
 from video_source import VideoSource, VideoSourceSpec
 
@@ -30,12 +31,14 @@ class DetectionWorker(QThread):
         device: str,
         zones: list[ZoneDefinition],
         event_store: EventStore,
+        policy: InferencePolicy | None = None,
         parent: Optional[object] = None,
     ) -> None:
         super().__init__(parent)
         self.spec = spec
         self.model_path = model_path
         self.device = device
+        self.policy = policy
         self._zones = [ZoneDefinition.from_dict(zone.to_dict()) for zone in zones]
         self.event_store = event_store
         self.alarm_player = AlarmPlayer()
@@ -88,8 +91,18 @@ class DetectionWorker(QThread):
         failed = False
 
         try:
-            engine = DetectionEngine(self.model_path, self._zones, self.device)
-            self.status_changed.emit(f"检测运行中，推理设备: {self.device}")
+            engine = (
+                DetectionEngine(self.model_path, self._zones, self.device)
+                if self.policy is None
+                else DetectionEngine(
+                    self.model_path,
+                    self._zones,
+                    self.device,
+                    self.policy,
+                )
+            )
+            mode_label = self.policy.label if self.policy is not None else "标准模式"
+            self.status_changed.emit(f"检测运行中：{mode_label}，推理设备: {self.device}")
             while not self._stop_event.is_set():
                 with self._control_lock:
                     paused = self._paused

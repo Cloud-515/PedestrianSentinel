@@ -2,7 +2,13 @@
 __pycache__/
 *.py[cod]
 .venv/
+.venv-*/
 venv/
+
+# Local OpenVINO export, calibration data, and benchmark output
+artifacts/
+benchmarks/
+models/
 
 # Runtime configuration and generated alarm data
 config.json

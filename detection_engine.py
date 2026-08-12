@@ -12,6 +12,7 @@ import supervision as sv
 from trackers import ByteTrackTracker
 from ultralytics import YOLO
 
+from inference_profiles import InferencePolicy
 from models import AlarmEvent, ZoneDefinition
 
 logger = logging.getLogger(__name__)
@@ -23,14 +24,22 @@ class DetectionEngine:
         model_path: str,
         zones: list[ZoneDefinition],
         device: str,
+        policy: InferencePolicy | None = None,
     ) -> None:
-        logger.info("Loading model: %s on device: %s", model_path, device)
-        self.model = YOLO(model_path)
-        self.device = device
+        self.policy = policy or InferencePolicy(model_path=model_path, device=device)
+        logger.info(
+            "Loading model: %s on device: %s (%s)",
+            self.policy.model_path,
+            self.policy.device,
+            self.policy.label,
+        )
+        self.model = YOLO(self.policy.model_path)
+        self.device = self.policy.device
         self.tracker = self._new_tracker()
         self.zones = [ZoneDefinition.from_dict(zone.to_dict()) for zone in zones]
         self.entry_times: dict[tuple[str, Hashable], float] = {}
         self.last_alarm_times: dict[tuple[str, Hashable], float] = {}
+        self._processed_frames = 0
 
     @staticmethod
     def _new_tracker() -> ByteTrackTracker:
@@ -57,6 +66,7 @@ class DetectionEngine:
         self.tracker = self._new_tracker()
         self.entry_times.clear()
         self.last_alarm_times.clear()
+        self._processed_frames = 0
 
     def process(
         self,
@@ -64,14 +74,29 @@ class DetectionEngine:
         video_time: float,
         source: str,
         operation_mode: str = "unknown",
+        render: bool = True,
     ) -> tuple[np.ndarray, list[AlarmEvent]]:
-        result = self.model(
-            frame,
-            classes=[0],
-            verbose=False,
-            device=self.device,
-        )[0]
-        detections = self.tracker.update(sv.Detections.from_ultralytics(result))
+        self._processed_frames += 1
+        detect_this_frame = (
+            (self._processed_frames - 1) % self.policy.detector_interval == 0
+        )
+        if detect_this_frame:
+            inference_kwargs: dict[str, Any] = {
+                "classes": [0],
+                "verbose": False,
+                "device": self.device,
+            }
+            if self.policy.imgsz is not None:
+                inference_kwargs["imgsz"] = self.policy.imgsz
+            result = self.model(frame, **inference_kwargs)[0]
+            raw_detections = sv.Detections.from_ultralytics(result)
+            detections = (
+                self.tracker.update(raw_detections, timestamp=video_time)
+                if self.policy.uses_tracker_prediction
+                else self.tracker.update(raw_detections)
+            )
+        else:
+            detections = self.tracker.tracked_objects
         track_ids = self._track_ids(detections)
         in_zone_ids: dict[str, set[Hashable]] = {zone.name: set() for zone in self.zones}
         in_zone_elapsed_seconds: dict[Hashable, float] = {}
@@ -119,12 +144,15 @@ class DetectionEngine:
             key: value for key, value in self.entry_times.items() if key in active_keys
         }
 
-        annotated = self._annotate(
-            frame,
-            detections,
-            in_zone_ids,
-            in_zone_elapsed_seconds,
-        )
+        if render:
+            annotated = self._annotate(
+                frame,
+                detections,
+                in_zone_ids,
+                in_zone_elapsed_seconds,
+            )
+        else:
+            annotated = frame
         return annotated, events
 
     @staticmethod

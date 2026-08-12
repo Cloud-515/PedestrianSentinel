@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from alarm_service import EventStore
 from detection_worker import DetectionWorker
+from inference_profiles import InferencePolicy
 from video_source import VideoSourceSpec
 
 
@@ -54,6 +55,38 @@ class WorkerDeviceTests(unittest.TestCase):
         self.assertTrue(FakeVideoSource.last_instance.closed)
         self.assertTrue(statuses[-1].startswith("检测错误:"))
         self.assertNotIn("检测已停止", statuses[-1])
+
+    def test_worker_forwards_low_power_policy_to_engine(self) -> None:
+        statuses: list[str] = []
+        event_store = EventStore(Path(tempfile.mkdtemp()) / "events")
+        policy = InferencePolicy(
+            model_path="model_openvino",
+            device="cpu",
+            imgsz=512,
+            detector_interval=4,
+            label="CPU 低功耗模式",
+        )
+        worker = DetectionWorker(
+            spec=VideoSourceSpec("test.mp4", operation_mode="video"),
+            model_path=policy.model_path,
+            device="cpu",
+            zones=[],
+            event_store=event_store,
+            policy=policy,
+        )
+        worker.status_changed.connect(statuses.append)
+
+        with (
+            patch("detection_worker.VideoSource", FakeVideoSource),
+            patch(
+                "detection_worker.DetectionEngine",
+                side_effect=RuntimeError("OpenVINO unavailable"),
+            ) as engine_factory,
+        ):
+            worker.run()
+
+        engine_factory.assert_called_once_with("model_openvino", [], "cpu", policy)
+        self.assertTrue(statuses[-1].startswith("检测错误:"))
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication
 
-from main_window import SourcePanel
+from main_window import SettingsPanel, SourcePanel
 
 
 class SourcePanelDeviceTests(unittest.TestCase):
@@ -44,6 +44,31 @@ class SourcePanelDeviceTests(unittest.TestCase):
         self.assertIn("本地视频", panel.source_edit.placeholderText())
         panel.set_operation_mode("monitor")
         self.assertIn("实时流", panel.source_edit.placeholderText())
+
+
+class SettingsPanelTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_low_power_setting_restores_and_emits_changes(self) -> None:
+        panel = SettingsPanel()
+        changes: list[bool] = []
+        panel.cpu_low_power_changed.connect(changes.append)
+
+        panel.set_cpu_low_power(True)
+        self.assertTrue(panel.cpu_low_power_cb.isChecked())
+        self.assertEqual(changes, [])
+
+        panel.cpu_low_power_cb.setChecked(False)
+        self.assertEqual(changes, [False])
+
+    def test_low_power_setting_can_be_locked_while_running(self) -> None:
+        panel = SettingsPanel()
+        panel.set_cpu_low_power_enabled(False)
+        self.assertFalse(panel.cpu_low_power_cb.isEnabled())
+        panel.set_cpu_low_power_available(True)
+        self.assertTrue(panel.cpu_low_power_cb.isEnabled())
 
 
 if __name__ == "__main__":

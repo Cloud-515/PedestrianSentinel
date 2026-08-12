@@ -16,6 +16,14 @@ class AppConfigDeviceTests(unittest.TestCase):
         restored = AppConfig.from_dict(config.to_dict())
         self.assertEqual(restored.inference_device, "cuda:2")
 
+    def test_low_power_preset_defaults_to_disabled_for_legacy_config(self) -> None:
+        self.assertFalse(AppConfig.from_dict({}).cpu_low_power_preset)
+
+    def test_low_power_preset_round_trips(self) -> None:
+        config = AppConfig(inference_device="cpu", cpu_low_power_preset=True)
+        restored = AppConfig.from_dict(config.to_dict())
+        self.assertTrue(restored.cpu_low_power_preset)
+
     def test_config_migrates_legacy_file_settings_to_video_mode(self) -> None:
         config = AppConfig.from_dict({"source": "demo.mp4", "source_type": "file"})
         self.assertEqual(config.operation_mode, "video")

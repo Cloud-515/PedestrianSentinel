@@ -73,6 +73,7 @@ class AppConfig:
     playback_speed: float = 1.0
     model_path: str = "yolo11n.pt"
     inference_device: str = "cpu"
+    cpu_low_power_preset: bool = False
     zones: list[ZoneDefinition] = field(default_factory=list)
     source_size: list[int] = field(default_factory=list)
     display_to_original_scale: dict[str, float] = field(
@@ -105,6 +106,7 @@ class AppConfig:
             playback_speed=float(data.get("playback_speed", 1.0)),
             model_path=str(data.get("model_path", "yolo11n.pt")),
             inference_device=str(data.get("inference_device", "cpu")),
+            cpu_low_power_preset=bool(data.get("cpu_low_power_preset", False)),
             zones=[ZoneDefinition.from_dict(zone) for zone in data.get("zones", [])],
             source_size=[int(value) for value in data.get("source_size", [])[:2]],
             display_to_original_scale={
@@ -126,6 +128,7 @@ class AppConfig:
             "playback_speed": self.playback_speed,
             "model_path": self.model_path,
             "inference_device": self.inference_device,
+            "cpu_low_power_preset": self.cpu_low_power_preset,
             "source_size": self.source_size,
             "polygon_coordinate_space": "original_video_pixels",
             "display_to_original_scale": self.display_to_original_scale,

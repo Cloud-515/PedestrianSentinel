@@ -1,0 +1,3 @@
+# Optional runtime and export toolchain for the CPU low-power preset.
+openvino==2024.6.0
+nncf==2.14.0

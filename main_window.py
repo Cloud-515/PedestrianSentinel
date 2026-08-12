@@ -43,6 +43,7 @@ from alarm_service import EventStore
 from config_store import ConfigStore
 from compute_devices import enumerate_inference_devices
 from detection_worker import DetectionWorker
+from inference_profiles import resolve_inference_policy
 from models import AlarmEvent, AppConfig, ZoneDefinition, ZoneProfile
 from profile_store import ProfileStore
 from video_source import VideoSourceSpec
@@ -183,6 +184,7 @@ class SourcePanel(QGroupBox):
 
 class SettingsPanel(QGroupBox):
     mode_changed = Signal(str)
+    cpu_low_power_changed = Signal(bool)
 
     def __init__(self) -> None:
         super().__init__("设置")
@@ -190,12 +192,18 @@ class SettingsPanel(QGroupBox):
         self.video_radio = QRadioButton("视频模式")
         self.monitor_radio = QRadioButton("监控模式")
         self.monitor_radio.setChecked(True)
+        self.cpu_low_power_cb = QCheckBox("CPU 低功耗模式")
+        self.cpu_low_power_cb.setToolTip(
+            "仅在 CPU 推理时使用 OpenVINO INT8、512 输入和每 4 帧检测。"
+        )
         self.back_btn = QPushButton("返回主页")
         layout.addWidget(self.video_radio)
         layout.addWidget(self.monitor_radio)
+        layout.addWidget(self.cpu_low_power_cb)
         layout.addStretch()
         layout.addWidget(self.back_btn)
         self.video_radio.toggled.connect(self._emit_mode)
+        self.cpu_low_power_cb.toggled.connect(self.cpu_low_power_changed)
 
     def set_operation_mode(self, operation_mode: str) -> None:
         self.video_radio.setChecked(operation_mode == "video")
@@ -204,6 +212,20 @@ class SettingsPanel(QGroupBox):
     def set_mode_enabled(self, enabled: bool) -> None:
         self.video_radio.setEnabled(enabled)
         self.monitor_radio.setEnabled(enabled)
+
+    def set_cpu_low_power(self, enabled: bool) -> None:
+        self.cpu_low_power_cb.blockSignals(True)
+        self.cpu_low_power_cb.setChecked(enabled)
+        self.cpu_low_power_cb.blockSignals(False)
+
+    def set_cpu_low_power_available(self, available: bool, reason: str = "") -> None:
+        self.cpu_low_power_cb.setEnabled(True)
+        self.cpu_low_power_cb.setToolTip(
+            reason if not available else "仅在 CPU 推理时使用 OpenVINO INT8、512 输入和每 4 帧检测。"
+        )
+
+    def set_cpu_low_power_enabled(self, enabled: bool) -> None:
+        self.cpu_low_power_cb.setEnabled(enabled)
 
     def _emit_mode(self, checked: bool) -> None:
         if checked:
@@ -572,6 +594,7 @@ class MainWindow(QMainWindow):
         self.active_zone: ZoneDefinition | None = self.zones[0] if self.zones else None
         self.worker: DetectionWorker | None = None
         self.video_duration = 0.0
+        self._alarm_overlay_enabled = False
 
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
@@ -656,6 +679,8 @@ class MainWindow(QMainWindow):
             self.source_panel.set_status(
                 f"检测到 {len(device_options) - 1} 个可用 GPU"
             )
+        self.settings_panel.set_cpu_low_power(self.config.cpu_low_power_preset)
+        self._update_cpu_low_power_availability()
         self.playback_panel.loop_cb.setChecked(self.config.loop_playback)
         speed_value = max(1, min(16, round(self.config.playback_speed / 0.25)))
         self.playback_panel.speed_slider.setValue(speed_value)
@@ -677,6 +702,7 @@ class MainWindow(QMainWindow):
             lambda: self.sidebar_pages.setCurrentIndex(0)
         )
         self.settings_panel.mode_changed.connect(self._apply_operation_mode)
+        self.settings_panel.cpu_low_power_changed.connect(self._on_cpu_low_power_changed)
         self.zone_panel.profile_new_btn.clicked.connect(self._new_profile)
         self.zone_panel.profile_save_btn.clicked.connect(self._save_profile)
         self.zone_panel.profile_save_as_btn.clicked.connect(self._save_profile_as)
@@ -997,6 +1023,8 @@ class MainWindow(QMainWindow):
         else:
             self.config.monitor_source = self.source_panel.get_source()
         self.config.operation_mode = operation_mode
+        self._alarm_overlay_enabled = False
+        self.video_widget.clear_alarm()
         self.settings_panel.set_operation_mode(operation_mode)
         self.source_panel.set_operation_mode(operation_mode)
         self.source_panel.source_edit.setText(
@@ -1013,10 +1041,36 @@ class MainWindow(QMainWindow):
 
     def _on_device_changed(self, index: int) -> None:
         del index
+        self._update_cpu_low_power_availability()
         self.source_panel.set_status(
             f"推理设备已选择：{self.source_panel.device_combo.currentText()}"
         )
         self._schedule_config_save()
+
+    def _on_cpu_low_power_changed(self, enabled: bool) -> None:
+        self.config.cpu_low_power_preset = enabled
+        self._schedule_config_save()
+
+    def _update_cpu_low_power_availability(self) -> None:
+        device = self.source_panel.selected_device()
+        if device != "cpu":
+            self.settings_panel.set_cpu_low_power_enabled(False)
+            self.settings_panel.cpu_low_power_cb.setToolTip(
+                "CPU 低功耗模式仅适用于 CPU 推理。"
+            )
+            return
+        resolution = resolve_inference_policy(
+            self.config.model_path,
+            device,
+            self.config.cpu_low_power_preset,
+        )
+        if self.config.cpu_low_power_preset and not resolution.available:
+            self.settings_panel.set_cpu_low_power_available(
+                False,
+                f"CPU 低功耗模式不可用：{resolution.unavailable_reason}",
+            )
+            return
+        self.settings_panel.set_cpu_low_power_available(True)
 
     def _update_playback_enabled(self) -> None:
         running = self.worker is not None and self.worker.isRunning()
@@ -1045,12 +1099,28 @@ class MainWindow(QMainWindow):
 
         self._save_config()
         selected_device = self.source_panel.selected_device()
+        resolution = resolve_inference_policy(
+            str(model_path),
+            selected_device,
+            self.config.cpu_low_power_preset,
+        )
+        if not resolution.available:
+            QMessageBox.warning(
+                self,
+                "CPU 低功耗模式不可用",
+                resolution.unavailable_reason,
+            )
+            self.source_panel.set_status(
+                f"CPU 低功耗模式不可用：{resolution.unavailable_reason}"
+            )
+            return
         self.worker = DetectionWorker(
             spec=spec,
-            model_path=str(model_path),
+            model_path=resolution.policy.model_path,
             device=selected_device,
             zones=self.zones,
             event_store=self.event_store,
+            policy=resolution.policy,
             parent=self,
         )
         self.worker.frame_ready.connect(self.video_widget.set_frame)
@@ -1061,10 +1131,12 @@ class MainWindow(QMainWindow):
         self.worker.finished.connect(self._on_worker_finished)
 
         self.video_duration = 0.0
+        self._alarm_overlay_enabled = True
         self.playback_panel.set_progress(0.0, 0.0)
         self.playback_panel.set_paused(False)
         self.source_panel.set_running(True)
         self.settings_panel.set_mode_enabled(False)
+        self.settings_panel.set_cpu_low_power_enabled(False)
         self._set_profile_controls_enabled(False)
         self.playback_panel.set_file_mode(spec.is_file, True)
         self.source_panel.set_status(f"正在打开视频源… 推理设备: {selected_device}")
@@ -1073,6 +1145,8 @@ class MainWindow(QMainWindow):
     def stop_detection(self) -> None:
         if self.worker is None or not self.worker.isRunning():
             return
+        self._alarm_overlay_enabled = False
+        self.video_widget.clear_alarm()
         self.source_panel.stop_btn.setEnabled(False)
         self.source_panel.set_status("正在停止检测…")
         self.worker.stop()
@@ -1082,8 +1156,11 @@ class MainWindow(QMainWindow):
         self.worker = None
         if finished_worker is not None:
             finished_worker.deleteLater()
+        self._alarm_overlay_enabled = False
+        self.video_widget.clear_alarm()
         self.source_panel.set_running(False)
         self.settings_panel.set_mode_enabled(True)
+        self._update_cpu_low_power_availability()
         self._set_profile_controls_enabled(True)
         self.playback_panel.set_paused(False)
         self._update_playback_enabled()
@@ -1102,6 +1179,11 @@ class MainWindow(QMainWindow):
     def _on_alarm_event(self, event: AlarmEvent) -> None:
         if event.operation_mode == self.config.operation_mode:
             self.event_panel.append_event(event)
+        if (
+            self._alarm_overlay_enabled
+            and event.operation_mode == self.config.operation_mode
+        ):
+            self.video_widget.show_alarm(event)
         self.source_panel.set_status(
             f"警报：目标 {event.track_id} 进入区域“{event.zone_name}”"
         )
@@ -1166,6 +1248,7 @@ class MainWindow(QMainWindow):
         self.config.loop_playback = self.playback_panel.loop_cb.isChecked()
         self.config.playback_speed = self.playback_panel.speed()
         self.config.inference_device = self.source_panel.selected_device()
+        self.config.cpu_low_power_preset = self.settings_panel.cpu_low_power_cb.isChecked()
         self.config.zones = self.zones
         self.config.display_to_original_scale = self.video_widget.coordinate_mapping()
         try:
