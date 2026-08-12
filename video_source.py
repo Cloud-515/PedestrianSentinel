@@ -10,17 +10,16 @@ import cv2
 @dataclass
 class VideoSourceSpec:
     value: str
-    source_type: str = "camera"
-    test_mode: bool = False
+    operation_mode: str = "monitor"
     loop_playback: bool = True
     speed: float = 1.0
 
     @property
     def is_file(self) -> bool:
-        return self.source_type == "file" or self.test_mode
+        return self.operation_mode == "video"
 
     def capture_value(self) -> int | str:
-        return int(self.value) if self.source_type == "camera" and self.value.isdecimal() else self.value
+        return self.value if self.is_file or not self.value.isdecimal() else int(self.value)
 
 
 class VideoSource:

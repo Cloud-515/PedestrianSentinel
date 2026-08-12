@@ -33,7 +33,7 @@ class WorkerDeviceTests(unittest.TestCase):
         statuses: list[str] = []
         event_store = EventStore(Path(tempfile.mkdtemp()) / "events")
         worker = DetectionWorker(
-            spec=VideoSourceSpec("test.mp4", source_type="file"),
+            spec=VideoSourceSpec("test.mp4", operation_mode="video"),
             model_path="model.pt",
             device="cuda:0",
             zones=[],

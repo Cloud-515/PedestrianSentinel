@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
@@ -18,17 +18,21 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QDialog,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QProgressBar,
+    QInputDialog,
     QPushButton,
     QRadioButton,
     QScrollArea,
     QSlider,
+    QStyledItemDelegate,
     QSplitter,
+    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -39,7 +43,8 @@ from alarm_service import EventStore
 from config_store import ConfigStore
 from compute_devices import enumerate_inference_devices
 from detection_worker import DetectionWorker
-from models import AlarmEvent, AppConfig, ZoneDefinition
+from models import AlarmEvent, AppConfig, ZoneDefinition, ZoneProfile
+from profile_store import ProfileStore
 from video_source import VideoSourceSpec
 from video_widget import VideoWidget
 
@@ -48,6 +53,7 @@ logger = logging.getLogger(__name__)
 APP_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = APP_DIR / "config.json"
 EVENTS_DIR = APP_DIR / "events"
+PROFILES_DIR = APP_DIR / "profiles"
 
 
 # ---------------------------------------------------------------------------
@@ -61,13 +67,14 @@ class SourcePanel(QGroupBox):
 
         # 来源输入行
         src_row = QHBoxLayout()
+        self.source_label = QLabel("监控来源:")
         self.source_edit = QLineEdit("0")
-        self.source_edit.setPlaceholderText("摄像头索引 或 视频文件路径")
+        self.source_edit.setPlaceholderText("摄像头索引或实时流地址")
         self.browse_btn = QPushButton("…")
         self.browse_btn.setFixedWidth(28)
         self.browse_btn.setToolTip("选择视频文件")
         self.browse_btn.clicked.connect(self._browse_file)
-        src_row.addWidget(QLabel("来源:"))
+        src_row.addWidget(self.source_label)
         src_row.addWidget(self.source_edit)
         src_row.addWidget(self.browse_btn)
         layout.addLayout(src_row)
@@ -85,8 +92,9 @@ class SourcePanel(QGroupBox):
         type_row.addStretch()
         layout.addLayout(type_row)
 
-        # 测试模式用于标记离线视频测试任务。
-        self.test_mode_cb = QCheckBox("测试模式（播放视频文件）")
+        # 模式由设置页控制，来源类别会随模式自动切换。
+        self.test_mode_cb = QCheckBox("视频模式")
+        self.test_mode_cb.setVisible(False)
         layout.addWidget(self.test_mode_cb)
 
         device_row = QHBoxLayout()
@@ -119,18 +127,22 @@ class SourcePanel(QGroupBox):
         )
         if path:
             self.source_edit.setText(path)
-            self.file_radio.setChecked(True)
-            self.test_mode_cb.setChecked(True)
 
     def get_source(self) -> str:
         return self.source_edit.text().strip()
 
-    def source_type(self) -> str:
-        return "file" if self.file_radio.isChecked() else "camera"
-
-    def set_source_type(self, source_type: str) -> None:
-        self.file_radio.setChecked(source_type == "file")
-        self.camera_radio.setChecked(source_type != "file")
+    def set_operation_mode(self, operation_mode: str) -> None:
+        is_video = operation_mode == "video"
+        self.file_radio.setChecked(is_video)
+        self.camera_radio.setChecked(not is_video)
+        self.camera_radio.setVisible(not is_video)
+        self.file_radio.setVisible(is_video)
+        self.test_mode_cb.setChecked(is_video)
+        self.source_label.setText("视频源:" if is_video else "监控来源:")
+        self.source_edit.setPlaceholderText(
+            "选择本地视频文件" if is_video else "摄像头索引或实时流地址"
+        )
+        self.browse_btn.setVisible(is_video)
 
     def set_device_options(
         self,
@@ -169,6 +181,63 @@ class SourcePanel(QGroupBox):
 # 右侧面板：区域管理区
 # ---------------------------------------------------------------------------
 
+class SettingsPanel(QGroupBox):
+    mode_changed = Signal(str)
+
+    def __init__(self) -> None:
+        super().__init__("设置")
+        layout = QVBoxLayout(self)
+        self.video_radio = QRadioButton("视频模式")
+        self.monitor_radio = QRadioButton("监控模式")
+        self.monitor_radio.setChecked(True)
+        self.back_btn = QPushButton("返回主页")
+        layout.addWidget(self.video_radio)
+        layout.addWidget(self.monitor_radio)
+        layout.addStretch()
+        layout.addWidget(self.back_btn)
+        self.video_radio.toggled.connect(self._emit_mode)
+
+    def set_operation_mode(self, operation_mode: str) -> None:
+        self.video_radio.setChecked(operation_mode == "video")
+        self.monitor_radio.setChecked(operation_mode != "video")
+
+    def set_mode_enabled(self, enabled: bool) -> None:
+        self.video_radio.setEnabled(enabled)
+        self.monitor_radio.setEnabled(enabled)
+
+    def _emit_mode(self, checked: bool) -> None:
+        if checked:
+            self.mode_changed.emit("video")
+        else:
+            self.mode_changed.emit("monitor")
+
+
+class ProfileRow(QWidget):
+    apply_requested = Signal(str)
+    delete_requested = Signal(str)
+
+    def __init__(self, name: str) -> None:
+        super().__init__()
+        self.name = name
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        label = QLabel(name)
+        label.setToolTip(name)
+        layout.addWidget(label, 1)
+        apply_button = QPushButton("应用")
+        delete_button = QPushButton("删除")
+        apply_button.clicked.connect(lambda: self.apply_requested.emit(self.name))
+        delete_button.clicked.connect(lambda: self.delete_requested.emit(self.name))
+        layout.addWidget(apply_button)
+        layout.addWidget(delete_button)
+        self.apply_button = apply_button
+        self.delete_button = delete_button
+
+    def set_actions_enabled(self, enabled: bool) -> None:
+        self.apply_button.setEnabled(enabled)
+        self.delete_button.setEnabled(enabled)
+
+
 class ZonePanel(QGroupBox):
     color_changed = Signal(str)
 
@@ -176,9 +245,26 @@ class ZonePanel(QGroupBox):
         super().__init__("警戒区域", parent)
         layout = QVBoxLayout(self)
 
+        profile_header = QHBoxLayout()
+        profile_header.addWidget(QLabel("配置组:"))
+        self.profile_new_btn = QPushButton("新建")
+        self.profile_save_btn = QPushButton("保存")
+        self.profile_save_as_btn = QPushButton("另存为")
+        self.profile_status = QLabel("已保存")
+        profile_header.addWidget(self.profile_new_btn)
+        profile_header.addWidget(self.profile_save_btn)
+        profile_header.addWidget(self.profile_save_as_btn)
+        profile_header.addWidget(self.profile_status)
+        layout.addLayout(profile_header)
+
+        self.profile_list = QListWidget()
+        self.profile_list.setMaximumHeight(150)
+        layout.addWidget(self.profile_list)
+
         # 列表
         self.zone_list = QListWidget()
-        self.zone_list.setMaximumHeight(120)
+        row_height = max(self.zone_list.sizeHintForRow(0), self.fontMetrics().height() + 8)
+        self.zone_list.setFixedHeight(row_height * 5 + 6)
         layout.addWidget(self.zone_list)
 
         # 新增 / 删除
@@ -389,6 +475,42 @@ class PlaybackPanel(QGroupBox):
 # 右侧面板：报警记录区
 # ---------------------------------------------------------------------------
 
+class AlarmDetailDialog(QDialog):
+    def __init__(self, event: AlarmEvent, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("报警详情")
+        self.resize(720, 620)
+        layout = QVBoxLayout(self)
+        mode_label = "视频模式" if event.operation_mode == "video" else "监控模式"
+        details = [
+            ("报警时间", event.wall_time),
+            ("运行模式", mode_label),
+            ("视频源", event.source),
+            ("警戒区域", event.zone_name),
+            ("目标 ID", event.track_id),
+            ("进入时刻", f"{event.entered_at_seconds:.3f}s"),
+            ("报警时刻", f"{event.alarm_at_seconds:.3f}s"),
+            ("截图路径", event.screenshot_path or "无"),
+        ]
+        for label, value in details:
+            layout.addWidget(QLabel(f"{label}: {value}"))
+        self.screenshot_label = QLabel("截图不可用")
+        self.screenshot_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.screenshot_label.setMinimumHeight(320)
+        if event.screenshot_path:
+            pixmap = QPixmap(event.screenshot_path)
+            if not pixmap.isNull():
+                self.screenshot_label.setPixmap(
+                    pixmap.scaled(
+                        680,
+                        360,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                )
+        layout.addWidget(self.screenshot_label)
+
+
 class EventPanel(QGroupBox):
     HEADERS = ["时间", "视频源", "区域", "目标ID", "进入时刻", "报警时刻", "截图路径"]
 
@@ -405,9 +527,16 @@ class EventPanel(QGroupBox):
         header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
         self.table.setMinimumHeight(220)
+        self.table.cellDoubleClicked.connect(self._show_details)
         layout.addWidget(self.table)
         self.clear_btn = QPushButton("清空记录")
         layout.addWidget(self.clear_btn)
+
+    def _show_details(self, row: int, column: int) -> None:
+        item = self.table.item(row, 0)
+        event = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if isinstance(event, AlarmEvent):
+            AlarmDetailDialog(event, self).exec()
 
     def append_event(self, event: AlarmEvent) -> None:
         row = self.table.rowCount()
@@ -415,6 +544,8 @@ class EventPanel(QGroupBox):
         for column, value in enumerate(event.to_row()):
             item = QTableWidgetItem(value)
             item.setToolTip(value)
+            if column == 0:
+                item.setData(Qt.ItemDataRole.UserRole, event)
             self.table.setItem(row, column, item)
         self.table.scrollToBottom()
 
@@ -429,6 +560,8 @@ class MainWindow(QMainWindow):
         self.resize(1280, 800)
 
         self.config_store = ConfigStore(CONFIG_PATH)
+        self.profile_store = ProfileStore(PROFILES_DIR)
+        self.profile_dirty = False
         self.event_store = EventStore(EVENTS_DIR)
         self.config = self._load_config()
         self.zones = self.config.zones
@@ -443,6 +576,7 @@ class MainWindow(QMainWindow):
 
         self.video_widget = VideoWidget()
         self.source_panel = SourcePanel()
+        self.settings_panel = SettingsPanel()
         self.zone_panel = ZonePanel()
         self.playback_panel = PlaybackPanel()
         self.event_panel = EventPanel()
@@ -453,17 +587,28 @@ class MainWindow(QMainWindow):
         self._load_event_history()
 
     def _build_layout(self) -> None:
-        right_content = QWidget()
-        right_layout = QVBoxLayout(right_content)
-        right_layout.addWidget(self.source_panel)
-        right_layout.addWidget(self.zone_panel)
-        right_layout.addWidget(self.playback_panel)
-        right_layout.addWidget(self.event_panel)
-        right_layout.addStretch()
+        self.settings_btn = QPushButton("设置")
+        home_content = QWidget()
+        home_layout = QVBoxLayout(home_content)
+        home_layout.addWidget(self.settings_btn)
+        home_layout.addWidget(self.source_panel)
+        home_layout.addWidget(self.zone_panel)
+        home_layout.addWidget(self.playback_panel)
+        home_layout.addWidget(self.event_panel)
+        home_layout.addStretch()
+
+        settings_content = QWidget()
+        settings_layout = QVBoxLayout(settings_content)
+        settings_layout.addWidget(self.settings_panel)
+        settings_layout.addStretch()
+
+        self.sidebar_pages = QStackedWidget()
+        self.sidebar_pages.addWidget(home_content)
+        self.sidebar_pages.addWidget(settings_content)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setWidget(right_content)
+        scroll.setWidget(self.sidebar_pages)
         scroll.setMinimumWidth(420)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -483,10 +628,12 @@ class MainWindow(QMainWindow):
             return AppConfig()
 
     def _load_controls(self) -> None:
-        self.source_panel.source_edit.setText(self.config.source)
-        source_type = "file" if self.config.test_mode else self.config.source_type
-        self.source_panel.set_source_type(source_type)
-        self.source_panel.test_mode_cb.setChecked(self.config.test_mode)
+        self._apply_operation_mode(self.config.operation_mode, persist=False)
+        self.source_panel.source_edit.setText(
+            self.config.video_source
+            if self.config.operation_mode == "video"
+            else self.config.monitor_source
+        )
         device_options = enumerate_inference_devices()
         restored = self.source_panel.set_device_options(
             device_options,
@@ -508,16 +655,27 @@ class MainWindow(QMainWindow):
         self.playback_panel.loop_cb.setChecked(self.config.loop_playback)
         speed_value = max(1, min(16, round(self.config.playback_speed / 0.25)))
         self.playback_panel.speed_slider.setValue(speed_value)
+        if self.config.active_profile and self.profile_store.exists(self.config.active_profile):
+            self.zones = self.profile_store.load(self.config.active_profile).zones
+            self.active_zone = self.zones[0] if self.zones else None
         self.video_widget.set_zones(self.zones)
         self.video_widget.set_active_zone(self.active_zone)
         self._refresh_zone_panel()
+        self._refresh_profiles()
+        self._set_profile_dirty(False)
         self._update_playback_enabled()
 
     def _connect_signals(self) -> None:
         self.source_panel.open_btn.clicked.connect(self.start_detection)
         self.source_panel.stop_btn.clicked.connect(self.stop_detection)
-        self.source_panel.file_radio.toggled.connect(self._on_source_mode_changed)
-        self.source_panel.test_mode_cb.toggled.connect(self._on_source_mode_changed)
+        self.settings_btn.clicked.connect(lambda: self.sidebar_pages.setCurrentIndex(1))
+        self.settings_panel.back_btn.clicked.connect(
+            lambda: self.sidebar_pages.setCurrentIndex(0)
+        )
+        self.settings_panel.mode_changed.connect(self._apply_operation_mode)
+        self.zone_panel.profile_new_btn.clicked.connect(self._new_profile)
+        self.zone_panel.profile_save_btn.clicked.connect(self._save_profile)
+        self.zone_panel.profile_save_as_btn.clicked.connect(self._save_profile_as)
         self.source_panel.device_combo.currentIndexChanged.connect(
             self._on_device_changed
         )
@@ -543,12 +701,49 @@ class MainWindow(QMainWindow):
         self.event_panel.clear_btn.clicked.connect(self._clear_events)
 
     def _load_event_history(self) -> None:
+        self.event_panel.clear()
         try:
-            for event in self.event_store.load_recent():
+            for event in self.event_store.load_recent(
+                operation_mode=self.config.operation_mode
+            ):
                 self.event_panel.append_event(event)
         except OSError as error:
             logger.exception("Unable to load alarm event history")
             self.source_panel.set_status(f"报警记录读取失败: {error}")
+
+    def _set_profile_controls_enabled(self, enabled: bool) -> None:
+        self.zone_panel.profile_save_btn.setEnabled(enabled)
+        self.zone_panel.profile_save_as_btn.setEnabled(enabled)
+        self.zone_panel.profile_new_btn.setEnabled(enabled)
+        for index in range(self.zone_panel.profile_list.count()):
+            row = self.zone_panel.profile_list.itemWidget(self.zone_panel.profile_list.item(index))
+            if row is not None:
+                row.set_actions_enabled(enabled)
+
+    def _set_profile_dirty(self, dirty: bool) -> None:
+        self.profile_dirty = dirty
+        name = self.config.active_profile or "未命名配置组"
+        self.zone_panel.profile_status.setText("未保存" if dirty else "已保存")
+        self.zone_panel.profile_status.setToolTip(f"当前配置组: {name}")
+
+    def _refresh_profiles(self) -> None:
+        current = self.config.active_profile
+        summaries = self.profile_store.list_profiles()
+        profile_names = [summary.name for summary in summaries]
+        if current and current not in profile_names:
+            profile_names.append(current)
+        self.zone_panel.profile_list.clear()
+        for name in profile_names:
+            item = QListWidgetItem(self.zone_panel.profile_list)
+            row = ProfileRow(name)
+            row.apply_requested.connect(self._request_profile_change)
+            row.delete_requested.connect(self._delete_profile)
+            item.setSizeHint(row.sizeHint())
+            self.zone_panel.profile_list.addItem(item)
+            self.zone_panel.profile_list.setItemWidget(item, row)
+        self.zone_panel.profile_status.setToolTip(
+            f"当前配置组: {current or '未命名配置组'}"
+        )
 
     def _refresh_zone_panel(self) -> None:
         self.zone_panel.populate(self.zones, self.active_zone)
@@ -556,6 +751,132 @@ class MainWindow(QMainWindow):
         self.zone_panel.set_params_enabled(has_active)
         if self.active_zone is not None:
             self.zone_panel.load_zone_params(self.active_zone)
+
+    def _ask_profile_save(self, message: str) -> str:
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("配置组有未保存修改")
+        dialog.setText(message)
+        save_button = dialog.addButton("保存并继续", QMessageBox.ButtonRole.AcceptRole)
+        discard_button = dialog.addButton("放弃修改", QMessageBox.ButtonRole.DestructiveRole)
+        cancel_button = dialog.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        dialog.exec()
+        clicked = dialog.clickedButton()
+        if clicked is save_button:
+            return "save"
+        if clicked is discard_button:
+            return "discard"
+        return "cancel"
+
+    def _request_profile_change(self, name: str) -> None:
+        if not name:
+            return
+        if name == self.config.active_profile:
+            if not self.zones:
+                QMessageBox.information(self, "配置组为空", "当前配置组尚未添加警戒区域。")
+            return
+        if self.profile_dirty:
+            answer = self._ask_profile_save("是否保存当前修改后再切换配置组？")
+            if answer == "cancel":
+                self._refresh_profiles()
+                return
+            if answer == "save" and not self._save_profile():
+                self._refresh_profiles()
+                return
+        self._load_profile(name)
+
+    def _load_profile(self, name: str) -> None:
+        if not name or (self.worker is not None and self.worker.isRunning()):
+            return
+        try:
+            profile = self.profile_store.load(name)
+        except ValueError as error:
+            QMessageBox.warning(self, "加载配置组失败", str(error))
+            return
+        self.zones = profile.zones
+        self.active_zone = self.zones[0] if self.zones else None
+        self.config.active_profile = name
+        self.video_widget.set_zones(self.zones)
+        self.video_widget.set_active_zone(self.active_zone)
+        self._refresh_zone_panel()
+        self._zones_updated(mark_profile_dirty=False)
+        self._set_profile_dirty(False)
+        self._schedule_config_save()
+
+    def _save_profile(self) -> bool:
+        name = self.config.active_profile.strip()
+        if not name:
+            name, accepted = QInputDialog.getText(self, "保存配置组", "配置组名称:")
+            if not accepted or not name.strip():
+                return False
+            name = name.strip()
+        try:
+            self.profile_store.save(ZoneProfile(name=name, zones=self.zones))
+        except ValueError as error:
+            QMessageBox.warning(self, "保存配置组失败", str(error))
+            return False
+        self.config.active_profile = name
+        self._refresh_profiles()
+        self._set_profile_dirty(False)
+        self._schedule_config_save()
+        self.source_panel.set_status(f"配置组已保存: {name}")
+        return True
+
+    def _save_profile_as(self) -> None:
+        name, accepted = QInputDialog.getText(self, "配置组另存为", "新配置组名称:")
+        if not accepted or not name.strip():
+            return
+        name = name.strip()
+        if self.profile_store.exists(name):
+            QMessageBox.warning(self, "另存为失败", "该配置组名称已存在。")
+            return
+        old_name = self.config.active_profile
+        self.config.active_profile = name
+        if not self._save_profile():
+            self.config.active_profile = old_name
+
+    def _new_profile(self) -> None:
+        if self.profile_dirty:
+            answer = self._ask_profile_save("是否保存当前修改后新建配置组？")
+            if answer == "cancel":
+                return
+            if answer == "save" and not self._save_profile():
+                return
+        name, accepted = QInputDialog.getText(self, "新建配置组", "配置组名称:")
+        if not accepted or not name.strip():
+            return
+        name = name.strip()
+        if self.profile_store.exists(name):
+            QMessageBox.warning(self, "新建失败", "该配置组名称已存在。")
+            return
+        self.config.active_profile = name
+        self.zones = []
+        self.active_zone = None
+        self.video_widget.set_zones(self.zones)
+        self.video_widget.set_active_zone(self.active_zone)
+        self._refresh_zone_panel()
+        self._refresh_profiles()
+        self._set_profile_dirty(True)
+
+    def _delete_profile(self, name: str) -> None:
+        if self.worker is not None and self.worker.isRunning():
+            return
+        if QMessageBox.question(
+            self,
+            "删除配置组",
+            f"确定删除配置组“{name}”吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.profile_store.delete(name)
+        except ValueError as error:
+            QMessageBox.warning(self, "删除配置组失败", str(error))
+            return
+        if self.config.active_profile == name:
+            self.config.active_profile = ""
+            self._set_profile_dirty(False)
+        self._refresh_profiles()
+        self._schedule_config_save()
 
     def _on_zone_selected(
         self,
@@ -654,19 +975,37 @@ class MainWindow(QMainWindow):
         if zone is self.active_zone:
             self._zones_updated()
 
-    def _zones_updated(self) -> None:
+    def _zones_updated(self, mark_profile_dirty: bool = True) -> None:
         if self.worker is not None and self.worker.isRunning():
             self.worker.set_zones(self.zones)
+        if mark_profile_dirty:
+            self._set_profile_dirty(True)
         self._schedule_config_save()
 
-    def _on_source_mode_changed(self, checked: bool = False) -> None:
-        if checked and self.sender() is self.source_panel.test_mode_cb:
-            self.source_panel.file_radio.setChecked(True)
+    def _apply_operation_mode(self, operation_mode: str, persist: bool = True) -> None:
+        if self.worker is not None and self.worker.isRunning():
+            return
+        if operation_mode not in {"monitor", "video"}:
+            operation_mode = "monitor"
+        previous_mode = self.config.operation_mode
+        if previous_mode == "video":
+            self.config.video_source = self.source_panel.get_source()
+        else:
+            self.config.monitor_source = self.source_panel.get_source()
+        self.config.operation_mode = operation_mode
+        self.settings_panel.set_operation_mode(operation_mode)
+        self.source_panel.set_operation_mode(operation_mode)
+        self.source_panel.source_edit.setText(
+            self.config.video_source if operation_mode == "video" else self.config.monitor_source
+        )
+        self.playback_panel.setVisible(operation_mode == "video")
+        self._load_event_history()
         self._update_playback_enabled()
-        self._schedule_config_save()
+        if persist:
+            self._schedule_config_save()
 
     def _is_file_mode(self) -> bool:
-        return self.source_panel.source_type() == "file"
+        return self.config.operation_mode == "video"
 
     def _on_device_changed(self, index: int) -> None:
         del index
@@ -692,8 +1031,7 @@ class MainWindow(QMainWindow):
 
         spec = VideoSourceSpec(
             value=source,
-            source_type=self.source_panel.source_type(),
-            test_mode=self.source_panel.test_mode_cb.isChecked(),
+            operation_mode=self.config.operation_mode,
             loop_playback=self.playback_panel.loop_cb.isChecked(),
             speed=self.playback_panel.speed(),
         )
@@ -722,6 +1060,8 @@ class MainWindow(QMainWindow):
         self.playback_panel.set_progress(0.0, 0.0)
         self.playback_panel.set_paused(False)
         self.source_panel.set_running(True)
+        self.settings_panel.set_mode_enabled(False)
+        self._set_profile_controls_enabled(False)
         self.playback_panel.set_file_mode(spec.is_file, True)
         self.source_panel.set_status(f"正在打开视频源… 推理设备: {selected_device}")
         self.worker.start()
@@ -739,6 +1079,8 @@ class MainWindow(QMainWindow):
         if finished_worker is not None:
             finished_worker.deleteLater()
         self.source_panel.set_running(False)
+        self.settings_panel.set_mode_enabled(True)
+        self._set_profile_controls_enabled(True)
         self.playback_panel.set_paused(False)
         self._update_playback_enabled()
 
@@ -754,7 +1096,8 @@ class MainWindow(QMainWindow):
         self.playback_panel.set_progress(ratio, self.video_duration)
 
     def _on_alarm_event(self, event: AlarmEvent) -> None:
-        self.event_panel.append_event(event)
+        if event.operation_mode == self.config.operation_mode:
+            self.event_panel.append_event(event)
         self.source_panel.set_status(
             f"警报：目标 {event.track_id} 进入区域“{event.zone_name}”"
         )
@@ -798,7 +1141,7 @@ class MainWindow(QMainWindow):
         if answer != QMessageBox.StandardButton.Yes:
             return
         try:
-            self.event_store.clear()
+            self.event_store.clear(self.config.operation_mode)
             self.event_panel.clear()
         except OSError as error:
             logger.exception("Unable to clear alarm event history")
@@ -808,9 +1151,14 @@ class MainWindow(QMainWindow):
         self._save_timer.start()
 
     def _save_config(self) -> None:
-        self.config.source = self.source_panel.get_source()
-        self.config.source_type = self.source_panel.source_type()
-        self.config.test_mode = self.source_panel.test_mode_cb.isChecked()
+        current_source = self.source_panel.get_source()
+        if self.config.operation_mode == "video":
+            self.config.video_source = current_source
+        else:
+            self.config.monitor_source = current_source
+        self.config.source = current_source
+        self.config.source_type = "file" if self.config.operation_mode == "video" else "camera"
+        self.config.test_mode = self.config.operation_mode == "video"
         self.config.loop_playback = self.playback_panel.loop_cb.isChecked()
         self.config.playback_speed = self.playback_panel.speed()
         self.config.inference_device = self.source_panel.selected_device()

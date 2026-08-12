@@ -12,6 +12,8 @@ import supervision as sv
 from trackers import ByteTrackTracker
 from ultralytics import YOLO
 
+from logging_config import configure_logging
+
 MODEL_PATH = "yolo11n.pt"
 DWELL_TIME_THRESHOLD_SECONDS = 2.0
 ALARM_COOLDOWN_SECONDS = 10.0
@@ -222,6 +224,7 @@ def parse_video_source(value: str) -> Union[int, str]:
 
 
 if __name__ == "__main__":
+    configure_logging()
     parser = argparse.ArgumentParser(description="Pedestrian zone intrusion monitor")
     parser.add_argument(
         "--source",

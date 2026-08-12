@@ -7,6 +7,7 @@ venv/
 # Runtime configuration and generated alarm data
 config.json
 events/
+profiles/
 *.log
 gui-*.png
 

@@ -127,7 +127,12 @@ class DetectionWorker(QThread):
                     continue
 
                 reconnect_attempts = 0
-                annotated, events = engine.process(frame, video_time, self.spec.value)
+                annotated, events = engine.process(
+                    frame,
+                    video_time,
+                    self.spec.value,
+                    self.spec.operation_mode,
+                )
                 self.frame_ready.emit(annotated)
                 if source.spec.is_file and source.duration_seconds > 0:
                     self.progress_changed.emit(min(1.0, video_time / source.duration_seconds))

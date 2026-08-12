@@ -30,10 +30,45 @@ class ZoneDefinition:
 
 
 @dataclass
+class ZoneProfile:
+    name: str
+    zones: list[ZoneDefinition] = field(default_factory=list)
+    description: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+    version: int = 1
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ZoneProfile":
+        return cls(
+            name=str(data.get("name", "未命名配置组")),
+            zones=[ZoneDefinition.from_dict(zone) for zone in data.get("zones", [])],
+            description=str(data.get("description", "")),
+            created_at=str(data.get("created_at", "")),
+            updated_at=str(data.get("updated_at", "")),
+            version=int(data.get("version", 1)),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "version": self.version,
+            "name": self.name,
+            "description": self.description,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "zones": [zone.to_dict() for zone in self.zones],
+        }
+
+
+@dataclass
 class AppConfig:
     source: str = "0"
     source_type: str = "camera"
     test_mode: bool = False
+    operation_mode: str = "monitor"
+    video_source: str = ""
+    monitor_source: str = "0"
+    active_profile: str = ""
     loop_playback: bool = True
     playback_speed: float = 1.0
     model_path: str = "yolo11n.pt"
@@ -46,10 +81,26 @@ class AppConfig:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "AppConfig":
+        source = str(data.get("source", "0"))
+        source_type = str(data.get("source_type", "camera"))
+        test_mode = bool(data.get("test_mode", False))
+        operation_mode = str(data.get("operation_mode", ""))
+        if operation_mode not in {"monitor", "video"}:
+            operation_mode = "video" if test_mode or source_type == "file" else "monitor"
+        video_source = str(
+            data.get("video_source", source if operation_mode == "video" else "")
+        )
+        monitor_source = str(
+            data.get("monitor_source", source if operation_mode == "monitor" else "0")
+        )
         return cls(
-            source=str(data.get("source", "0")),
-            source_type=str(data.get("source_type", "camera")),
-            test_mode=bool(data.get("test_mode", False)),
+            source=source,
+            source_type=source_type,
+            test_mode=test_mode,
+            operation_mode=operation_mode,
+            video_source=video_source,
+            monitor_source=monitor_source,
+            active_profile=str(data.get("active_profile", "")),
             loop_playback=bool(data.get("loop_playback", True)),
             playback_speed=float(data.get("playback_speed", 1.0)),
             model_path=str(data.get("model_path", "yolo11n.pt")),
@@ -67,6 +118,10 @@ class AppConfig:
             "source": self.source,
             "source_type": self.source_type,
             "test_mode": self.test_mode,
+            "operation_mode": self.operation_mode,
+            "video_source": self.video_source,
+            "monitor_source": self.monitor_source,
+            "active_profile": self.active_profile,
             "loop_playback": self.loop_playback,
             "playback_speed": self.playback_speed,
             "model_path": self.model_path,
@@ -86,6 +141,7 @@ class AlarmEvent:
     entered_at_seconds: float
     alarm_at_seconds: float
     wall_time: str
+    operation_mode: str = "unknown"
     screenshot_path: str = ""
 
     def to_row(self) -> list[str]:

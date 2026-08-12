@@ -16,6 +16,27 @@ class AppConfigDeviceTests(unittest.TestCase):
         restored = AppConfig.from_dict(config.to_dict())
         self.assertEqual(restored.inference_device, "cuda:2")
 
+    def test_config_migrates_legacy_file_settings_to_video_mode(self) -> None:
+        config = AppConfig.from_dict({"source": "demo.mp4", "source_type": "file"})
+        self.assertEqual(config.operation_mode, "video")
+        self.assertEqual(config.video_source, "demo.mp4")
+        self.assertEqual(config.monitor_source, "0")
+
+    def test_config_preserves_separate_mode_sources(self) -> None:
+        config = AppConfig(
+            operation_mode="video",
+            video_source="demo.mp4",
+            monitor_source="rtsp://camera/live",
+        )
+        restored = AppConfig.from_dict(config.to_dict())
+        self.assertEqual(restored.operation_mode, "video")
+        self.assertEqual(restored.video_source, "demo.mp4")
+        self.assertEqual(restored.monitor_source, "rtsp://camera/live")
+
+    def test_config_rejects_unknown_operation_mode(self) -> None:
+        config = AppConfig.from_dict({"operation_mode": "unknown"})
+        self.assertEqual(config.operation_mode, "monitor")
+
 
 class DeviceDiscoveryTests(unittest.TestCase):
     def test_cpu_only_runtime_lists_only_cpu(self) -> None:

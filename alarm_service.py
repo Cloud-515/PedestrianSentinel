@@ -54,6 +54,7 @@ class EventStore:
         payload = {
             "time": event.wall_time,
             "video_source": event.source,
+            "operation_mode": event.operation_mode,
             "zone_name": event.zone_name,
             "track_id": event.track_id,
             "entered_at_seconds": event.entered_at_seconds,
@@ -66,7 +67,11 @@ class EventStore:
                 event_file.write(json.dumps(payload, ensure_ascii=False) + "\n")
         return event
 
-    def load_recent(self, limit: int = 200) -> list[AlarmEvent]:
+    def load_recent(
+        self,
+        limit: int = 200,
+        operation_mode: str | None = None,
+    ) -> list[AlarmEvent]:
         if not self.log_path.exists():
             return []
         events: list[AlarmEvent] = []
@@ -84,12 +89,27 @@ class EventStore:
                         entered_at_seconds=float(payload.get("entered_at_seconds", 0.0)),
                         alarm_at_seconds=float(payload.get("alarm_at_seconds", 0.0)),
                         wall_time=str(payload.get("time", "")),
+                        operation_mode=str(payload.get("operation_mode", "unknown")),
                         screenshot_path=str(payload.get("screenshot_path", "")),
                     )
                 )
+        if operation_mode is not None:
+            events = [event for event in events if event.operation_mode == operation_mode]
         return events[-limit:]
 
-    def clear(self) -> None:
+    def clear(self, operation_mode: str | None = None) -> None:
         with self._lock:
-            if self.log_path.exists():
+            if not self.log_path.exists():
+                return
+            if operation_mode is None:
                 self.log_path.unlink()
+                return
+            retained = [
+                json.loads(line)
+                for line in self.log_path.read_text(encoding="utf-8").splitlines()
+                if line.strip() and json.loads(line).get("operation_mode", "unknown") != operation_mode
+            ]
+            self.log_path.write_text(
+                "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in retained),
+                encoding="utf-8",
+            )

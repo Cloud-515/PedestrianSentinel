@@ -9,6 +9,7 @@ from typing import Any
 import cv2
 import numpy as np
 import supervision as sv
+from trackers import ByteTrackTracker
 from ultralytics import YOLO
 
 from models import AlarmEvent, ZoneDefinition
@@ -32,12 +33,14 @@ class DetectionEngine:
         self.last_alarm_times: dict[tuple[str, Hashable], float] = {}
 
     @staticmethod
-    def _new_tracker() -> sv.ByteTrack:
-        return sv.ByteTrack(
+    def _new_tracker() -> ByteTrackTracker:
+        return ByteTrackTracker(
             track_activation_threshold=0.25,
             lost_track_buffer=30,
             frame_rate=30,
             minimum_consecutive_frames=1,
+            minimum_iou_threshold=0.1,
+            high_conf_det_threshold=0.6,
         )
 
     def update_zones(self, zones: list[ZoneDefinition]) -> None:
@@ -55,16 +58,23 @@ class DetectionEngine:
         self.entry_times.clear()
         self.last_alarm_times.clear()
 
-    def process(self, frame: np.ndarray, video_time: float, source: str) -> tuple[np.ndarray, list[AlarmEvent]]:
+    def process(
+        self,
+        frame: np.ndarray,
+        video_time: float,
+        source: str,
+        operation_mode: str = "unknown",
+    ) -> tuple[np.ndarray, list[AlarmEvent]]:
         result = self.model(
             frame,
             classes=[0],
             verbose=False,
             device=self.device,
         )[0]
-        detections = self.tracker.update_with_detections(sv.Detections.from_ultralytics(result))
+        detections = self.tracker.update(sv.Detections.from_ultralytics(result))
         track_ids = self._track_ids(detections)
         in_zone_ids: dict[str, set[Hashable]] = {zone.name: set() for zone in self.zones}
+        in_zone_elapsed_seconds: dict[Hashable, float] = {}
         events: list[AlarmEvent] = []
 
         for index, track_id in enumerate(track_ids):
@@ -78,8 +88,12 @@ class DetectionEngine:
                 in_zone_ids[zone.name].add(track_id)
                 key = (zone.name, track_id)
                 entered_at = self.entry_times.setdefault(key, video_time)
+                elapsed_seconds = max(0.0, video_time - entered_at)
+                in_zone_elapsed_seconds[track_id] = max(
+                    in_zone_elapsed_seconds.get(track_id, 0.0), elapsed_seconds
+                )
                 last_alarm_at = self.last_alarm_times.get(key)
-                if video_time - entered_at < zone.dwell_seconds:
+                if elapsed_seconds < zone.dwell_seconds:
                     continue
                 if last_alarm_at is not None and video_time - last_alarm_at < zone.cooldown_seconds:
                     continue
@@ -87,6 +101,7 @@ class DetectionEngine:
                 events.append(
                     AlarmEvent(
                         source=source,
+                        operation_mode=operation_mode,
                         zone_name=zone.name,
                         track_id=str(track_id),
                         entered_at_seconds=entered_at,
@@ -104,7 +119,12 @@ class DetectionEngine:
             key: value for key, value in self.entry_times.items() if key in active_keys
         }
 
-        annotated = self._annotate(frame, detections, in_zone_ids)
+        annotated = self._annotate(
+            frame,
+            detections,
+            in_zone_ids,
+            in_zone_elapsed_seconds,
+        )
         return annotated, events
 
     @staticmethod
@@ -118,6 +138,12 @@ class DetectionEngine:
         return values
 
     @staticmethod
+    def _format_elapsed(seconds: float) -> str:
+        total_milliseconds = max(0, int(seconds * 1000))
+        whole_seconds, milliseconds = divmod(total_milliseconds, 1000)
+        return f"{whole_seconds}.{milliseconds:03d}s"
+
+    @staticmethod
     def _contains(zone: ZoneDefinition, point: tuple[float, float]) -> bool:
         polygon = np.asarray(zone.polygon, dtype=np.float32)
         return cv2.pointPolygonTest(polygon, point, False) >= 0
@@ -127,6 +153,7 @@ class DetectionEngine:
         frame: np.ndarray,
         detections: sv.Detections,
         in_zone_ids: dict[str, set[Hashable]],
+        in_zone_elapsed_seconds: dict[Hashable, float],
     ) -> np.ndarray:
         annotated = frame.copy()
         track_ids = self._track_ids(detections)
@@ -138,7 +165,7 @@ class DetectionEngine:
             cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
             label = f"ID:{track_id}" if track_id is not None else "Person"
             if inside:
-                label += " IN ZONE"
+                label += f" IN ZONE {self._format_elapsed(in_zone_elapsed_seconds[track_id])}"
             cv2.putText(
                 annotated,
                 label,

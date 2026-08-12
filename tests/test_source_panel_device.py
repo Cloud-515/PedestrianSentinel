@@ -38,6 +38,13 @@ class SourcePanelDeviceTests(unittest.TestCase):
         panel.set_running(False)
         self.assertTrue(panel.device_combo.isEnabled())
 
+    def test_operation_mode_updates_source_hint(self) -> None:
+        panel = SourcePanel()
+        panel.set_operation_mode("video")
+        self.assertIn("本地视频", panel.source_edit.placeholderText())
+        panel.set_operation_mode("monitor")
+        self.assertIn("实时流", panel.source_edit.placeholderText())
+
 
 if __name__ == "__main__":
     unittest.main()
