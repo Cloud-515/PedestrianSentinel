@@ -522,6 +522,10 @@ class EventPanel(QGroupBox):
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setAlternatingRowColors(True)
+        self.table.setStyleSheet(
+            "QTableWidget::item:hover { background-color: transparent; }"
+            "QTableWidget::item:selected { background-color: rgba(1, 174, 231, 128); }"
+        )
         self.table.verticalHeader().setVisible(False)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
