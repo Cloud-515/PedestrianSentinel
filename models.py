@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from datetime import datetime
+from typing import Any, Literal
+from uuid import uuid4
 
 
 @dataclass
@@ -142,10 +144,37 @@ class AlarmEvent:
     zone_name: str
     track_id: str
     entered_at_seconds: float
-    alarm_at_seconds: float
+    alarm_at_seconds: float | None
     wall_time: str
     operation_mode: str = "unknown"
     screenshot_path: str = ""
+    session_id: str = field(default_factory=lambda: uuid4().hex)
+    exited_at_seconds: float | None = None
+    duration_seconds: float | None = None
+    entry_screenshot_path: str = ""
+    alarm_screenshot_path: str = ""
+    status: Literal["active", "alarmed", "completed"] = "active"
+
+    def __post_init__(self) -> None:
+        if self.alarm_screenshot_path and not self.screenshot_path:
+            self.screenshot_path = self.alarm_screenshot_path
+        elif self.screenshot_path and not self.alarm_screenshot_path:
+            self.alarm_screenshot_path = self.screenshot_path
+
+    @property
+    def alarmed(self) -> bool:
+        return self.alarm_at_seconds is not None
+
+    @staticmethod
+    def _format_timestamp(value: float) -> str:
+        return datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+    def format_event_time(self, value: float | None, precision: int = 2) -> str:
+        if value is None:
+            return "未记录"
+        if self.operation_mode == "monitor":
+            return self._format_timestamp(value)
+        return f"{value:.{precision}f}s"
 
     def to_row(self) -> list[str]:
         return [
@@ -153,7 +182,17 @@ class AlarmEvent:
             self.source,
             self.zone_name,
             self.track_id,
-            f"{self.entered_at_seconds:.2f}s",
-            f"{self.alarm_at_seconds:.2f}s",
-            self.screenshot_path,
+            self.format_event_time(self.entered_at_seconds),
+            self.format_event_time(self.alarm_at_seconds),
+            self.format_event_time(self.exited_at_seconds),
+            "未触发报警" if not self.alarmed else self.status,
+            f"{self.duration_seconds:.2f}s" if self.duration_seconds is not None else "未结算",
+            self.entry_screenshot_path or self.screenshot_path,
+            self.alarm_screenshot_path,
         ]
+
+
+@dataclass
+class SessionTransition:
+    kind: Literal["entered", "alarmed", "exited"]
+    event: AlarmEvent

@@ -11,7 +11,7 @@ from PySide6.QtCore import QThread, Signal
 from alarm_service import AlarmPlayer, EventStore
 from detection_engine import DetectionEngine
 from inference_profiles import InferencePolicy
-from models import AlarmEvent, ZoneDefinition
+from models import AlarmEvent, SessionTransition, ZoneDefinition
 from video_source import VideoSource, VideoSourceSpec
 
 logger = logging.getLogger(__name__)
@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 class DetectionWorker(QThread):
     frame_ready = Signal(object)
     event_ready = Signal(object)
+    event_updated = Signal(object)
     status_changed = Signal(str)
     source_opened = Signal(int, int, float)
     progress_changed = Signal(float)
@@ -89,6 +90,7 @@ class DetectionWorker(QThread):
         reconnect_attempts = 0
         last_zones = list(self._zones)
         failed = False
+        last_video_time: float | None = None
 
         try:
             engine = (
@@ -123,8 +125,10 @@ class DetectionWorker(QThread):
                         self.msleep(20)
                         continue
                     if source.spec.is_file and loop_playback:
+                        self._finalize_sessions(engine, last_video_time)
                         if source.restart_file():
                             engine.reset_tracking()
+                            last_video_time = None
                             self.status_changed.emit("测试视频循环播放")
                             continue
                     reconnect_attempts += 1
@@ -132,15 +136,18 @@ class DetectionWorker(QThread):
                         self.status_changed.emit("视频播放结束")
                         break
                     self.status_changed.emit(f"视频中断，正在重连 ({reconnect_attempts}/5)")
+                    self._finalize_sessions(engine, last_video_time)
                     source.close()
                     time.sleep(2.0)
                     if source.open():
                         engine.reset_tracking()
+                        last_video_time = None
                         continue
                     continue
 
                 reconnect_attempts = 0
-                annotated, events = engine.process(
+                last_video_time = video_time
+                annotated, transitions = engine.process(
                     frame,
                     video_time,
                     self.spec.value,
@@ -149,10 +156,8 @@ class DetectionWorker(QThread):
                 self.frame_ready.emit(annotated)
                 if source.spec.is_file and source.duration_seconds > 0:
                     self.progress_changed.emit(min(1.0, video_time / source.duration_seconds))
-                for event in events:
-                    stored_event = self.event_store.record(event, annotated)
-                    self.alarm_player.trigger()
-                    self.event_ready.emit(stored_event)
+                for transition in transitions:
+                    self._handle_transition(transition, annotated)
                 if source.spec.is_file:
                     self.msleep(max(1, int(source.wait_interval() * 1000)))
         except Exception as error:
@@ -160,6 +165,28 @@ class DetectionWorker(QThread):
             logger.exception("Detection worker stopped unexpectedly")
             self.status_changed.emit(f"检测错误: {error}")
         finally:
+            if "engine" in locals():
+                self._finalize_sessions(engine, last_video_time)
             source.close()
             if not failed:
                 self.status_changed.emit("检测已停止")
+
+    def _handle_transition(self, transition: SessionTransition, frame: np.ndarray) -> None:
+        event = transition.event
+        if transition.kind == "entered":
+            self.event_store.open_session(event, frame)
+            self.event_updated.emit(event)
+        elif transition.kind == "alarmed":
+            self.event_store.mark_alarmed(event, frame)
+            self.alarm_player.trigger()
+            self.event_updated.emit(event)
+            self.event_ready.emit(event)
+        else:
+            self.event_store.close_session(event)
+            self.event_updated.emit(event)
+
+    def _finalize_sessions(self, engine: DetectionEngine, video_time: float | None) -> None:
+        if video_time is None:
+            return
+        for transition in engine.finalize_active_sessions(video_time):
+            self._handle_transition(transition, np.empty((0, 0, 3), dtype=np.uint8))

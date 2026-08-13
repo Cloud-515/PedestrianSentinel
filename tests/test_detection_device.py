@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import unittest
+from datetime import datetime
 from unittest.mock import Mock, patch
 
 import numpy as np
 
 from detection_engine import DetectionEngine
 from inference_profiles import InferencePolicy
-from models import ZoneDefinition
+from models import AlarmEvent, ZoneDefinition
 
 
 class EmptyDetections:
@@ -28,6 +29,38 @@ class TrackedDetections:
 
 
 class DetectionDeviceTests(unittest.TestCase):
+    def test_monitor_event_times_use_local_computer_time(self) -> None:
+        timestamp = 1786588135.995
+        event = AlarmEvent(
+            source="rtsp://camera",
+            zone_name="区域1",
+            track_id="0",
+            entered_at_seconds=timestamp,
+            alarm_at_seconds=timestamp + 12.041,
+            wall_time="2026-08-13 10:29:08",
+            operation_mode="monitor",
+        )
+
+        entered_at = datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        alarm_at = datetime.fromtimestamp(timestamp + 12.041).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+        self.assertEqual(event.format_event_time(event.entered_at_seconds, precision=3), entered_at)
+        self.assertEqual(event.to_row()[4:7], [entered_at, alarm_at, "未记录"])
+
+    def test_video_event_times_remain_playback_seconds(self) -> None:
+        event = AlarmEvent(
+            source="test.mp4",
+            zone_name="区域1",
+            track_id="0",
+            entered_at_seconds=12.3456,
+            alarm_at_seconds=24.5678,
+            wall_time="2026-08-13 10:29:08",
+            operation_mode="video",
+        )
+
+        self.assertEqual(event.format_event_time(event.entered_at_seconds, precision=3), "12.346s")
+        self.assertEqual(event.to_row()[4:6], ["12.35s", "24.57s"])
+
     def test_engine_passes_device_only_to_inference(self) -> None:
         model = Mock()
         model.return_value = [object()]
@@ -139,10 +172,10 @@ class DetectionDeviceTests(unittest.TestCase):
 
         self.assertEqual(tracker.update.call_count, 2)
         self.assertEqual(engine.entry_times, {("警戒区", 7): 0.0})
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0].track_id, "7")
-        self.assertEqual(events[0].entered_at_seconds, 0.0)
-        self.assertEqual(events[0].alarm_at_seconds, 2.0)
+        self.assertEqual([transition.kind for transition in events], ["entered", "alarmed"])
+        self.assertEqual(events[-1].event.track_id, "7")
+        self.assertEqual(events[-1].event.entered_at_seconds, 0.0)
+        self.assertEqual(events[-1].event.alarm_at_seconds, 2.0)
 
     def test_low_power_tracking_reset_restarts_detector_cadence(self) -> None:
         model = Mock(return_value=[object()])
@@ -175,6 +208,66 @@ class DetectionDeviceTests(unittest.TestCase):
 
         self.assertEqual(model.call_count, 2)
         second_tracker.update.assert_called_once()
+
+    def test_intrusion_session_closes_short_visit_and_creates_new_session_on_reentry(self) -> None:
+        model = Mock(return_value=[object()])
+        tracker = Mock()
+        person = TrackedDetections([10, 10, 30, 50], track_id=4)
+        tracker.update.side_effect = [person, EmptyDetections(), person, EmptyDetections()]
+        zone = ZoneDefinition(
+            name="警戒区",
+            polygon=[[0, 0], [100, 0], [100, 100], [0, 100]],
+            closed=True,
+            dwell_seconds=5.0,
+        )
+        frame = np.zeros((120, 120, 3), dtype=np.uint8)
+
+        with (
+            patch("detection_engine.YOLO", return_value=model),
+            patch.object(DetectionEngine, "_new_tracker", return_value=tracker),
+            patch("detection_engine.sv.Detections.from_ultralytics", return_value=object()),
+        ):
+            engine = DetectionEngine("model.pt", [zone], "cpu")
+            _, entered = engine.process(frame, 10.0, "test.mp4")
+            _, exited = engine.process(frame, 12.0, "test.mp4")
+            _, reentered = engine.process(frame, 20.0, "test.mp4")
+            _, exited_again = engine.process(frame, 21.0, "test.mp4")
+
+        self.assertEqual([transition.kind for transition in entered], ["entered"])
+        self.assertEqual([transition.kind for transition in exited], ["exited"])
+        self.assertEqual(exited[0].event.duration_seconds, 2.0)
+        self.assertFalse(exited[0].event.alarmed)
+        self.assertEqual([transition.kind for transition in reentered], ["entered"])
+        self.assertNotEqual(entered[0].event.session_id, reentered[0].event.session_id)
+        self.assertEqual([transition.kind for transition in exited_again], ["exited"])
+
+    def test_intrusion_session_only_emits_one_alarm_while_target_remains(self) -> None:
+        model = Mock(return_value=[object()])
+        tracker = Mock()
+        person = TrackedDetections([10, 10, 30, 50], track_id=5)
+        tracker.update.side_effect = [person, person, person, EmptyDetections()]
+        zone = ZoneDefinition(
+            name="警戒区",
+            polygon=[[0, 0], [100, 0], [100, 100], [0, 100]],
+            closed=True,
+            dwell_seconds=2.0,
+        )
+        frame = np.zeros((120, 120, 3), dtype=np.uint8)
+
+        with (
+            patch("detection_engine.YOLO", return_value=model),
+            patch.object(DetectionEngine, "_new_tracker", return_value=tracker),
+            patch("detection_engine.sv.Detections.from_ultralytics", return_value=object()),
+        ):
+            engine = DetectionEngine("model.pt", [zone], "cpu")
+            transitions = []
+            for timestamp in (0.0, 2.0, 5.0, 6.0):
+                _, frame_transitions = engine.process(frame, timestamp, "test.mp4")
+                transitions.extend(frame_transitions)
+
+        self.assertEqual([transition.kind for transition in transitions], ["entered", "alarmed", "exited"])
+        self.assertEqual(transitions[1].event.alarm_at_seconds, 2.0)
+        self.assertEqual(transitions[-1].event.duration_seconds, 6.0)
 
     def test_format_elapsed_uses_seconds_and_milliseconds(self) -> None:
         self.assertEqual(DetectionEngine._format_elapsed(0), "0.000s")

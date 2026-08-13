@@ -505,41 +505,54 @@ class AlarmDetailDialog(QDialog):
         layout = QVBoxLayout(self)
         mode_label = "视频模式" if event.operation_mode == "video" else "监控模式"
         details = [
-            ("报警时间", event.wall_time),
+            ("进入时间", event.format_event_time(event.entered_at_seconds, precision=3)),
+            ("报警时间", event.format_event_time(event.alarm_at_seconds, precision=3)),
+            ("退出时间", event.format_event_time(event.exited_at_seconds, precision=3)),
+            ("闯入时长", f"{event.duration_seconds:.2f}s" if event.duration_seconds is not None else "未结算"),
+            ("状态", "未触发报警" if not event.alarmed else event.status),
             ("运行模式", mode_label),
             ("视频源", event.source),
             ("警戒区域", event.zone_name),
             ("目标 ID", event.track_id),
-            ("进入时刻", f"{event.entered_at_seconds:.3f}s"),
-            ("报警时刻", f"{event.alarm_at_seconds:.3f}s"),
-            ("截图路径", event.screenshot_path or "无"),
+            ("进入取证", event.entry_screenshot_path or "无"),
+            ("报警取证", event.alarm_screenshot_path or "无"),
         ]
         for label, value in details:
             layout.addWidget(QLabel(f"{label}: {value}"))
-        self.screenshot_label = QLabel("截图不可用")
-        self.screenshot_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.screenshot_label.setMinimumHeight(320)
-        if event.screenshot_path:
-            pixmap = QPixmap(event.screenshot_path)
-            if not pixmap.isNull():
-                self.screenshot_label.setPixmap(
-                    pixmap.scaled(
-                        680,
-                        360,
-                        Qt.AspectRatioMode.KeepAspectRatio,
-                        Qt.TransformationMode.SmoothTransformation,
+        screenshots = QHBoxLayout()
+        for title, screenshot_path in (
+            ("进入取证", event.entry_screenshot_path or event.screenshot_path),
+            ("报警取证", event.alarm_screenshot_path),
+        ):
+            screenshot_label = QLabel(f"{title}不可用")
+            screenshot_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            screenshot_label.setMinimumSize(330, 240)
+            if screenshot_path:
+                pixmap = QPixmap(screenshot_path)
+                if not pixmap.isNull():
+                    screenshot_label.setPixmap(
+                        pixmap.scaled(
+                            330,
+                            300,
+                            Qt.AspectRatioMode.KeepAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation,
+                        )
                     )
-                )
-        layout.addWidget(self.screenshot_label)
+            screenshots.addWidget(screenshot_label)
+        layout.addLayout(screenshots)
 
 
 class EventPanel(QGroupBox):
-    HEADERS = ["时间", "视频源", "区域", "目标ID", "进入时刻", "报警时刻", "截图路径"]
+    HEADERS = [
+        "记录时间", "视频源", "区域", "目标ID", "进入时刻", "报警时刻",
+        "退出时刻", "状态", "闯入时长", "进入取证", "报警取证",
+    ]
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__("报警记录", parent)
         layout = QVBoxLayout(self)
         self.table = QTableWidget(0, len(self.HEADERS))
+        self._rows_by_session: dict[str, int] = {}
         self.table.setHorizontalHeaderLabels(self.HEADERS)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -565,10 +578,14 @@ class EventPanel(QGroupBox):
             AlarmDetailDialog(event, self).exec()
 
     def append_event(self, event: AlarmEvent) -> None:
-        row = self.table.rowCount()
-        self.table.insertRow(row)
+        row = self._rows_by_session.get(event.session_id)
+        if row is None:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            self._rows_by_session[event.session_id] = row
         for column, value in enumerate(event.to_row()):
-            item = QTableWidgetItem(value)
+            item = self.table.item(row, column) or QTableWidgetItem()
+            item.setText(value)
             item.setToolTip(value)
             if column == 0:
                 item.setData(Qt.ItemDataRole.UserRole, event)
@@ -577,6 +594,7 @@ class EventPanel(QGroupBox):
 
     def clear(self) -> None:
         self.table.setRowCount(0)
+        self._rows_by_session.clear()
 
 
 class MainWindow(QMainWindow):
@@ -1125,6 +1143,7 @@ class MainWindow(QMainWindow):
         )
         self.worker.frame_ready.connect(self.video_widget.set_frame)
         self.worker.event_ready.connect(self._on_alarm_event)
+        self.worker.event_updated.connect(self._on_alarm_event_updated)
         self.worker.status_changed.connect(self.source_panel.set_status)
         self.worker.source_opened.connect(self._on_source_opened)
         self.worker.progress_changed.connect(self._on_progress_changed)
@@ -1176,9 +1195,11 @@ class MainWindow(QMainWindow):
     def _on_progress_changed(self, ratio: float) -> None:
         self.playback_panel.set_progress(ratio, self.video_duration)
 
-    def _on_alarm_event(self, event: AlarmEvent) -> None:
+    def _on_alarm_event_updated(self, event: AlarmEvent) -> None:
         if event.operation_mode == self.config.operation_mode:
             self.event_panel.append_event(event)
+
+    def _on_alarm_event(self, event: AlarmEvent) -> None:
         if (
             self._alarm_overlay_enabled
             and event.operation_mode == self.config.operation_mode

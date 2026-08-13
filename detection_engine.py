@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Hashable
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -13,9 +14,15 @@ from trackers import ByteTrackTracker
 from ultralytics import YOLO
 
 from inference_profiles import InferencePolicy
-from models import AlarmEvent, ZoneDefinition
+from models import AlarmEvent, SessionTransition, ZoneDefinition
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ActiveIntrusion:
+    event: AlarmEvent
+    last_seen_at_seconds: float
 
 
 class DetectionEngine:
@@ -37,8 +44,7 @@ class DetectionEngine:
         self.device = self.policy.device
         self.tracker = self._new_tracker()
         self.zones = [ZoneDefinition.from_dict(zone.to_dict()) for zone in zones]
-        self.entry_times: dict[tuple[str, Hashable], float] = {}
-        self.last_alarm_times: dict[tuple[str, Hashable], float] = {}
+        self.active_sessions: dict[tuple[str, Hashable], ActiveIntrusion] = {}
         self._processed_frames = 0
 
     @staticmethod
@@ -54,19 +60,37 @@ class DetectionEngine:
 
     def update_zones(self, zones: list[ZoneDefinition]) -> None:
         self.zones = [ZoneDefinition.from_dict(zone.to_dict()) for zone in zones]
-        names = {zone.name for zone in self.zones}
-        self.entry_times = {
-            key: value for key, value in self.entry_times.items() if key[0] in names
-        }
-        self.last_alarm_times = {
-            key: value for key, value in self.last_alarm_times.items() if key[0] in names
-        }
 
     def reset_tracking(self) -> None:
         self.tracker = self._new_tracker()
-        self.entry_times.clear()
-        self.last_alarm_times.clear()
+        self.active_sessions.clear()
         self._processed_frames = 0
+
+    def finalize_active_sessions(self, video_time: float) -> list[SessionTransition]:
+        transitions = [
+            self._close_session(key, video_time)
+            for key in list(self.active_sessions)
+        ]
+        return transitions
+
+    def _close_session(
+        self,
+        key: tuple[str, Hashable],
+        video_time: float,
+    ) -> SessionTransition:
+        session = self.active_sessions.pop(key)
+        event = session.event
+        event.exited_at_seconds = video_time
+        event.duration_seconds = max(0.0, video_time - event.entered_at_seconds)
+        event.status = "completed"
+        return SessionTransition("exited", event)
+
+    @property
+    def entry_times(self) -> dict[tuple[str, Hashable], float]:
+        return {
+            key: session.event.entered_at_seconds
+            for key, session in self.active_sessions.items()
+        }
 
     def process(
         self,
@@ -75,7 +99,7 @@ class DetectionEngine:
         source: str,
         operation_mode: str = "unknown",
         render: bool = True,
-    ) -> tuple[np.ndarray, list[AlarmEvent]]:
+    ) -> tuple[np.ndarray, list[SessionTransition]]:
         self._processed_frames += 1
         detect_this_frame = (
             (self._processed_frames - 1) % self.policy.detector_interval == 0
@@ -100,7 +124,7 @@ class DetectionEngine:
         track_ids = self._track_ids(detections)
         in_zone_ids: dict[str, set[Hashable]] = {zone.name: set() for zone in self.zones}
         in_zone_elapsed_seconds: dict[Hashable, float] = {}
-        events: list[AlarmEvent] = []
+        transitions: list[SessionTransition] = []
 
         for index, track_id in enumerate(track_ids):
             if track_id is None or index >= len(detections.xyxy):
@@ -112,37 +136,38 @@ class DetectionEngine:
                     continue
                 in_zone_ids[zone.name].add(track_id)
                 key = (zone.name, track_id)
-                entered_at = self.entry_times.setdefault(key, video_time)
-                elapsed_seconds = max(0.0, video_time - entered_at)
-                in_zone_elapsed_seconds[track_id] = max(
-                    in_zone_elapsed_seconds.get(track_id, 0.0), elapsed_seconds
-                )
-                last_alarm_at = self.last_alarm_times.get(key)
-                if elapsed_seconds < zone.dwell_seconds:
-                    continue
-                if last_alarm_at is not None and video_time - last_alarm_at < zone.cooldown_seconds:
-                    continue
-                self.last_alarm_times[key] = video_time
-                events.append(
-                    AlarmEvent(
+                session = self.active_sessions.get(key)
+                if session is None:
+                    event = AlarmEvent(
                         source=source,
                         operation_mode=operation_mode,
                         zone_name=zone.name,
                         track_id=str(track_id),
-                        entered_at_seconds=entered_at,
-                        alarm_at_seconds=video_time,
+                        entered_at_seconds=video_time,
+                        alarm_at_seconds=None,
                         wall_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     )
+                    session = ActiveIntrusion(event, video_time)
+                    self.active_sessions[key] = session
+                    transitions.append(SessionTransition("entered", event))
+                session.last_seen_at_seconds = video_time
+                elapsed_seconds = max(0.0, video_time - session.event.entered_at_seconds)
+                in_zone_elapsed_seconds[track_id] = max(
+                    in_zone_elapsed_seconds.get(track_id, 0.0), elapsed_seconds
                 )
+                if not session.event.alarmed and elapsed_seconds >= zone.dwell_seconds:
+                    session.event.alarm_at_seconds = video_time
+                    session.event.status = "alarmed"
+                    transitions.append(SessionTransition("alarmed", session.event))
 
         active_keys = {
             (zone_name, track_id)
             for zone_name, ids in in_zone_ids.items()
             for track_id in ids
         }
-        self.entry_times = {
-            key: value for key, value in self.entry_times.items() if key in active_keys
-        }
+        for key in list(self.active_sessions):
+            if key not in active_keys:
+                transitions.append(self._close_session(key, video_time))
 
         if render:
             annotated = self._annotate(
@@ -153,7 +178,7 @@ class DetectionEngine:
             )
         else:
             annotated = frame
-        return annotated, events
+        return annotated, transitions
 
     @staticmethod
     def _track_ids(detections: sv.Detections) -> list[Hashable | None]:
