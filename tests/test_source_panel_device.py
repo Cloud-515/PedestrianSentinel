@@ -38,6 +38,24 @@ class SourcePanelDeviceTests(unittest.TestCase):
         panel.set_running(False)
         self.assertTrue(panel.device_combo.isEnabled())
 
+    def test_armed_control_is_available_only_while_running_and_resets_silently(self) -> None:
+        panel = SourcePanel()
+        changes: list[bool] = []
+        panel.armed_cb.toggled.connect(changes.append)
+
+        self.assertTrue(panel.armed_cb.isChecked())
+        self.assertFalse(panel.armed_cb.isEnabled())
+
+        panel.set_running(True)
+        self.assertTrue(panel.armed_cb.isEnabled())
+        panel.armed_cb.setChecked(False)
+        self.assertEqual(changes, [False])
+
+        panel.set_running(False)
+        self.assertTrue(panel.armed_cb.isChecked())
+        self.assertFalse(panel.armed_cb.isEnabled())
+        self.assertEqual(changes, [False])
+
     def test_operation_mode_updates_source_hint(self) -> None:
         panel = SourcePanel()
         panel.set_operation_mode("video")

@@ -4,11 +4,11 @@ from typing import Optional
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QImage, QPainter, QPen
+from PySide6.QtCore import QPointF, QRectF, QTimer, Qt, Signal
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QImage, QPainter, QPen
 from PySide6.QtWidgets import QWidget
 
-from models import ZoneDefinition
+from models import AlarmEvent, ZoneDefinition
 
 
 class VideoWidget(QWidget):
@@ -26,6 +26,14 @@ class VideoWidget(QWidget):
         self._active_zone: ZoneDefinition | None = None
         self._drag_index: int | None = None
         self._video_rect = QRectF()
+        self._pending_alarm_events: dict[tuple[str, str], AlarmEvent] = {}
+        self._displayed_alarm_events: list[AlarmEvent] = []
+        self._aggregation_timer = QTimer(self)
+        self._aggregation_timer.setSingleShot(True)
+        self._aggregation_timer.timeout.connect(self._flush_alarm_batch)
+        self._alarm_timer = QTimer(self)
+        self._alarm_timer.setSingleShot(True)
+        self._alarm_timer.timeout.connect(self.clear_alarm)
 
     def set_frame(self, frame: np.ndarray) -> None:
         height, width = frame.shape[:2]
@@ -85,7 +93,84 @@ class VideoWidget(QWidget):
             return
         painter.drawImage(self._video_rect, self._image)
         self._draw_zones(painter)
+        self._draw_alarm_banner(painter)
         self.mapping_changed.emit(self.coordinate_mapping())
+
+    def show_alarm(self, event: AlarmEvent) -> None:
+        key = (event.zone_name, event.track_id)
+        self._pending_alarm_events[key] = event
+        if not self._aggregation_timer.isActive():
+            self._aggregation_timer.start(800)
+        self._alarm_timer.start(5000)
+
+    def clear_alarm(self) -> None:
+        self._aggregation_timer.stop()
+        self._alarm_timer.stop()
+        if not self._pending_alarm_events and not self._displayed_alarm_events:
+            return
+        self._pending_alarm_events.clear()
+        self._displayed_alarm_events.clear()
+        self.update()
+
+    def _flush_alarm_batch(self) -> None:
+        if not self._pending_alarm_events:
+            return
+        self._displayed_alarm_events = list(self._pending_alarm_events.values())
+        self._pending_alarm_events.clear()
+        self.update()
+
+    def _draw_alarm_banner(self, painter: QPainter) -> None:
+        if not self._displayed_alarm_events or self._video_rect.isEmpty():
+            return
+        max_details = 4
+        total_events = len(self._displayed_alarm_events)
+        detail_events = self._displayed_alarm_events[:max_details]
+        overflow_count = total_events - len(detail_events)
+        font = QFont(self.font())
+        font.setBold(True)
+        font.setPointSize(12)
+        metrics = QFontMetrics(font)
+        row_height = metrics.height() + 4
+        row_count = 1 + len(detail_events) + (1 if overflow_count else 0)
+        banner_height = row_count * row_height + 20
+        banner = QRectF(
+            self._video_rect.x() + 12,
+            self._video_rect.y() + 12,
+            max(0.0, self._video_rect.width() - 24),
+            min(banner_height, max(0.0, self._video_rect.height() - 24)),
+        )
+        painter.save()
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(211, 47, 47, 179))
+        painter.drawRoundedRect(banner, 4, 4)
+        painter.setPen(QColor("#FFFFFF"))
+        painter.setFont(font)
+        text_rect = banner.adjusted(16, 10, -16, -10)
+        lines = [f"入侵报警  |  共 {total_events} 条报警"]
+        lines.extend(
+            f"目标 {event.track_id} 进入区域：{event.zone_name}  |  {event.wall_time}"
+            for event in detail_events
+        )
+        if overflow_count:
+            lines.append(f"另有 {overflow_count} 条报警")
+        for index, line in enumerate(lines):
+            row = QRectF(
+                text_rect.x(),
+                text_rect.y() + index * row_height,
+                text_rect.width(),
+                row_height,
+            )
+            elided = metrics.elidedText(
+                line,
+                Qt.TextElideMode.ElideRight,
+                round(row.width()),
+            )
+            painter.drawText(
+                row,
+                Qt.AlignmentFlag.AlignVCenter | Qt.TextFlag.TextSingleLine,
+                elided,
+            )
+        painter.restore()
 
     def resizeEvent(self, event: object) -> None:
         super().resizeEvent(event)

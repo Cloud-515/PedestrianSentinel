@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QScrollArea,
+    QSizePolicy,
     QSlider,
     QStyledItemDelegate,
     QSplitter,
@@ -46,6 +47,7 @@ from detection_worker import DetectionWorker
 from inference_profiles import resolve_inference_policy
 from models import AlarmEvent, AppConfig, ZoneDefinition, ZoneProfile
 from profile_store import ProfileStore
+from source_history import add_history_entry
 from video_source import VideoSourceSpec
 from video_widget import VideoWidget
 
@@ -61,6 +63,21 @@ PROFILES_DIR = APP_DIR / "profiles"
 # 右侧面板：视频源区
 # ---------------------------------------------------------------------------
 
+class EditableSourceComboBox(QComboBox):
+    def text(self) -> str:
+        return self.currentText()
+
+    def setText(self, value: str) -> None:
+        self.setEditText(value)
+
+    def placeholderText(self) -> str:
+        return self.lineEdit().placeholderText() if self.lineEdit() else ""
+
+    def setPlaceholderText(self, value: str) -> None:
+        if self.lineEdit() is not None:
+            self.lineEdit().setPlaceholderText(value)
+
+
 class SourcePanel(QGroupBox):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__("视频源", parent)
@@ -68,16 +85,25 @@ class SourcePanel(QGroupBox):
 
         # 来源输入行
         src_row = QHBoxLayout()
+        src_row.setContentsMargins(0, 0, 0, 0)
+        src_row.setSpacing(6)
         self.source_label = QLabel("监控来源:")
-        self.source_edit = QLineEdit("0")
+        self.source_label.setSizePolicy(
+            QSizePolicy.Policy.Fixed,
+            QSizePolicy.Policy.Preferred,
+        )
+        self.source_edit = EditableSourceComboBox()
+        self.source_edit.setEditable(True)
+        self.source_edit.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.source_edit.setEditText("0")
         self.source_edit.setPlaceholderText("摄像头索引或实时流地址")
         self.browse_btn = QPushButton("…")
         self.browse_btn.setFixedWidth(28)
         self.browse_btn.setToolTip("选择视频文件")
         self.browse_btn.clicked.connect(self._browse_file)
-        src_row.addWidget(self.source_label)
-        src_row.addWidget(self.source_edit)
-        src_row.addWidget(self.browse_btn)
+        src_row.addWidget(self.source_label, 0, Qt.AlignmentFlag.AlignVCenter)
+        src_row.addWidget(self.source_edit, 1)
+        src_row.addWidget(self.browse_btn, 0)
         layout.addLayout(src_row)
 
         type_row = QHBoxLayout()
@@ -107,6 +133,11 @@ class SourcePanel(QGroupBox):
         device_row.addWidget(self.device_combo, 1)
         layout.addLayout(device_row)
 
+        self.armed_cb = QCheckBox("警戒检测与报警")
+        self.armed_cb.setChecked(True)
+        self.armed_cb.setEnabled(False)
+        layout.addWidget(self.armed_cb)
+
         # 打开 / 停止
         btn_row = QHBoxLayout()
         self.open_btn = QPushButton("▶ 打开")
@@ -131,6 +162,15 @@ class SourcePanel(QGroupBox):
 
     def get_source(self) -> str:
         return self.source_edit.text().strip()
+
+    def refresh_source_history(self, history: list[str]) -> None:
+        # 刷新候选项时保留用户正在编辑的输入。
+        current_text = self.source_edit.currentText()
+        self.source_edit.blockSignals(True)
+        self.source_edit.clear()
+        self.source_edit.addItems(history)
+        self.source_edit.setEditText(current_text)
+        self.source_edit.blockSignals(False)
 
     def set_operation_mode(self, operation_mode: str) -> None:
         is_video = operation_mode == "video"
@@ -176,6 +216,13 @@ class SourcePanel(QGroupBox):
         self.file_radio.setEnabled(not running)
         self.test_mode_cb.setEnabled(not running)
         self.device_combo.setEnabled(not running)
+        if running:
+            self.armed_cb.setEnabled(True)
+        else:
+            self.armed_cb.blockSignals(True)
+            self.armed_cb.setChecked(True)
+            self.armed_cb.blockSignals(False)
+            self.armed_cb.setEnabled(False)
 
 
 # ---------------------------------------------------------------------------
@@ -679,6 +726,11 @@ class MainWindow(QMainWindow):
             if self.config.operation_mode == "video"
             else self.config.monitor_source
         )
+        self.source_panel.refresh_source_history(
+            self.config.file_history
+            if self.config.operation_mode == "video"
+            else self.config.camera_history
+        )
         device_options = enumerate_inference_devices()
         restored = self.source_panel.set_device_options(
             device_options,
@@ -715,6 +767,7 @@ class MainWindow(QMainWindow):
     def _connect_signals(self) -> None:
         self.source_panel.open_btn.clicked.connect(self.start_detection)
         self.source_panel.stop_btn.clicked.connect(self.stop_detection)
+        self.source_panel.armed_cb.toggled.connect(self._set_armed)
         self.settings_btn.clicked.connect(lambda: self.sidebar_pages.setCurrentIndex(1))
         self.settings_panel.back_btn.clicked.connect(
             lambda: self.sidebar_pages.setCurrentIndex(0)
@@ -1048,6 +1101,9 @@ class MainWindow(QMainWindow):
         self.source_panel.source_edit.setText(
             self.config.video_source if operation_mode == "video" else self.config.monitor_source
         )
+        self.source_panel.refresh_source_history(
+            self.config.file_history if operation_mode == "video" else self.config.camera_history
+        )
         self.playback_panel.setVisible(operation_mode == "video")
         self._load_event_history()
         self._update_playback_enabled()
@@ -1170,6 +1226,17 @@ class MainWindow(QMainWindow):
         self.source_panel.set_status("正在停止检测…")
         self.worker.stop()
 
+    def _set_armed(self, armed: bool) -> None:
+        if self.worker is None or not self.worker.isRunning():
+            return
+        self.worker.set_armed(armed)
+        self._alarm_overlay_enabled = armed
+        if not armed:
+            self.video_widget.clear_alarm()
+            self.source_panel.set_status("已撤防：检测与报警已暂停，视频预览继续。")
+        else:
+            self.source_panel.set_status("已恢复警戒：检测与报警已启用。")
+
     def _on_worker_finished(self) -> None:
         finished_worker = self.worker
         self.worker = None
@@ -1188,6 +1255,21 @@ class MainWindow(QMainWindow):
         self.video_duration = duration
         self.config.source_size = [width, height]
         self.playback_panel.set_progress(0.0, duration)
+        source = self.source_panel.get_source()
+        if self._is_file_mode():
+            self.config.file_history = add_history_entry(
+                self.config.file_history,
+                source,
+                file_source=True,
+            )
+            history = self.config.file_history
+        else:
+            self.config.camera_history = add_history_entry(
+                self.config.camera_history,
+                source,
+            )
+            history = self.config.camera_history
+        self.source_panel.refresh_source_history(history)
         kind = "视频文件" if self._is_file_mode() else "摄像头"
         self.source_panel.set_status(f"{kind}已打开：{width}×{height}")
         self._schedule_config_save()

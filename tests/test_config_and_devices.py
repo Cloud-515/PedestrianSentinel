@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import compute_devices
 from models import AppConfig
+from source_history import add_history_entry
 
 
 class AppConfigDeviceTests(unittest.TestCase):
@@ -44,6 +45,33 @@ class AppConfigDeviceTests(unittest.TestCase):
     def test_config_rejects_unknown_operation_mode(self) -> None:
         config = AppConfig.from_dict({"operation_mode": "unknown"})
         self.assertEqual(config.operation_mode, "monitor")
+
+    def test_source_histories_round_trip_with_normalization(self) -> None:
+        config = AppConfig.from_dict(
+            {
+                "camera_history": [" 0 ", "rtsp://camera/live", "0", None],
+                "file_history": ["demo.mp4", "./demo.mp4", "", 1],
+            }
+        )
+
+        self.assertEqual(config.camera_history, ["0", "rtsp://camera/live"])
+        self.assertEqual(len(config.file_history), 1)
+        self.assertTrue(config.file_history[0].endswith("demo.mp4"))
+        self.assertEqual(
+            AppConfig.from_dict(config.to_dict()).file_history,
+            config.file_history,
+        )
+
+    def test_file_history_addition_deduplicates_existing_case_variants(self) -> None:
+        history = add_history_entry(
+            ["Archive.mp4", "archive.mp4"],
+            "latest.mp4",
+            file_source=True,
+        )
+
+        self.assertEqual(len(history), 2)
+        self.assertTrue(history[0].endswith("latest.mp4"))
+        self.assertTrue(history[1].endswith("Archive.mp4"))
 
 
 class DeviceDiscoveryTests(unittest.TestCase):

@@ -15,7 +15,12 @@ logger = logging.getLogger(__name__)
 
 
 class AlarmPlayer:
-    def __init__(self) -> None:
+    def __init__(self, warning_audio_path: str | Path | None = None) -> None:
+        self.warning_audio_path = (
+            Path(warning_audio_path)
+            if warning_audio_path is not None
+            else Path(__file__).resolve().with_name("warming_converted.wav")
+        )
         self._lock = threading.Lock()
         self._is_playing = False
 
@@ -30,8 +35,11 @@ class AlarmPlayer:
         try:
             import winsound
 
-            winsound.Beep(1000, 400)
-        except (ImportError, RuntimeError) as error:
+            winsound.PlaySound(
+                str(self.warning_audio_path),
+                winsound.SND_FILENAME | winsound.SND_NODEFAULT,
+            )
+        except (ImportError, OSError, RuntimeError) as error:
             logger.warning("Unable to play alarm: %s", error)
         finally:
             with self._lock:

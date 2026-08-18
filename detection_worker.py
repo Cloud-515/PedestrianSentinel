@@ -49,6 +49,9 @@ class DetectionWorker(QThread):
         self._paused = False
         self._loop_playback = spec.loop_playback
         self._speed = spec.speed
+        self._armed = True
+        self._arm_generation = 0
+        self._applied_arm_generation = 0
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -74,6 +77,13 @@ class DetectionWorker(QThread):
     def set_speed(self, speed: float) -> None:
         with self._control_lock:
             self._speed = max(0.1, speed)
+
+    def set_armed(self, armed: bool) -> None:
+        with self._control_lock:
+            if self._armed == armed:
+                return
+            self._armed = armed
+            self._arm_generation += 1
 
     def set_zones(self, zones: list[ZoneDefinition]) -> None:
         with self._control_lock:
@@ -147,6 +157,17 @@ class DetectionWorker(QThread):
 
                 reconnect_attempts = 0
                 last_video_time = video_time
+                armed = self._sync_armed_state(engine)
+                if not armed:
+                    self.frame_ready.emit(frame)
+                    if source.spec.is_file and source.duration_seconds > 0:
+                        self.progress_changed.emit(
+                            min(1.0, video_time / source.duration_seconds)
+                        )
+                    if source.spec.is_file:
+                        self.msleep(max(1, int(source.wait_interval() * 1000)))
+                    continue
+
                 annotated, transitions = engine.process(
                     frame,
                     video_time,
@@ -171,7 +192,20 @@ class DetectionWorker(QThread):
             if not failed:
                 self.status_changed.emit("检测已停止")
 
+    def _sync_armed_state(self, engine: DetectionEngine) -> bool:
+        with self._control_lock:
+            armed = self._armed
+            arm_generation = self._arm_generation
+        if arm_generation != self._applied_arm_generation:
+            # 每次布撤防切换都丢弃旧轨迹，避免跨状态产生误报。
+            engine.reset_tracking()
+            self._applied_arm_generation = arm_generation
+        return armed
+
     def _handle_transition(self, transition: SessionTransition, frame: np.ndarray) -> None:
+        with self._control_lock:
+            if not self._armed:
+                return
         event = transition.event
         if transition.kind == "entered":
             self.event_store.open_session(event, frame)

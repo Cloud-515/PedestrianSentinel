@@ -1,18 +1,19 @@
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import cv2
 import numpy as np
 
-from alarm_service import EventStore
+from alarm_service import AlarmPlayer, EventStore
 from detection_worker import DetectionWorker
 from inference_profiles import InferencePolicy
-from models import AlarmEvent
+from models import AlarmEvent, SessionTransition
 from video_source import VideoSourceSpec
 
 
@@ -35,6 +36,29 @@ class FakeVideoSource:
 
 
 class WorkerDeviceTests(unittest.TestCase):
+    def test_alarm_player_plays_configured_wav_file(self) -> None:
+        audio_path = Path("warning.wav")
+        player = AlarmPlayer(audio_path)
+        winsound = Mock(SND_FILENAME=1, SND_NODEFAULT=2)
+
+        with patch.dict(sys.modules, {"winsound": winsound}):
+            player._play()
+
+        winsound.PlaySound.assert_called_once_with(
+            str(audio_path),
+            winsound.SND_FILENAME | winsound.SND_NODEFAULT,
+        )
+        self.assertFalse(player._is_playing)
+
+    def test_alarm_player_ignores_trigger_while_playing(self) -> None:
+        player = AlarmPlayer()
+        player._is_playing = True
+
+        with patch("alarm_service.threading.Thread") as thread:
+            player.trigger()
+
+        thread.assert_not_called()
+
     def test_event_store_folds_intrusion_session_updates(self) -> None:
         root = Path(tempfile.mkdtemp()) / "events"
         store = EventStore(root)
@@ -147,6 +171,134 @@ class WorkerDeviceTests(unittest.TestCase):
 
         engine_factory.assert_called_once_with("model_openvino", [], "cpu", policy)
         self.assertTrue(statuses[-1].startswith("检测错误:"))
+
+    def test_disarmed_worker_keeps_preview_without_detection_side_effects(self) -> None:
+        frame = np.zeros((12, 16, 3), dtype=np.uint8)
+        event = AlarmEvent(
+            source="test.mp4",
+            zone_name="警戒区",
+            track_id="7",
+            entered_at_seconds=1.0,
+            alarm_at_seconds=2.0,
+            wall_time="2026-08-17 10:00:00",
+            operation_mode="video",
+        )
+
+        class ControlledSource:
+            def __init__(self, spec: VideoSourceSpec) -> None:
+                self.spec = spec
+                self.width = 640
+                self.height = 480
+                self.duration_seconds = 10.0
+                self._reads = [(True, frame, 1.0), (False, None, None)]
+
+            def open(self) -> bool:
+                return True
+
+            def read(self) -> tuple[bool, np.ndarray | None, float | None]:
+                return self._reads.pop(0)
+
+            def is_paused(self) -> bool:
+                return False
+
+            def wait_interval(self) -> float:
+                return 0.001
+
+            def restart_file(self) -> bool:
+                return False
+
+            def close(self) -> None:
+                pass
+
+        engine = Mock()
+        engine.finalize_active_sessions.return_value = [SessionTransition("exited", event)]
+        store = Mock()
+        worker = DetectionWorker(
+            spec=VideoSourceSpec("test.mp4", operation_mode="video"),
+            model_path="model.pt",
+            device="cpu",
+            zones=[],
+            event_store=store,
+        )
+        worker.alarm_player = Mock()
+        frames: list[np.ndarray] = []
+        updates: list[AlarmEvent] = []
+        alarms: list[AlarmEvent] = []
+        worker.frame_ready.connect(frames.append)
+        worker.event_updated.connect(updates.append)
+        worker.event_ready.connect(alarms.append)
+        worker.set_armed(False)
+
+        with (
+            patch("detection_worker.VideoSource", ControlledSource),
+            patch("detection_worker.DetectionEngine", return_value=engine),
+        ):
+            worker.run()
+
+        self.assertEqual(len(frames), 1)
+        np.testing.assert_array_equal(frames[0], frame)
+        engine.process.assert_not_called()
+        engine.reset_tracking.assert_called_once_with()
+        store.open_session.assert_not_called()
+        store.mark_alarmed.assert_not_called()
+        store.close_session.assert_not_called()
+        worker.alarm_player.trigger.assert_not_called()
+        self.assertEqual(updates, [])
+        self.assertEqual(alarms, [])
+
+    def test_arm_state_edges_reset_tracking_once_each(self) -> None:
+        worker = DetectionWorker(
+            spec=VideoSourceSpec("test.mp4", operation_mode="video"),
+            model_path="model.pt",
+            device="cpu",
+            zones=[],
+            event_store=Mock(),
+        )
+        engine = Mock()
+
+        self.assertTrue(worker._sync_armed_state(engine))
+        worker.set_armed(False)
+        self.assertFalse(worker._sync_armed_state(engine))
+        worker.set_armed(False)
+        self.assertFalse(worker._sync_armed_state(engine))
+        worker.set_armed(True)
+        self.assertTrue(worker._sync_armed_state(engine))
+
+        self.assertEqual(engine.reset_tracking.call_count, 2)
+
+    def test_disarming_before_transition_persistence_discards_transition(self) -> None:
+        event = AlarmEvent(
+            source="camera",
+            zone_name="警戒区",
+            track_id="7",
+            entered_at_seconds=1.0,
+            alarm_at_seconds=2.0,
+            wall_time="2026-08-17 10:00:00",
+            operation_mode="monitor",
+        )
+        store = Mock()
+        worker = DetectionWorker(
+            spec=VideoSourceSpec("camera", operation_mode="monitor"),
+            model_path="model.pt",
+            device="cpu",
+            zones=[],
+            event_store=store,
+        )
+        worker.alarm_player = Mock()
+        updates: list[AlarmEvent] = []
+        alarms: list[AlarmEvent] = []
+        worker.event_updated.connect(updates.append)
+        worker.event_ready.connect(alarms.append)
+        worker.set_armed(False)
+
+        worker._handle_transition(
+            SessionTransition("alarmed", event), np.zeros((2, 2, 3), dtype=np.uint8)
+        )
+
+        store.mark_alarmed.assert_not_called()
+        worker.alarm_player.trigger.assert_not_called()
+        self.assertEqual(updates, [])
+        self.assertEqual(alarms, [])
 
 
 if __name__ == "__main__":

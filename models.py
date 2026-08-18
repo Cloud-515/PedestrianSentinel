@@ -5,6 +5,8 @@ from datetime import datetime
 from typing import Any, Literal
 from uuid import uuid4
 
+from source_history import load_history
+
 
 @dataclass
 class ZoneDefinition:
@@ -70,6 +72,8 @@ class AppConfig:
     operation_mode: str = "monitor"
     video_source: str = ""
     monitor_source: str = "0"
+    camera_history: list[str] = field(default_factory=list)
+    file_history: list[str] = field(default_factory=list)
     active_profile: str = ""
     loop_playback: bool = True
     playback_speed: float = 1.0
@@ -103,6 +107,8 @@ class AppConfig:
             operation_mode=operation_mode,
             video_source=video_source,
             monitor_source=monitor_source,
+            camera_history=load_history(data.get("camera_history")),
+            file_history=load_history(data.get("file_history"), file_source=True),
             active_profile=str(data.get("active_profile", "")),
             loop_playback=bool(data.get("loop_playback", True)),
             playback_speed=float(data.get("playback_speed", 1.0)),
@@ -125,6 +131,8 @@ class AppConfig:
             "operation_mode": self.operation_mode,
             "video_source": self.video_source,
             "monitor_source": self.monitor_source,
+            "camera_history": self.camera_history,
+            "file_history": self.file_history,
             "active_profile": self.active_profile,
             "loop_playback": self.loop_playback,
             "playback_speed": self.playback_speed,
