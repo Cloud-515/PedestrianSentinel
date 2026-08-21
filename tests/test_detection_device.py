@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from contextlib import contextmanager
 from datetime import datetime
 from unittest.mock import Mock, patch
 
@@ -346,6 +347,155 @@ class DetectionDeviceTests(unittest.TestCase):
         labels = [call.args[1] for call in put_text.call_args_list if call.args[1].startswith("ID:")]
         self.assertEqual(labels[-1], "ID:1 IN ZONE 5.000s")
         self.assertEqual(len(labels), 2)
+
+
+class AlarmCooldownTests(unittest.TestCase):
+    """冷却时间：同一目标同一区域在冷却期内不重复报警。
+
+    这里的重点是「离开又立刻回来」。区域边界上的徘徊、或者 ByteTrack 丢一帧 ID
+    又找回，都会关掉旧会话、开一个新会话并重新计时 —— 如果不看冷却，每一轮都会
+    放告警音、写一条 JSONL、存一张截图。
+    """
+
+    @staticmethod
+    def _zone(name: str = "警戒区", **overrides: float) -> ZoneDefinition:
+        return ZoneDefinition(
+            name=name,
+            polygon=[[0, 0], [100, 0], [100, 100], [0, 100]],
+            closed=True,
+            **overrides,
+        )
+
+    @contextmanager
+    def _engine(self, zone: ZoneDefinition, frames: list[object]):
+        """构造一个由假 tracker 驱动的引擎：frames 里每一项就是那一帧的检测结果。"""
+        model = Mock(return_value=[object()])
+        tracker = Mock()
+        tracker.update.side_effect = frames
+        with (
+            patch("detection_engine.YOLO", return_value=model),
+            patch.object(DetectionEngine, "_new_tracker", return_value=tracker),
+            patch("detection_engine.sv.Detections.from_ultralytics", return_value=object()),
+        ):
+            yield DetectionEngine("model.pt", [zone], "cpu")
+
+    @staticmethod
+    def _drive(engine: DetectionEngine, timestamps: list[float]) -> list:
+        frame = np.zeros((120, 120, 3), dtype=np.uint8)
+        transitions = []
+        for timestamp in timestamps:
+            _, frame_transitions = engine.process(frame, timestamp, "test.mp4")
+            transitions.extend(frame_transitions)
+        return transitions
+
+    @staticmethod
+    def _alarm_times(transitions: list) -> list[float]:
+        return [
+            transition.event.alarm_at_seconds
+            for transition in transitions
+            if transition.kind == "alarmed"
+        ]
+
+    def test_cooldown_suppresses_alarm_when_target_reenters_zone(self) -> None:
+        zone = self._zone(dwell_seconds=2.0, cooldown_seconds=10.0)
+        person = TrackedDetections([10, 10, 30, 50], track_id=8)
+        frames = [person, person, EmptyDetections(), person, person, EmptyDetections()]
+
+        with self._engine(zone, frames) as engine:
+            transitions = self._drive(engine, [0.0, 2.0, 3.0, 4.0, 6.0, 7.0])
+
+        self.assertEqual(
+            [transition.kind for transition in transitions],
+            ["entered", "alarmed", "exited", "entered", "exited"],
+        )
+        # 第二个会话被压住：没有 alarmed，事件也不能标成已报警，否则界面会显示成误报。
+        self.assertFalse(transitions[-1].event.alarmed)
+        self.assertIsNone(transitions[-1].event.alarm_at_seconds)
+
+    def test_cooldown_lapse_allows_alarm_on_later_reentry(self) -> None:
+        zone = self._zone(dwell_seconds=2.0, cooldown_seconds=10.0)
+        person = TrackedDetections([10, 10, 30, 50], track_id=8)
+        frames = [person, person, EmptyDetections(), person, person]
+
+        with self._engine(zone, frames) as engine:
+            transitions = self._drive(engine, [0.0, 2.0, 3.0, 20.0, 22.0])
+
+        self.assertEqual(self._alarm_times(transitions), [2.0, 22.0])
+
+    def test_suppressed_session_still_alarms_once_cooldown_lapses(self) -> None:
+        """被压住的会话不会被永久吞掉：目标一直没走，冷却期一过就补报一次。"""
+        zone = self._zone(dwell_seconds=2.0, cooldown_seconds=10.0)
+        person = TrackedDetections([10, 10, 30, 50], track_id=8)
+        frames = [person, person, EmptyDetections(), person, person, person]
+
+        with self._engine(zone, frames) as engine:
+            transitions = self._drive(engine, [0.0, 2.0, 3.0, 4.0, 6.0, 12.0])
+
+        self.assertEqual(self._alarm_times(transitions), [2.0, 12.0])
+
+    def test_cooldown_is_tracked_per_target(self) -> None:
+        zone = self._zone(dwell_seconds=2.0, cooldown_seconds=10.0)
+        first = TrackedDetections([10, 10, 30, 50], track_id=1)
+        second = TrackedDetections([10, 10, 30, 50], track_id=2)
+        frames = [first, first, second, second]
+
+        with self._engine(zone, frames) as engine:
+            transitions = self._drive(engine, [0.0, 2.0, 3.0, 5.0])
+
+        # 换了目标就该报 —— 冷却只压同一个 (区域, 目标ID)。
+        alarmed = [transition for transition in transitions if transition.kind == "alarmed"]
+        self.assertEqual([transition.event.track_id for transition in alarmed], ["1", "2"])
+
+    def test_zero_cooldown_alarms_on_every_reentry(self) -> None:
+        zone = self._zone(dwell_seconds=2.0, cooldown_seconds=0.0)
+        person = TrackedDetections([10, 10, 30, 50], track_id=8)
+        frames = [person, person, EmptyDetections(), person, person]
+
+        with self._engine(zone, frames) as engine:
+            transitions = self._drive(engine, [0.0, 2.0, 3.0, 4.0, 6.0])
+
+        self.assertEqual(self._alarm_times(transitions), [2.0, 6.0])
+
+    def test_reset_tracking_clears_cooldown_history(self) -> None:
+        """布撤防切换、换源、循环播放都会 reset —— 时间轴变了，旧的报警时刻不能留。"""
+        zone = self._zone(dwell_seconds=2.0, cooldown_seconds=10.0)
+        person = TrackedDetections([10, 10, 30, 50], track_id=8)
+        frames = [person, person, person, person]
+
+        with self._engine(zone, frames) as engine:
+            transitions = self._drive(engine, [0.0, 2.0])
+            engine.reset_tracking()
+            transitions.extend(self._drive(engine, [3.0, 5.0]))
+
+        self.assertEqual(self._alarm_times(transitions), [2.0, 5.0])
+
+    def test_cooldown_history_is_pruned_once_it_stops_mattering(self) -> None:
+        """ByteTrack 的 ID 只增不减，这个 dict 不清理的话会一直长。"""
+        zone = self._zone(dwell_seconds=2.0, cooldown_seconds=10.0)
+        person = TrackedDetections([10, 10, 30, 50], track_id=8)
+        frames = [person, person, EmptyDetections(), EmptyDetections()]
+
+        with self._engine(zone, frames) as engine:
+            self._drive(engine, [0.0, 2.0])
+            self.assertEqual(list(engine._last_alarm_at), [("警戒区", 8)])
+            self._drive(engine, [3.0])
+            self.assertEqual(list(engine._last_alarm_at), [("警戒区", 8)])
+            self._drive(engine, [20.0])
+            self.assertEqual(engine._last_alarm_at, {})
+
+    def test_cooldown_history_drops_entries_for_removed_zones(self) -> None:
+        zone = self._zone(dwell_seconds=2.0, cooldown_seconds=10.0)
+        person = TrackedDetections([10, 10, 30, 50], track_id=8)
+        frames = [person, person, EmptyDetections()]
+
+        with self._engine(zone, frames) as engine:
+            self._drive(engine, [0.0, 2.0])
+            # 区域被改名或删掉之后，它名下的冷却记录永远不会再被查到，留着只是泄漏。
+            engine.update_zones(
+                [self._zone("改名后的区域", dwell_seconds=2.0, cooldown_seconds=10.0)]
+            )
+            self._drive(engine, [3.0])
+            self.assertEqual(engine._last_alarm_at, {})
 
 
 if __name__ == "__main__":

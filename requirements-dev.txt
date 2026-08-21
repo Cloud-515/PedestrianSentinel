@@ -1,0 +1,5 @@
+# 开发与测试用依赖（运行程序本身不需要）。
+# 安装：pip install -r requirements.txt -r requirements-dev.txt
+#
+# pytest 需要 >= 7：pytest.ini 里的 pythonpath 选项是 7.0 引入的。
+pytest>=7.0

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
 from typing import Optional
 
 import numpy as np
@@ -24,6 +23,21 @@ class DetectionWorker(QThread):
     status_changed = Signal(str)
     source_opened = Signal(int, int, float)
     progress_changed = Signal(float)
+
+    # 流中断后的重连退避：第一次等 1 秒，之后翻倍，最多等 30 秒。上限是个折中 ——
+    # 再长会让网络恢复后的接回变慢，再短则长时间断开时会一直高频重开设备、刷日志。
+    RECONNECT_BASE_DELAY = 1.0
+    RECONNECT_MAX_DELAY = 30.0
+
+    @classmethod
+    def _reconnect_delay(cls, attempts: int) -> float:
+        """1、2、4、8、16、30、30…… 秒。
+
+        指数先夹住再取幂：断开几个小时之后 attempts 会涨到很大，直接算
+        ``2 ** attempts`` 得到的是天文数字（超过 1024 次方就是 inf）。
+        """
+        exponent = min(max(0, attempts - 1), 20)
+        return min(cls.RECONNECT_BASE_DELAY * (2**exponent), cls.RECONNECT_MAX_DELAY)
 
     def __init__(
         self,
@@ -141,20 +155,31 @@ class DetectionWorker(QThread):
                             last_video_time = None
                             self.status_changed.emit("测试视频循环播放")
                             continue
-                    reconnect_attempts += 1
-                    if source.spec.is_file or reconnect_attempts >= 5:
+                    if source.spec.is_file:
+                        # 文件读到结尾是正常结束，不是中断，没有重连的意义。
                         self.status_changed.emit("视频播放结束")
                         break
-                    self.status_changed.emit(f"视频中断，正在重连 ({reconnect_attempts}/5)")
+                    # 摄像头或网络流断了：一直重试，不放弃。安防程序不该因为网线松了
+                    # 几次就自己停掉 —— 那之后画面是黑的、告警是静的，而界面上只写着
+                    # 「视频播放结束」，看的人根本不知道已经没在防了。
+                    reconnect_attempts += 1
+                    delay = self._reconnect_delay(reconnect_attempts)
+                    self.status_changed.emit(
+                        f"视频中断，第 {reconnect_attempts} 次重连，{delay:.0f} 秒后重试"
+                    )
                     self._finalize_sessions(engine, last_video_time)
                     source.close()
-                    time.sleep(2.0)
+                    # 用 wait 而不是 sleep：按下停止要立刻醒，别让界面等满整个退避时间。
+                    if self._stop_event.wait(delay):
+                        break
                     if source.open():
                         engine.reset_tracking()
                         last_video_time = None
-                        continue
+                        self.status_changed.emit("视频源已重新连接")
                     continue
 
+                # 计数器在「真的读到帧」之后才归零，而不是 open() 成功就归零：RTSP
+                # 地址常常能打开却一帧都不来，那种情况下退避必须继续往上涨。
                 reconnect_attempts = 0
                 last_video_time = video_time
                 armed = self._sync_armed_state(engine)

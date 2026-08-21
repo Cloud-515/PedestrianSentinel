@@ -312,5 +312,170 @@ class WorkerDeviceTests(unittest.TestCase):
         self.assertEqual(alarms, [])
 
 
+class ScriptedStopEvent:
+    """替掉 worker 的停止事件，把每次重连退避等了多久记下来。
+
+    重连里用的是 ``_stop_event.wait(delay)`` 而不是 ``time.sleep(delay)``，所以
+    这里既能读出退避时长，又能在第 ``limit`` 次等待时假装「停止」被按下，让
+    ``run()`` 立刻收尾 —— 测试不必真的睡上 1、2、4…… 秒。
+    """
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.delays: list[float] = []
+        self._stopped = False
+
+    def wait(self, timeout: float | None = None) -> bool:
+        self.delays.append(timeout)
+        if len(self.delays) >= self.limit:
+            self._stopped = True
+        return self._stopped
+
+    def is_set(self) -> bool:
+        return self._stopped
+
+    def set(self) -> None:
+        self._stopped = True
+
+
+class ScriptedSource:
+    """按脚本返回读帧结果的假视频源；读完脚本就一直失败。"""
+
+    def __init__(self, spec: VideoSourceSpec, reads: list[tuple] | None = None) -> None:
+        self.spec = spec
+        self.width = 640
+        self.height = 480
+        self.duration_seconds = 0.0
+        self.opens = 0
+        self.closes = 0
+        self._reads = list(reads or [])
+
+    def open(self) -> bool:
+        self.opens += 1
+        return True
+
+    def read(self) -> tuple:
+        return self._reads.pop(0) if self._reads else (False, None, None)
+
+    def is_paused(self) -> bool:
+        return False
+
+    def wait_interval(self) -> float:
+        return 0.001
+
+    def restart_file(self) -> bool:
+        return False
+
+    def close(self) -> None:
+        self.closes += 1
+
+
+class ReconnectBackoffTests(unittest.TestCase):
+    """流中断后的重连：指数退避、永不放弃、等待可被停止打断。
+
+    原来的实现是固定 ``time.sleep(2.0)`` 加「重试 5 次就 break」。对一个安防程序
+    来说后者是要命的：网络抖 5 次之后线程自己退出，画面黑着、告警静着，界面上只
+    写「视频播放结束」，看的人根本不知道已经没在防了。
+    """
+
+    def _worker(self, spec: VideoSourceSpec, stop_limit: int) -> DetectionWorker:
+        worker = DetectionWorker(
+            spec=spec,
+            model_path="model.pt",
+            device="cpu",
+            zones=[],
+            event_store=Mock(),
+        )
+        worker.alarm_player = Mock()
+        worker._stop_event = ScriptedStopEvent(stop_limit)
+        return worker
+
+    @staticmethod
+    def _engine() -> Mock:
+        engine = Mock()
+        engine.finalize_active_sessions.return_value = []
+        # 这些测试只关心重连，不关心检测结果；给个能解包的返回值就行。
+        engine.process.return_value = (np.zeros((12, 16, 3), dtype=np.uint8), [])
+        return engine
+
+    def _run(self, worker: DetectionWorker, source: ScriptedSource) -> list[str]:
+        statuses: list[str] = []
+        worker.status_changed.connect(statuses.append)
+        with (
+            patch("detection_worker.VideoSource", return_value=source),
+            patch("detection_worker.DetectionEngine", return_value=self._engine()),
+        ):
+            worker.run()
+        return statuses
+
+    def test_reconnect_delay_doubles_then_caps(self) -> None:
+        delays = [DetectionWorker._reconnect_delay(attempt) for attempt in range(1, 8)]
+        self.assertEqual(delays, [1.0, 2.0, 4.0, 8.0, 16.0, 30.0, 30.0])
+
+    def test_reconnect_delay_survives_a_very_long_outage(self) -> None:
+        """断开几小时后 attempts 会很大，2 ** attempts 直接算会溢出成 inf。"""
+        self.assertEqual(DetectionWorker._reconnect_delay(10_000), 30.0)
+
+    def test_stream_break_keeps_retrying_and_never_gives_up(self) -> None:
+        spec = VideoSourceSpec("rtsp://camera", operation_mode="monitor")
+        source = ScriptedSource(spec)
+        worker = self._worker(spec, stop_limit=8)
+
+        statuses = self._run(worker, source)
+
+        # 八次重连都发生了 —— 旧实现在第 5 次就 break 了。
+        self.assertEqual(
+            worker._stop_event.delays,
+            [1.0, 2.0, 4.0, 8.0, 16.0, 30.0, 30.0, 30.0],
+        )
+        self.assertNotIn("视频播放结束", statuses)
+        self.assertIn("视频中断，第 8 次重连，30 秒后重试", statuses)
+        # 每次重连都得先 close 再 open，否则句柄会漏；最后 finally 里还会再 close 一次。
+        self.assertEqual(source.opens, 8)
+
+    def test_successful_frame_read_resets_the_backoff(self) -> None:
+        frame = np.zeros((12, 16, 3), dtype=np.uint8)
+        spec = VideoSourceSpec("rtsp://camera", operation_mode="monitor")
+        source = ScriptedSource(
+            spec,
+            reads=[
+                (False, None, None),
+                (False, None, None),
+                (True, frame, 1.0),
+                (False, None, None),
+            ],
+        )
+        worker = self._worker(spec, stop_limit=3)
+
+        self._run(worker, source)
+
+        # 读到帧之后退避从头开始，不会因为之前抖过就一直等 4 秒。
+        self.assertEqual(worker._stop_event.delays, [1.0, 2.0, 1.0])
+
+    def test_stop_during_backoff_wait_ends_immediately(self) -> None:
+        spec = VideoSourceSpec("rtsp://camera", operation_mode="monitor")
+        source = ScriptedSource(spec)
+        worker = self._worker(spec, stop_limit=1)
+
+        statuses = self._run(worker, source)
+
+        # 第一次等待就被打断：不再重开视频源，界面也不该看到「已重新连接」。
+        self.assertEqual(worker._stop_event.delays, [1.0])
+        self.assertEqual(source.opens, 1)
+        self.assertNotIn("视频源已重新连接", statuses)
+
+    def test_file_end_stops_without_any_reconnect(self) -> None:
+        spec = VideoSourceSpec("test.mp4", operation_mode="video", loop_playback=False)
+        source = ScriptedSource(spec)
+        worker = self._worker(spec, stop_limit=1)
+
+        statuses = self._run(worker, source)
+
+        # 文件读到结尾是正常结束，不该退避、也不该重连。
+        self.assertEqual(worker._stop_event.delays, [])
+        self.assertEqual(source.opens, 1)
+        self.assertIn("视频播放结束", statuses)
+
+
 if __name__ == "__main__":
     unittest.main()
