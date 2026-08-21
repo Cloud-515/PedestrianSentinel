@@ -9,6 +9,7 @@ from uuid import uuid4
 import cv2
 import numpy as np
 
+import app_paths
 from models import AlarmEvent
 
 logger = logging.getLogger(__name__)
@@ -19,7 +20,10 @@ class AlarmPlayer:
         self.warning_audio_path = (
             Path(warning_audio_path)
             if warning_audio_path is not None
-            else Path(__file__).resolve().with_name("warming_converted.wav")
+            # 分组式发布布局优先，扁平式（资源直接放 exe 同级）作为兼容回退。
+            else app_paths.resource(
+                "assets/warming_converted.wav", "warming_converted.wav"
+            )
         )
         self._lock = threading.Lock()
         self._is_playing = False

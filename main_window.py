@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import app_paths
 from alarm_service import EventStore
 from config_store import ConfigStore
 from compute_devices import enumerate_inference_devices
@@ -53,10 +54,10 @@ from video_widget import VideoWidget
 
 logger = logging.getLogger(__name__)
 
-APP_DIR = Path(__file__).resolve().parent
-CONFIG_PATH = APP_DIR / "config.json"
-EVENTS_DIR = APP_DIR / "events"
-PROFILES_DIR = APP_DIR / "profiles"
+APP_DIR = app_paths.APP_DIR
+CONFIG_PATH = app_paths.data("config.json")
+EVENTS_DIR = app_paths.data("events")
+PROFILES_DIR = app_paths.data("profiles")
 
 
 # ---------------------------------------------------------------------------
@@ -1168,8 +1169,14 @@ class MainWindow(QMainWindow):
             speed=self.playback_panel.speed(),
         )
         model_path = Path(self.config.model_path)
-        if not model_path.is_absolute() and (APP_DIR / model_path).exists():
-            model_path = APP_DIR / model_path
+        if not model_path.is_absolute():
+            # 分组式布局的 models/ 优先，扁平式（模型直接放 exe 同级）作为兼容回退；
+            # 两处都没有就保留相对路径，让 ultralytics 沿用它按名下载的既有行为。
+            resolved = app_paths.resource(
+                f"models/{model_path.as_posix()}", model_path.as_posix()
+            )
+            if resolved.exists():
+                model_path = resolved
 
         self._save_config()
         selected_device = self.source_panel.selected_device()

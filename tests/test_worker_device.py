@@ -36,6 +36,17 @@ class FakeVideoSource:
 
 
 class WorkerDeviceTests(unittest.TestCase):
+    def events_dir(self) -> Path:
+        """给出一个用完就删的 events\\ 路径。
+
+        原来这里直接用 `Path(tempfile.mkdtemp()) / "events"`，四处调用一处不清理 ——
+        每跑一次测试就在 %TEMP% 里永久留下几个目录。除了越积越多，它还真误导过人：
+        排查打包版是否往 %TEMP% 撒文件时，这几个目录看上去正是"程序在漏"的证据。
+        """
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        return Path(temporary.name) / "events"
+
     def test_alarm_player_plays_configured_wav_file(self) -> None:
         audio_path = Path("warning.wav")
         player = AlarmPlayer(audio_path)
@@ -60,7 +71,7 @@ class WorkerDeviceTests(unittest.TestCase):
         thread.assert_not_called()
 
     def test_event_store_folds_intrusion_session_updates(self) -> None:
-        root = Path(tempfile.mkdtemp()) / "events"
+        root = self.events_dir()
         store = EventStore(root)
         event = AlarmEvent(
             source="camera",
@@ -93,7 +104,7 @@ class WorkerDeviceTests(unittest.TestCase):
         self.assertTrue(Path(loaded.alarm_screenshot_path).exists())
 
     def test_event_store_loads_legacy_single_screenshot_record(self) -> None:
-        root = Path(tempfile.mkdtemp()) / "events"
+        root = self.events_dir()
         root.mkdir()
         screenshot = root / "legacy.jpg"
         cv2.imwrite(str(screenshot), np.zeros((4, 4, 3), dtype=np.uint8))
@@ -116,7 +127,7 @@ class WorkerDeviceTests(unittest.TestCase):
 
     def test_engine_initialization_failure_keeps_error_status(self) -> None:
         statuses: list[str] = []
-        event_store = EventStore(Path(tempfile.mkdtemp()) / "events")
+        event_store = EventStore(self.events_dir())
         worker = DetectionWorker(
             spec=VideoSourceSpec("test.mp4", operation_mode="video"),
             model_path="model.pt",
@@ -142,7 +153,7 @@ class WorkerDeviceTests(unittest.TestCase):
 
     def test_worker_forwards_low_power_policy_to_engine(self) -> None:
         statuses: list[str] = []
-        event_store = EventStore(Path(tempfile.mkdtemp()) / "events")
+        event_store = EventStore(self.events_dir())
         policy = InferencePolicy(
             model_path="model_openvino",
             device="cpu",

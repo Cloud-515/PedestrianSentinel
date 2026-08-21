@@ -13,9 +13,17 @@ models/
 # Runtime configuration and generated alarm data
 config.json
 events/
+selftest-events/
 profiles/
 *.log
 gui-*.png
+
+# 告警音的 TTS 原始素材。程序实际加载的是转码后的 warming_converted.wav，
+# 它已入库；这些原始件体积大、文件名带括号与全角标点，留在本地即可。
+*.mp3
+
+# 与本项目无关的本机网卡配置导出
+network-backup/
 
 # Local models and video sources
 *.pt
@@ -29,3 +37,8 @@ gui-*.png
 # IDE files
 .idea/
 .vscode/
+
+# PyInstaller 打包中间产物与发布目录（spec / build.ps1 本身要入库）
+execode/build/
+execode/dist/
+execode/stage/

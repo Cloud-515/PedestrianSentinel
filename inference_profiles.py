@@ -5,8 +5,10 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-APP_DIR = Path(__file__).resolve().parent
-LOW_POWER_MODEL_DIR = APP_DIR / "models" / "yolo11n_int8_openvino_model"
+import app_paths
+
+APP_DIR = app_paths.APP_DIR
+LOW_POWER_MODEL_DIR = app_paths.resource("models/yolo11n_int8_openvino_model")
 
 
 @dataclass(frozen=True)

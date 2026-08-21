@@ -4,8 +4,10 @@ import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-APP_DIR = Path(__file__).resolve().parent
-LOG_DIR = APP_DIR / "logs"
+import app_paths
+
+APP_DIR = app_paths.APP_DIR
+LOG_DIR = app_paths.data("logs")
 LOG_FILE = LOG_DIR / "app.log"
 _LOG_HANDLER_MARKER = "pp_human_file_handler"
 
