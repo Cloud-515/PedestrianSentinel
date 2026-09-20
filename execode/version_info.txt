@@ -1,7 +1,7 @@
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 0, 0, 0),
-    prodvers=(1, 0, 0, 0),
+    filevers=(1, 1, 0, 0),
+    prodvers=(1, 1, 0, 0),
     mask=0x3F,
     flags=0x0,
     OS=0x40004,
@@ -18,12 +18,12 @@ VSVersionInfo(
           [
             StringStruct("CompanyName", ""),
             StringStruct("FileDescription", "行人警戒区域监控"),
-            StringStruct("FileVersion", "1.0.0.0"),
+            StringStruct("FileVersion", "1.1.0.0"),
             StringStruct("InternalName", "PedestrianZoneMonitor"),
             StringStruct("LegalCopyright", ""),
             StringStruct("OriginalFilename", "行人警戒区域监控.exe"),
             StringStruct("ProductName", "行人警戒区域监控"),
-            StringStruct("ProductVersion", "1.0.0.0"),
+            StringStruct("ProductVersion", "1.1.0.0"),
           ],
         )
       ]
