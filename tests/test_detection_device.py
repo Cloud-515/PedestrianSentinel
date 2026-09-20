@@ -62,6 +62,53 @@ class DetectionDeviceTests(unittest.TestCase):
         self.assertEqual(event.format_event_time(event.entered_at_seconds, precision=3), "12.346s")
         self.assertEqual(event.to_row()[4:6], ["12.35s", "24.57s"])
 
+    def test_event_status_column_shows_chinese_not_raw_machine_value(self) -> None:
+        """状态列以前直接印 status 字段，中文界面上会出现 active/completed。"""
+
+        def event() -> AlarmEvent:
+            return AlarmEvent(
+                source="test.mp4",
+                zone_name="区域1",
+                track_id="0",
+                entered_at_seconds=1.0,
+                alarm_at_seconds=None,
+                wall_time="2026-08-13 10:29:08",
+                operation_mode="video",
+            )
+
+        active = event()
+        self.assertEqual(active.status, "active")
+        self.assertEqual(active.status_label, "未触发报警")
+        self.assertEqual(active.to_row()[7], "未触发报警")
+
+        alarmed = event()
+        alarmed.alarm_at_seconds = 2.0
+        alarmed.status = "alarmed"
+        self.assertEqual(alarmed.to_row()[7], "已报警")
+
+        completed = event()
+        completed.alarm_at_seconds = 2.0
+        completed.exited_at_seconds = 5.0
+        completed.status = "completed"
+        self.assertEqual(completed.to_row()[7], "已结束")
+
+    def test_unrecorded_alarm_does_not_borrow_the_completed_label(self) -> None:
+        """没报过警但已经离场的会话，状态仍是「未触发报警」而不是「已结束」。"""
+        event = AlarmEvent(
+            source="test.mp4",
+            zone_name="区域1",
+            track_id="0",
+            entered_at_seconds=1.0,
+            alarm_at_seconds=None,
+            wall_time="2026-08-13 10:29:08",
+            operation_mode="video",
+            exited_at_seconds=9.0,
+            duration_seconds=8.0,
+            status="completed",
+        )
+
+        self.assertEqual(event.status_label, "未触发报警")
+
     def test_engine_passes_device_only_to_inference(self) -> None:
         model = Mock()
         model.return_value = [object()]

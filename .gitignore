@@ -42,3 +42,7 @@ network-backup/
 execode/build/
 execode/dist/
 execode/stage/
+
+# 历史发布包的留档。一个包 300 MB 上下，进了 git 历史就再也清不干净 ——
+# 它和 dist/ 一样属于产物，留在本地即可。
+execode/release-backup/

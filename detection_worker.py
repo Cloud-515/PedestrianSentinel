@@ -60,6 +60,9 @@ class DetectionWorker(QThread):
         self._stop_event = threading.Event()
         self._step_event = threading.Event()
         self._control_lock = threading.Lock()
+        # 「上一帧界面还没画完」的标志。跨线程信号是排队投递的，Qt 既不合并也不
+        # 丢弃，所以界面跟不上时必须由发送端自己丢帧，否则队列会无上限增长。
+        self._frame_pending = threading.Event()
         self._paused = False
         self._loop_playback = spec.loop_playback
         self._speed = spec.speed
@@ -69,6 +72,27 @@ class DetectionWorker(QThread):
 
     def stop(self) -> None:
         self._stop_event.set()
+
+    def frame_consumed(self) -> None:
+        """界面已经把上一帧画完了，可以收下一帧。由接收帧的槽调用。"""
+        self._frame_pending.clear()
+
+    def _emit_frame(self, frame: np.ndarray) -> None:
+        """界面还没消化上一帧，这一帧就不再往队列里塞。
+
+        1080p 一帧 BGR 是 6 MB，而界面每帧都要做一次颜色转换加缩放绘制；低功耗
+        预设能跑到 100 fps，比界面快得多。此时队列里积压的是帧，而内存增长和画面
+        滞后都是按秒算的（每积压一秒就是几百 MB）。监控模式下的读取循环本来也没有
+        节流 —— 文件模式那边靠 wait_interval 自己限速，摄像头/网络流没有。
+
+        只丢「显示」，检测照跑：跳过检测会让驻留计时和告警判定跟着失真，那才是
+        这个程序的立身之本。标注帧也照画（不能省掉 render），因为同一帧还要用作
+        告警取证截图，少画一次就会出现没有画框的取证图。
+        """
+        if self._frame_pending.is_set():
+            return
+        self._frame_pending.set()
+        self.frame_ready.emit(frame)
 
     def set_paused(self, paused: bool) -> None:
         with self._control_lock:
@@ -184,7 +208,7 @@ class DetectionWorker(QThread):
                 last_video_time = video_time
                 armed = self._sync_armed_state(engine)
                 if not armed:
-                    self.frame_ready.emit(frame)
+                    self._emit_frame(frame)
                     if source.spec.is_file and source.duration_seconds > 0:
                         self.progress_changed.emit(
                             min(1.0, video_time / source.duration_seconds)
@@ -199,7 +223,7 @@ class DetectionWorker(QThread):
                     self.spec.value,
                     self.spec.operation_mode,
                 )
-                self.frame_ready.emit(annotated)
+                self._emit_frame(annotated)
                 if source.spec.is_file and source.duration_seconds > 0:
                     self.progress_changed.emit(min(1.0, video_time / source.duration_seconds))
                 for transition in transitions:

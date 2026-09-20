@@ -1,3 +1,18 @@
+"""早期的最小可运行示例：一个窗口、一个摄像头、一个硬编码矩形警戒区。
+
+**它不参与桌面程序，也不进发布包**（`execode/PedestrianZoneMonitor.spec` 把它列在
+excludes 里）。留在这里是当参考用的：不依赖 config / profiles / Qt 面板，一百多行
+就能把「YOLO + ByteTrack + 多边形判定 + 蜂鸣报警」串起来，适合拿去试验证新的思路。
+
+两处**已经和主程序不一致**的地方，读的时候别照着它改主程序：
+
+* ``MAX_RECONNECT_ATTEMPTS = 5`` —— 主程序早已改成「永不放弃 + 指数退避」（见
+  ``detection_worker.DetectionWorker._reconnect_delay``）。对一个安防程序来说，网络
+  抖五次就自己退出是要命的：画面黑着、告警静着，界面上却看不出已经没在防了。
+* 报警区是写死的 ``POLYGON``，驻留与冷却阈值也是模块常量；主程序里这些都是每个
+  警戒区域各自的配置项，并且按 ``(区域名, 目标ID)`` 记冷却。
+"""
+
 import argparse
 import logging
 import sys

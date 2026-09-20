@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import (
@@ -31,6 +32,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSlider,
+    QSpinBox,
     QStyledItemDelegate,
     QSplitter,
     QStackedWidget,
@@ -46,8 +48,18 @@ from config_store import ConfigStore
 from compute_devices import enumerate_inference_devices
 from detection_worker import DetectionWorker
 from inference_profiles import resolve_inference_policy
-from models import AlarmEvent, AppConfig, ZoneDefinition, ZoneProfile
+from models import (
+    DEFAULT_RETENTION_DAYS,
+    DEFAULT_RETENTION_MB,
+    MAX_RETENTION_DAYS,
+    MAX_RETENTION_MB,
+    AlarmEvent,
+    AppConfig,
+    ZoneDefinition,
+    ZoneProfile,
+)
 from profile_store import ProfileStore
+from retention import RetentionPolicy, directory_usage, format_size, prune_screenshots
 from source_history import add_history_entry
 from video_source import VideoSourceSpec
 from video_widget import VideoWidget
@@ -233,6 +245,8 @@ class SourcePanel(QGroupBox):
 class SettingsPanel(QGroupBox):
     mode_changed = Signal(str)
     cpu_low_power_changed = Signal(bool)
+    retention_changed = Signal(int, int)
+    prune_requested = Signal()
 
     def __init__(self) -> None:
         super().__init__("设置")
@@ -244,14 +258,85 @@ class SettingsPanel(QGroupBox):
         self.cpu_low_power_cb.setToolTip(
             "仅在 CPU 推理时使用 OpenVINO INT8、512 输入和每 4 帧检测。"
         )
-        self.back_btn = QPushButton("返回主页")
         layout.addWidget(self.video_radio)
         layout.addWidget(self.monitor_radio)
         layout.addWidget(self.cpu_low_power_cb)
+        layout.addWidget(self._build_retention_box())
         layout.addStretch()
+        self.back_btn = QPushButton("返回主页")
         layout.addWidget(self.back_btn)
         self.video_radio.toggled.connect(self._emit_mode)
         self.cpu_low_power_cb.toggled.connect(self.cpu_low_power_changed)
+
+    def _build_retention_box(self) -> QGroupBox:
+        box = QGroupBox("取证留存")
+        box.setToolTip(
+            "只清理报警截图，报警记录本身一直保留（它是纯文本，体积可以忽略）。\n"
+            "0 表示该条规则不生效；两条都是 0 就不再自动清理。\n"
+            "更早的记录仍会显示在报警记录表里，只是详情中的截图会缺失。"
+        )
+        layout = QVBoxLayout(box)
+
+        days_row = QHBoxLayout()
+        days_row.addWidget(QLabel("截图保留:"))
+        self.retention_days_spin = QSpinBox()
+        self.retention_days_spin.setRange(0, MAX_RETENTION_DAYS)
+        self.retention_days_spin.setSuffix(" 天")
+        self.retention_days_spin.setValue(DEFAULT_RETENTION_DAYS)
+        self.retention_days_spin.setToolTip("早于这个天数的截图会被清理；0 表示不按天数清理。")
+        days_row.addWidget(self.retention_days_spin, 1)
+        layout.addLayout(days_row)
+
+        size_row = QHBoxLayout()
+        size_row.addWidget(QLabel("容量上限:"))
+        self.retention_mb_spin = QSpinBox()
+        self.retention_mb_spin.setRange(0, MAX_RETENTION_MB)
+        self.retention_mb_spin.setSingleStep(128)
+        self.retention_mb_spin.setSuffix(" MB")
+        self.retention_mb_spin.setValue(DEFAULT_RETENTION_MB)
+        self.retention_mb_spin.setToolTip(
+            "截图目录超过这个体积时，从最旧的开始清理；0 表示不限。"
+        )
+        size_row.addWidget(self.retention_mb_spin, 1)
+        layout.addLayout(size_row)
+
+        self.storage_label = QLabel("正在统计占用…")
+        self.storage_label.setStyleSheet("color: #7A8A99; font-size: 11px;")
+        layout.addWidget(self.storage_label)
+
+        self.prune_btn = QPushButton("立即清理")
+        self.prune_btn.setToolTip("按上面的规则清理一次，并刷新占用统计。")
+        self.prune_btn.clicked.connect(self.prune_requested)
+        layout.addWidget(self.prune_btn)
+
+        self.retention_days_spin.valueChanged.connect(self._emit_retention)
+        self.retention_mb_spin.valueChanged.connect(self._emit_retention)
+        return box
+
+    def _emit_retention(self, value: int) -> None:
+        del value
+        self.retention_changed.emit(
+            self.retention_days_spin.value(), self.retention_mb_spin.value()
+        )
+
+    def set_retention(self, days: int, megabytes: int) -> None:
+        for spin, value in (
+            (self.retention_days_spin, days),
+            (self.retention_mb_spin, megabytes),
+        ):
+            spin.blockSignals(True)
+            spin.setValue(value)
+            spin.blockSignals(False)
+
+    def retention(self) -> tuple[int, int]:
+        return self.retention_days_spin.value(), self.retention_mb_spin.value()
+
+    def set_storage_usage(self, text: str) -> None:
+        self.storage_label.setText(text)
+
+    def set_retention_controls_enabled(self, enabled: bool) -> None:
+        self.retention_days_spin.setEnabled(enabled)
+        self.retention_mb_spin.setEnabled(enabled)
 
     def set_operation_mode(self, operation_mode: str) -> None:
         self.video_radio.setChecked(operation_mode == "video")
@@ -557,7 +642,7 @@ class AlarmDetailDialog(QDialog):
             ("报警时间", event.format_event_time(event.alarm_at_seconds, precision=3)),
             ("退出时间", event.format_event_time(event.exited_at_seconds, precision=3)),
             ("闯入时长", f"{event.duration_seconds:.2f}s" if event.duration_seconds is not None else "未结算"),
-            ("状态", "未触发报警" if not event.alarmed else event.status),
+            ("状态", event.status_label),
             ("运行模式", mode_label),
             ("视频源", event.source),
             ("警戒区域", event.zone_name),
@@ -667,6 +752,12 @@ class MainWindow(QMainWindow):
         self._save_timer.setInterval(300)
         self._save_timer.timeout.connect(self._save_config)
 
+        # 截图留存：一小时扫一次目录。扫描 200 来个文件的耗时在毫秒级，代价可以忽略；
+        # 真正的意义是「程序连着跑几个月也不会把磁盘吃满」，而不是精确到点就清。
+        self._retention_timer = QTimer(self)
+        self._retention_timer.setInterval(60 * 60 * 1000)
+        self._retention_timer.timeout.connect(self._run_retention)
+
         self.video_widget = VideoWidget()
         self.source_panel = SourcePanel()
         self.settings_panel = SettingsPanel()
@@ -678,6 +769,12 @@ class MainWindow(QMainWindow):
         self._load_controls()
         self._connect_signals()
         self._load_event_history()
+        self._refresh_storage_usage()
+        self._retention_timer.start()
+        # 启动时先让窗口画出来再扫目录：目录很大时这一步不该拖慢启动。放在事件循环
+        # 里做还有个好处 —— 自动化测试不跑事件循环，就不会在无准备的情况下动磁盘。
+        # 配置读坏而回落默认值时不自动清理（见 _run_retention）。
+        QTimer.singleShot(0, self._run_retention)
 
     def _build_layout(self) -> None:
         self.settings_btn = QPushButton("设置")
@@ -714,11 +811,24 @@ class MainWindow(QMainWindow):
 
     def _load_config(self) -> AppConfig:
         try:
-            return self.config_store.load()
-        except (OSError, ValueError, TypeError) as error:
+            loaded = self.config_store.load()
+        except Exception as error:  # noqa: BLE001 - 配置文件坏成什么样都不该让程序起不来
+            # 这里刻意捕获所有异常：原来只接 (OSError, ValueError, TypeError)，而
+            # 「zones 被改成对象」这类坏数据抛的是 AttributeError，会一路冒到 main()
+            # 之外 —— 用户每次启动都只看到「程序出错」，只能自己想到去删 config.json。
+            # 解析不了就把坏文件改名留档再走默认配置，别再覆盖它。
             logger.exception("Unable to load configuration")
-            QMessageBox.warning(self, "配置读取失败", f"将使用默认配置。\n{error}")
+            self._config_trusted = False
+            backup = self.config_store.quarantine()
+            hint = f"\n原文件已备份为 {backup.name}。" if backup else ""
+            QMessageBox.warning(
+                self,
+                "配置读取失败",
+                f"将使用默认配置。{hint}\n{error}",
+            )
             return AppConfig()
+        self._config_trusted = True
+        return loaded
 
     def _load_controls(self) -> None:
         self._apply_operation_mode(self.config.operation_mode, persist=False)
@@ -752,6 +862,10 @@ class MainWindow(QMainWindow):
             )
         self.settings_panel.set_cpu_low_power(self.config.cpu_low_power_preset)
         self._update_cpu_low_power_availability()
+        self.settings_panel.set_retention(
+            self.config.screenshot_retention_days,
+            self.config.screenshot_retention_mb,
+        )
         self.playback_panel.loop_cb.setChecked(self.config.loop_playback)
         speed_value = max(1, min(16, round(self.config.playback_speed / 0.25)))
         self.playback_panel.speed_slider.setValue(speed_value)
@@ -775,6 +889,8 @@ class MainWindow(QMainWindow):
         )
         self.settings_panel.mode_changed.connect(self._apply_operation_mode)
         self.settings_panel.cpu_low_power_changed.connect(self._on_cpu_low_power_changed)
+        self.settings_panel.retention_changed.connect(self._on_retention_changed)
+        self.settings_panel.prune_requested.connect(self._prune_now)
         self.zone_panel.profile_new_btn.clicked.connect(self._new_profile)
         self.zone_panel.profile_save_btn.clicked.connect(self._save_profile)
         self.zone_panel.profile_save_as_btn.clicked.connect(self._save_profile_as)
@@ -1126,6 +1242,52 @@ class MainWindow(QMainWindow):
         self.config.cpu_low_power_preset = enabled
         self._schedule_config_save()
 
+    def _on_retention_changed(self, days: int, megabytes: int) -> None:
+        self.config.screenshot_retention_days = days
+        self.config.screenshot_retention_mb = megabytes
+        self._schedule_config_save()
+
+    def _retention_policy(self) -> RetentionPolicy:
+        return RetentionPolicy(
+            days=self.config.screenshot_retention_days,
+            max_bytes=self.config.screenshot_retention_mb * 1024 * 1024,
+        )
+
+    def _refresh_storage_usage(self) -> None:
+        count, size = directory_usage(self.event_store.screenshot_dir)
+        days, megabytes = self.settings_panel.retention()
+        limit = "不限" if megabytes <= 0 else f"{megabytes} MB"
+        self.settings_panel.set_storage_usage(
+            f"已存 {count} 张 · {format_size(size)}（容量上限 {limit}，保留 {days or '不限'} 天）"
+        )
+
+    def _run_retention(self) -> None:
+        """定时/启动时的自动清理。配置刚从坏文件回落时不清理。
+
+        默认值是 15 天/2 GB，而用户真正设的可能是 365 天 —— 拿一份「因为读不出来而
+        退回默认」的策略去删东西，删的就是用户的取证材料。所以这条路只在配置可信时
+        走；手动点「立即清理」不受限制（那是用户看着当前设置按的）。
+        """
+        if not getattr(self, "_config_trusted", False):
+            logger.info("配置未被可信读取，跳过自动截图清理")
+            self._refresh_storage_usage()
+            return
+        policy = self._retention_policy()
+        if not policy.enabled:
+            self._refresh_storage_usage()
+            return
+        result = prune_screenshots(self.event_store.screenshot_dir, policy)
+        if result.removed:
+            self.source_panel.set_status(f"取证留存：{result.describe()}")
+        self._refresh_storage_usage()
+
+    def _prune_now(self) -> None:
+        result = prune_screenshots(
+            self.event_store.screenshot_dir, self._retention_policy()
+        )
+        self._refresh_storage_usage()
+        self.source_panel.set_status(f"取证留存：{result.describe()}")
+
     def _update_cpu_low_power_availability(self) -> None:
         device = self.source_panel.selected_device()
         if device != "cpu":
@@ -1204,13 +1366,7 @@ class MainWindow(QMainWindow):
             policy=resolution.policy,
             parent=self,
         )
-        self.worker.frame_ready.connect(self.video_widget.set_frame)
-        self.worker.event_ready.connect(self._on_alarm_event)
-        self.worker.event_updated.connect(self._on_alarm_event_updated)
-        self.worker.status_changed.connect(self.source_panel.set_status)
-        self.worker.source_opened.connect(self._on_source_opened)
-        self.worker.progress_changed.connect(self._on_progress_changed)
-        self.worker.finished.connect(self._on_worker_finished)
+        self._connect_worker(self.worker)
 
         self.video_duration = 0.0
         self._alarm_overlay_enabled = True
@@ -1219,10 +1375,29 @@ class MainWindow(QMainWindow):
         self.source_panel.set_running(True)
         self.settings_panel.set_mode_enabled(False)
         self.settings_panel.set_cpu_low_power_enabled(False)
+        self.settings_panel.set_retention_controls_enabled(False)
         self._set_profile_controls_enabled(False)
         self.playback_panel.set_file_mode(spec.is_file, True)
         self.source_panel.set_status(f"正在打开视频源… 推理设备: {selected_device}")
         self.worker.start()
+
+    def _connect_worker(self, worker: DetectionWorker) -> None:
+        """把检测线程的信号接到界面上。
+
+        单独成一段，是为了能被测试直接驱动 —— 其中 frame_ready 的接法最容易出错：
+        它要在投递完成之后回执给**发出这一帧的那个** worker（点击「停止/打开」可能
+        已经把它换掉了，用 self.worker 去清标志会把新 worker 的待显示状态误清掉），
+        而这类错误只有真跑起来、还要界面恰好跟不上时才现形。
+        """
+        worker.frame_ready.connect(
+            lambda frame, source=worker: self._on_frame_ready(source, frame)
+        )
+        worker.event_ready.connect(self._on_alarm_event)
+        worker.event_updated.connect(self._on_alarm_event_updated)
+        worker.status_changed.connect(self.source_panel.set_status)
+        worker.source_opened.connect(self._on_source_opened)
+        worker.progress_changed.connect(self._on_progress_changed)
+        worker.finished.connect(self._on_worker_finished)
 
     def stop_detection(self) -> None:
         if self.worker is None or not self.worker.isRunning():
@@ -1254,9 +1429,18 @@ class MainWindow(QMainWindow):
         self.source_panel.set_running(False)
         self.settings_panel.set_mode_enabled(True)
         self._update_cpu_low_power_availability()
+        self.settings_panel.set_retention_controls_enabled(True)
         self._set_profile_controls_enabled(True)
         self.playback_panel.set_paused(False)
         self._update_playback_enabled()
+
+    def _on_frame_ready(self, source: DetectionWorker, frame: np.ndarray) -> None:
+        self.video_widget.set_frame(frame)
+        # 帧已经交给画面（颜色转换与拷贝都在 set_frame 里同步做完了），回执允许下一帧。
+        # worker 靠这个回执判断界面跟不跟得上，跟不上就丢显示帧而不是排队 —— 否则
+        # 队列里的帧会按秒堆起来（1080p 一帧 6 MB）。重绘是异步的，所以真实排队的
+        # 帧数最多会比「已画完的帧」多出一两帧，但不会无上限。
+        source.frame_consumed()
 
     def _on_source_opened(self, width: int, height: int, duration: float) -> None:
         self.video_duration = duration
@@ -1359,6 +1543,10 @@ class MainWindow(QMainWindow):
         self.config.playback_speed = self.playback_panel.speed()
         self.config.inference_device = self.source_panel.selected_device()
         self.config.cpu_low_power_preset = self.settings_panel.cpu_low_power_cb.isChecked()
+        (
+            self.config.screenshot_retention_days,
+            self.config.screenshot_retention_mb,
+        ) = self.settings_panel.retention()
         self.config.zones = self.zones
         self.config.display_to_original_scale = self.video_widget.coordinate_mapping()
         try:

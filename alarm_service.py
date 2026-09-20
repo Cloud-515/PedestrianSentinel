@@ -135,15 +135,32 @@ class EventStore:
         limit: int = 200,
         operation_mode: str | None = None,
     ) -> list[AlarmEvent]:
+        with self._lock:
+            events = self._read_events_locked()
+        if operation_mode is not None:
+            events = [event for event in events if event.operation_mode == operation_mode]
+        return events[-limit:]
+
+    def _read_events_locked(self) -> list[AlarmEvent]:
+        """读出全部会话。**调用方必须已经持有 self._lock。**
+
+        折叠成一份会话列表要扫完整个文件，所以它只能有一个入口：``load_recent``
+        读它之前拿锁，``clear`` 读改写全程拿锁 —— 否则两者之间就会开出一个窗口，
+        把检测线程刚好追加的那条报警吃掉。
+        """
         if not self.log_path.exists():
             return []
         events_by_session: dict[str, AlarmEvent] = {}
         order: list[str] = []
-        with self._lock, self.log_path.open("r", encoding="utf-8") as event_file:
+        with self.log_path.open("r", encoding="utf-8") as event_file:
             for line in event_file:
                 try:
                     payload = json.loads(line)
                 except json.JSONDecodeError:
+                    continue
+                # 这个文件是纯文本，被手工编辑过就会出现非对象的行；撞上它不该让
+                # 整个报警记录打不开。
+                if not isinstance(payload, dict):
                     continue
                 if payload.get("schema_version") == 2:
                     self._apply_v2_payload(payload, events_by_session, order)
@@ -152,10 +169,7 @@ class EventStore:
                 events_by_session[event.session_id] = event
                 if event.session_id not in order:
                     order.append(event.session_id)
-        events = [events_by_session[session_id] for session_id in order]
-        if operation_mode is not None:
-            events = [event for event in events if event.operation_mode == operation_mode]
-        return events[-limit:]
+        return [events_by_session[session_id] for session_id in order]
 
     @staticmethod
     def _event_from_payload(payload: dict[str, object]) -> AlarmEvent:
@@ -226,12 +240,15 @@ class EventStore:
             if operation_mode is None:
                 self.log_path.unlink()
                 return
-        retained = [
-            event
-            for event in self.load_recent(limit=10_000)
-            if event.operation_mode != operation_mode
-        ]
-        with self._lock:
+            # 读-改-写全程待在同一把锁里。检测线程随时可能往这个文件追加一条，而
+            # 「清空记录」按钮在检测运行中是可以点的 —— 中间松开锁的话，那条刚写
+            # 下的报警会连同别的记录一起被这份重写覆盖掉，日志里查不到、截图却还在。
+            # 这里也不再限制条数：为了清一个模式而丢掉另一个模式的更早记录，没有道理。
+            retained = [
+                event
+                for event in self._read_events_locked()
+                if event.operation_mode != operation_mode
+            ]
             self.log_path.write_text(
                 "".join(
                     json.dumps(

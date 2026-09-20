@@ -477,5 +477,272 @@ class ReconnectBackoffTests(unittest.TestCase):
         self.assertIn("视频播放结束", statuses)
 
 
+class FrameBackpressureTests(unittest.TestCase):
+    """界面跟不上时丢显示帧，但检测一帧都不能少。
+
+    Qt 的跨线程信号是排队投递的，既不合并也不丢弃。1080p 一帧 BGR 就是 6 MB，而
+    低功耗预设能跑到 100 fps，界面每帧还要做一次颜色转换和缩放绘制 —— 跟不上时
+    队列按秒堆起来，一秒几百 MB，最后内存耗尽。监控模式的读取循环自己也不限速
+    （文件模式靠 wait_interval 限了），所以必须由发送端丢帧。
+    """
+
+    FRAME_COUNT = 5
+
+    def _drive(
+        self,
+        acknowledge: bool,
+        transitions: list[SessionTransition] | None = None,
+    ) -> tuple[list[np.ndarray], "Mock", list[AlarmEvent], list[AlarmEvent], DetectionWorker]:
+        frames = [
+            np.full((6, 8, 3), index, dtype=np.uint8) for index in range(self.FRAME_COUNT)
+        ]
+        spec = VideoSourceSpec("rtsp://camera/live", operation_mode="monitor")
+        source = ScriptedSource(
+            spec,
+            reads=[(True, frame, float(index)) for index, frame in enumerate(frames)],
+        )
+        store = Mock()
+        worker = DetectionWorker(
+            spec=spec,
+            model_path="model.pt",
+            device="cpu",
+            zones=[],
+            event_store=store,
+        )
+        worker.alarm_player = Mock()
+        # 帧读完之后源会一直失败，而监控模式会无限重连；这里让第一次退避等待就
+        # 假装「停止」被按下，测试不必真睡。
+        worker._stop_event = ScriptedStopEvent(1)
+
+        delivered: list[np.ndarray] = []
+        ready: list[AlarmEvent] = []
+        updates: list[AlarmEvent] = []
+        worker.event_ready.connect(ready.append)
+        worker.event_updated.connect(updates.append)
+        if acknowledge:
+            # 模拟界面：画完一帧就回执，允许下一帧进来（同线程，投递是同步的）。
+            worker.frame_ready.connect(lambda frame: (delivered.append(frame), worker.frame_consumed()))
+        else:
+            worker.frame_ready.connect(delivered.append)
+
+        engine = Mock()
+        engine.finalize_active_sessions.return_value = []
+        engine.process.side_effect = (
+            lambda frame, *args, **kwargs: (frame, list(transitions or []))
+        )
+
+        with (
+            patch("detection_worker.VideoSource", return_value=source),
+            patch("detection_worker.DetectionEngine", return_value=engine),
+        ):
+            worker.run()
+
+        return delivered, engine, ready, updates, worker
+
+    def test_without_an_acknowledgement_only_the_first_frame_is_queued(self) -> None:
+        delivered, engine, _, _, _ = self._drive(acknowledge=False)
+
+        self.assertEqual(len(delivered), 1)
+        np.testing.assert_array_equal(delivered[0], np.full((6, 8, 3), 0, dtype=np.uint8))
+        # 丢的只是显示：检测每帧都照跑，否则驻留计时会失真。
+        self.assertEqual(engine.process.call_count, self.FRAME_COUNT)
+
+    def test_acknowledging_each_frame_delivers_every_frame(self) -> None:
+        delivered, engine, _, _, _ = self._drive(acknowledge=True)
+
+        self.assertEqual(len(delivered), self.FRAME_COUNT)
+        self.assertEqual(engine.process.call_count, self.FRAME_COUNT)
+        for index, frame in enumerate(delivered):
+            np.testing.assert_array_equal(frame, np.full((6, 8, 3), index, dtype=np.uint8))
+
+    def test_dropped_frames_still_persist_their_alarms(self) -> None:
+        """丢显示不能连带丢掉报警：那才是这个程序存在的意义。"""
+        event = AlarmEvent(
+            source="rtsp://camera/live",
+            zone_name="警戒区",
+            track_id="7",
+            entered_at_seconds=0.0,
+            alarm_at_seconds=2.0,
+            wall_time="2026-09-20 10:00:00",
+            operation_mode="monitor",
+        )
+        transitions = [SessionTransition("alarmed", event)]
+
+        delivered, engine, ready, updates, worker = self._drive(
+            acknowledge=False, transitions=transitions
+        )
+
+        self.assertEqual(len(delivered), 1)
+        self.assertEqual(engine.process.call_count, self.FRAME_COUNT)
+        self.assertEqual(len(ready), self.FRAME_COUNT)
+        self.assertEqual(len(updates), self.FRAME_COUNT)
+        self.assertEqual(worker.event_store.mark_alarmed.call_count, self.FRAME_COUNT)
+        self.assertEqual(worker.alarm_player.trigger.call_count, self.FRAME_COUNT)
+
+    def test_frame_consumed_lets_the_next_frame_through(self) -> None:
+        delivered, engine, _, _, worker = self._drive(acknowledge=False)
+        self.assertEqual(len(delivered), 1)
+        self.assertEqual(engine.process.call_count, self.FRAME_COUNT)
+
+        # 界面追上进度之后就能继续收帧，不是一次丢帧之后就永久静默。
+        worker.frame_consumed()
+        self.assertFalse(worker._frame_pending.is_set())
+
+    def test_disarmed_preview_also_drops_frames_it_cannot_keep_up_with(self) -> None:
+        spec = VideoSourceSpec("rtsp://camera/live", operation_mode="monitor")
+        source = ScriptedSource(
+            spec,
+            reads=[
+                (True, np.zeros((6, 8, 3), dtype=np.uint8), float(index))
+                for index in range(self.FRAME_COUNT)
+            ],
+        )
+        worker = DetectionWorker(
+            spec=spec,
+            model_path="model.pt",
+            device="cpu",
+            zones=[],
+            event_store=Mock(),
+        )
+        worker._stop_event = ScriptedStopEvent(1)
+        delivered: list[np.ndarray] = []
+        worker.frame_ready.connect(delivered.append)
+        worker.set_armed(False)
+        engine = Mock()
+        engine.finalize_active_sessions.return_value = []
+
+        with (
+            patch("detection_worker.VideoSource", return_value=source),
+            patch("detection_worker.DetectionEngine", return_value=engine),
+        ):
+            worker.run()
+
+        # 撤防时只是预览，更没必要把帧堆在队列里。
+        self.assertEqual(len(delivered), 1)
+
+
+class EventStoreClearTests(unittest.TestCase):
+    """「清空记录」按运行模式清理。
+
+    它是本项目里唯一会删数据的代码路径，而且按钮在检测运行中也能点 —— 所以这里
+    既要钉住过滤逻辑，也要钉住「读改写之间不能松锁」这件事。
+    """
+
+    def store(self) -> EventStore:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        return EventStore(Path(temporary.name) / "events")
+
+    @staticmethod
+    def _session(operation_mode: str, session_id: str) -> dict:
+        return {
+            "time": "2026-09-20 10:00:00",
+            "video_source": "rtsp://camera/live",
+            "operation_mode": operation_mode,
+            "zone_name": "警戒区",
+            "track_id": "7",
+            "entered_at_seconds": 1.0,
+            "alarm_at_seconds": 2.0,
+            "session_id": session_id,
+        }
+
+    def test_clear_without_a_log_file_is_a_no_op(self) -> None:
+        store = self.store()
+
+        store.clear("monitor")
+
+        self.assertEqual(store.load_recent(), [])
+
+    def test_clear_by_mode_keeps_the_other_modes_records(self) -> None:
+        store = self.store()
+        store.root.mkdir(parents=True)
+        lines = [
+            self._session("monitor", "m1"),
+            self._session("video", "v1"),
+            self._session("monitor", "m2"),
+        ]
+        store.log_path.write_text(
+            "".join(json.dumps(line, ensure_ascii=False) + "\n" for line in lines),
+            encoding="utf-8",
+        )
+
+        store.clear("monitor")
+
+        remaining = store.load_recent()
+        self.assertEqual([event.session_id for event in remaining], ["v1"])
+        self.assertEqual(remaining[0].operation_mode, "video")
+        # 详情不能只有一张「打开」的记录：报警时刻与状态要一起留下来。
+        self.assertEqual(remaining[0].alarm_at_seconds, 2.0)
+
+    def test_clear_without_a_mode_removes_everything(self) -> None:
+        store = self.store()
+        store.root.mkdir(parents=True)
+        store.log_path.write_text(
+            json.dumps(self._session("monitor", "m1")) + "\n", encoding="utf-8"
+        )
+
+        store.clear()
+
+        self.assertFalse(store.log_path.exists())
+        self.assertEqual(store.load_recent(), [])
+
+    def test_clear_keeps_other_mode_records_beyond_ten_thousand(self) -> None:
+        """以前是 load_recent(limit=10_000) 读完再重写：要留的那条只要排在
+        第 10001 条之前，就会被静默丢掉 —— 为清一个模式而删掉另一个模式的记录。"""
+        store = self.store()
+        store.root.mkdir(parents=True)
+        lines = [json.dumps({"operation_mode": "video", "session_id": "video-old"})]
+        lines.extend(
+            json.dumps({"operation_mode": "monitor", "session_id": f"m{index}"})
+            for index in range(10_050)
+        )
+        store.log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        store.clear("monitor")
+
+        remaining = store.load_recent(limit=1_000_000)
+        self.assertEqual([event.session_id for event in remaining], ["video-old"])
+
+    def test_clear_keeps_screenshots_on_disk(self) -> None:
+        """对话框承诺「已保存的截图文件将保留」，这里把这个契约钉住。"""
+        store = self.store()
+        frame = np.zeros((4, 4, 3), dtype=np.uint8)
+        event = AlarmEvent(
+            source="rtsp://camera/live",
+            zone_name="警戒区",
+            track_id="7",
+            entered_at_seconds=1.0,
+            alarm_at_seconds=2.0,
+            wall_time="2026-09-20 10:00:00",
+            operation_mode="monitor",
+        )
+        store.open_session(event, frame)
+        screenshot = Path(event.entry_screenshot_path)
+        self.assertTrue(screenshot.exists())
+
+        store.clear("monitor")
+
+        self.assertTrue(screenshot.exists())
+
+    def test_broken_lines_do_not_hide_the_readable_records(self) -> None:
+        store = self.store()
+        store.root.mkdir(parents=True)
+        store.log_path.write_text(
+            "\n".join(
+                [
+                    "{不是 json",
+                    json.dumps([1, 2, 3]),  # 合法 JSON，但不是对象
+                    json.dumps(self._session("video", "v1")),
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        events = store.load_recent()
+
+        self.assertEqual([event.session_id for event in events], ["v1"])
+
+
 if __name__ == "__main__":
     unittest.main()
