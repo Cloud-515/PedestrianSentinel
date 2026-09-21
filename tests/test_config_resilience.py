@@ -195,6 +195,46 @@ class FieldCoercionTests(unittest.TestCase):
         self.assertEqual(config.to_dict()["version"], 1)
         self.assertEqual(AppConfig.from_dict(config.to_dict()).version, 1)
 
+    def test_screenshot_cleanup_is_disabled_by_default(self) -> None:
+        """自动删除取证材料这件事必须由用户显式打开。"""
+        config = AppConfig.from_dict({})
+
+        self.assertFalse(config.screenshot_retention_enabled)
+        # 数值仍然预填成建议值，但没打开开关就不会生效。
+        self.assertEqual(config.screenshot_retention_days, 15)
+        self.assertEqual(config.screenshot_retention_mb, 2048)
+
+    def test_legacy_retention_numbers_do_not_enable_cleanup(self) -> None:
+        """旧版本的 config.json 里只有天数与上限（当时默认开启）。
+
+        那些数值是程序自己写进去的默认值，用户从没点过头 —— 升级时不能按「填了数值
+        就是同意」推断，否则等于替他同意删自己的取证材料。
+        """
+        with self.assertLogs("models", level=logging.INFO) as captured:
+            config = AppConfig.from_dict(
+                {"screenshot_retention_days": 15, "screenshot_retention_mb": 2048}
+            )
+
+        self.assertFalse(config.screenshot_retention_enabled)
+        self.assertTrue(
+            any("未启用自动清理" in message for message in captured.output), captured.output
+        )
+
+    def test_retention_switch_round_trips(self) -> None:
+        config = AppConfig.from_dict(
+            {
+                "screenshot_retention_enabled": True,
+                "screenshot_retention_days": 3,
+                "screenshot_retention_mb": 256,
+            }
+        )
+
+        self.assertTrue(config.screenshot_retention_enabled)
+        restored = AppConfig.from_dict(config.to_dict())
+        self.assertTrue(restored.screenshot_retention_enabled)
+        self.assertEqual(restored.screenshot_retention_days, 3)
+        self.assertEqual(restored.screenshot_retention_mb, 256)
+
     def test_broken_fields_are_reported_in_the_log(self) -> None:
         """回落要出声，否则用户只会觉得「我的设置莫名变了」。"""
         with self.assertLogs("models", level=logging.WARNING) as captured:

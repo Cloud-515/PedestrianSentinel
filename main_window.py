@@ -295,6 +295,7 @@ class SettingsPanel(QGroupBox):
         """
         return [
             checkbox_field("cpu_low_power_preset", self.cpu_low_power_cb),
+            checkbox_field("screenshot_retention_enabled", self.retention_enabled_cb),
             spinbox_field("screenshot_retention_days", self.retention_days_spin),
             spinbox_field("screenshot_retention_mb", self.retention_mb_spin),
             checkbox_field("notification_enabled", self.notification_enabled_cb),
@@ -379,11 +380,20 @@ class SettingsPanel(QGroupBox):
     def _build_retention_box(self) -> QGroupBox:
         box = QGroupBox("取证留存")
         box.setToolTip(
-            "只清理报警截图，报警记录本身一直保留（它是纯文本，体积可以忽略）。\n"
-            "0 表示该条规则不生效；两条都是 0 就不再自动清理。\n"
+            "默认关闭：不勾选就不会自动删除任何文件。\n"
+            "勾选后按下面的规则清理报警截图；报警记录本身一直保留（它是纯文本，体积可以忽略）。\n"
+            "天数或上限填 0 表示那条规则不生效。\n"
             "更早的记录仍会显示在报警记录表里，只是详情中的截图会缺失。"
         )
         layout = QVBoxLayout(box)
+
+        # 删除类功能必须有显式开关，而且默认关着 —— 程序不该在用户还没看过设置的时候
+        # 就动他的取证材料。
+        self.retention_enabled_cb = QCheckBox("自动清理过期截图")
+        self.retention_enabled_cb.setToolTip(
+            "勾选后才会按下面的规则自动清理；不勾选时连「立即清理」也不会删东西。"
+        )
+        layout.addWidget(self.retention_enabled_cb)
 
         days_row = QHBoxLayout()
         days_row.addWidget(QLabel("截图保留:"))
@@ -410,6 +420,7 @@ class SettingsPanel(QGroupBox):
 
         self.storage_label = QLabel("正在统计占用…")
         self.storage_label.setStyleSheet("color: #7A8A99; font-size: 11px;")
+        self.storage_label.setWordWrap(True)
         layout.addWidget(self.storage_label)
 
         self.prune_btn = QPushButton("立即清理")
@@ -417,9 +428,23 @@ class SettingsPanel(QGroupBox):
         self.prune_btn.clicked.connect(self.prune_requested)
         layout.addWidget(self.prune_btn)
 
+        self.retention_enabled_cb.toggled.connect(self._on_retention_toggled)
         self.retention_days_spin.valueChanged.connect(self._emit_retention)
         self.retention_mb_spin.valueChanged.connect(self._emit_retention)
+        self._apply_retention_enabled_state()
         return box
+
+    def _on_retention_toggled(self, enabled: bool) -> None:
+        del enabled
+        self._apply_retention_enabled_state()
+        self._emit_retention(0)
+
+    def _apply_retention_enabled_state(self) -> None:
+        """开关关着的时候，数值框与「立即清理」都不该可点 —— 免得看起来像能用。"""
+        enabled = self.retention_enabled_cb.isChecked()
+        self.retention_days_spin.setEnabled(enabled)
+        self.retention_mb_spin.setEnabled(enabled)
+        self.prune_btn.setEnabled(enabled)
 
     def _emit_retention(self, value: int) -> None:
         del value
@@ -427,24 +452,39 @@ class SettingsPanel(QGroupBox):
             self.retention_days_spin.value(), self.retention_mb_spin.value()
         )
 
-    def set_retention(self, days: int, megabytes: int) -> None:
-        for spin, value in (
+    def set_retention(self, enabled: bool, days: int, megabytes: int) -> None:
+        for widget, value in (
+            (self.retention_enabled_cb, enabled),
             (self.retention_days_spin, days),
             (self.retention_mb_spin, megabytes),
         ):
-            spin.blockSignals(True)
-            spin.setValue(value)
-            spin.blockSignals(False)
+            widget.blockSignals(True)
+            if isinstance(widget, QCheckBox):
+                widget.setChecked(bool(value))
+            else:
+                widget.setValue(int(value))
+            widget.blockSignals(False)
+        self._apply_retention_enabled_state()
 
-    def retention(self) -> tuple[int, int]:
-        return self.retention_days_spin.value(), self.retention_mb_spin.value()
+    def retention(self) -> tuple[bool, int, int]:
+        return (
+            self.retention_enabled_cb.isChecked(),
+            self.retention_days_spin.value(),
+            self.retention_mb_spin.value(),
+        )
 
     def set_storage_usage(self, text: str) -> None:
         self.storage_label.setText(text)
 
     def set_retention_controls_enabled(self, enabled: bool) -> None:
-        self.retention_days_spin.setEnabled(enabled)
-        self.retention_mb_spin.setEnabled(enabled)
+        """整组控件随检测运行状态启用/禁用（运行中不给改）。"""
+        self.retention_enabled_cb.setEnabled(enabled)
+        if enabled:
+            self._apply_retention_enabled_state()
+        else:
+            self.retention_days_spin.setEnabled(False)
+            self.retention_mb_spin.setEnabled(False)
+            self.prune_btn.setEnabled(False)
 
     def set_operation_mode(self, operation_mode: str) -> None:
         self.video_radio.setChecked(operation_mode == "video")
@@ -1362,8 +1402,9 @@ class MainWindow(QMainWindow):
         """
         del ignored
         self._settings_binder.store(self.config)
-        # 通知状态栏是「当前配置能不能发出去」的实时指示，改完就刷新。
+        # 通知状态栏与留存占用都是「当前配置生效成什么样」的实时指示，改完就刷新。
         self._refresh_notification_status()
+        self._refresh_storage_usage()
         self._schedule_config_save()
 
     def _log_effective_settings(self) -> None:
@@ -1458,6 +1499,13 @@ class MainWindow(QMainWindow):
         self.notification_dispatcher.notify(job, on_result=self._on_notification_result_async)
 
     def _retention_policy(self) -> RetentionPolicy:
+        """当前生效的清理策略。开关关着时返回一个「什么都不做」的策略。
+
+        开关是唯一的闸门：自动清理与「立即清理」都走这里，所以关掉之后程序不可能
+        删掉任何截图 —— 用户不必去猜「这个按钮到底会不会真的动手」。
+        """
+        if not self.config.screenshot_retention_enabled:
+            return RetentionPolicy()
         return RetentionPolicy(
             days=self.config.screenshot_retention_days,
             max_bytes=self.config.screenshot_retention_mb * 1024 * 1024,
@@ -1465,18 +1513,25 @@ class MainWindow(QMainWindow):
 
     def _refresh_storage_usage(self) -> None:
         count, size = directory_usage(self.event_store.screenshot_dir)
-        days, megabytes = self.settings_panel.retention()
-        limit = "不限" if megabytes <= 0 else f"{megabytes} MB"
+        enabled, days, megabytes = self.settings_panel.retention()
+        if not enabled:
+            state = "自动清理已关闭"
+        else:
+            limit = "不限" if megabytes <= 0 else f"{megabytes} MB"
+            state = f"容量上限 {limit}，保留 {days or '不限'} 天"
         self.settings_panel.set_storage_usage(
-            f"已存 {count} 张 · {format_size(size)}（容量上限 {limit}，保留 {days or '不限'} 天）"
+            f"已存 {count} 张 · {format_size(size)}（{state}）"
         )
 
     def _run_retention(self) -> None:
-        """定时/启动时的自动清理。配置刚从坏文件回落时不清理。
+        """定时/启动时的自动清理。
 
-        默认值是 15 天/2 GB，而用户真正设的可能是 365 天 —— 拿一份「因为读不出来而
-        退回默认」的策略去删东西，删的就是用户的取证材料。所以这条路只在配置可信时
-        走；手动点「立即清理」不受限制（那是用户看着当前设置按的）。
+        两道闸门，任一没打开就什么都不删：
+
+        * 用户没显式开启自动清理（默认就是关的）；
+        * 配置刚从坏文件回落成默认值 —— 那份默认值不代表用户的意愿，拿它去删取证
+          材料是不可接受的。手动「立即清理」也受第一道闸门约束，但不受第二道约束
+          （那是用户看着界面按的）。
         """
         if not getattr(self, "_config_trusted", False):
             logger.info("配置未被可信读取，跳过自动截图清理")
@@ -1496,7 +1551,10 @@ class MainWindow(QMainWindow):
             self.event_store.screenshot_dir, self._retention_policy()
         )
         self._refresh_storage_usage()
-        self.source_panel.set_status(f"取证留存：{result.describe()}")
+        if self.config.screenshot_retention_enabled:
+            self.source_panel.set_status(f"取证留存：{result.describe()}")
+        else:
+            self.source_panel.set_status("取证留存：自动清理未开启，未删除任何文件")
 
     def _update_cpu_low_power_availability(self) -> None:
         device = self.source_panel.selected_device()

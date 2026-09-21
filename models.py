@@ -123,6 +123,29 @@ def _coerce_int(value: object, default: int, *, key: str) -> int:
         return default
 
 
+def _coerce_retention_enabled(data: dict[str, Any]) -> bool:
+    """取证截图的自动清理开关。缺这个键时一律按**关闭**处理。
+
+    这个功能第一版是默认开启的（15 天 / 2048 MB），所以升级上来的 config.json 里可能
+    只有天数与上限、没有这个开关。此时**不能**按「填了数值就是同意」来推断 —— 那些
+    数值是程序自己写进去的默认值，用户从没点过头，而代价是删他的取证材料。
+    只把这件事记进日志，让它有迹可循。
+    """
+    if "screenshot_retention_enabled" in data:
+        return _coerce_bool(
+            data.get("screenshot_retention_enabled"),
+            False,
+            key="screenshot_retention_enabled",
+        )
+    legacy = _coerce_int(data.get("screenshot_retention_days"), 0, key="screenshot_retention_days")
+    if legacy > 0 or _coerce_int(data.get("screenshot_retention_mb"), 0, key="screenshot_retention_mb") > 0:
+        logger.info(
+            "配置里有截图留存的天数/上限但没有开关，按「未启用自动清理」处理"
+            "（旧版本默认开启，升级后需要用户自己确认）"
+        )
+    return False
+
+
 def _coerce_choice(value: object, default: str, allowed: tuple[str, ...], *, key: str) -> str:
     """枚举型字段：只认白名单里的值。
 
@@ -311,7 +334,10 @@ class AppConfig:
     display_to_original_scale: dict[str, float] = field(
         default_factory=lambda: {"x": 1.0, "y": 1.0}
     )
-    # 取证截图留存：0 表示那条规则不生效，两条都为 0 就是从不自动清理。
+    # 取证截图留存。**默认关闭**：自动删文件这件事必须由用户显式打开，第一版把它
+    # 默认开着，等于让程序在用户还没看过设置的情况下就动他的取证材料。
+    # 下面两个数值只在开关打开时生效，所以关掉开关不会丢掉用户填过的天数与上限。
+    screenshot_retention_enabled: bool = False
     screenshot_retention_days: int = DEFAULT_RETENTION_DAYS
     screenshot_retention_mb: int = DEFAULT_RETENTION_MB
     # 远程通知。默认关闭：往外部地址发数据必须由用户显式打开。
@@ -378,6 +404,7 @@ class AppConfig:
                 "x": _coerce_float(scale.get("x"), 1.0, key="display_to_original_scale.x"),
                 "y": _coerce_float(scale.get("y"), 1.0, key="display_to_original_scale.y"),
             },
+            screenshot_retention_enabled=_coerce_retention_enabled(data),
             screenshot_retention_days=_clamp(
                 _coerce_int(
                     data.get("screenshot_retention_days"),
@@ -437,6 +464,7 @@ class AppConfig:
             "source_size": self.source_size,
             "polygon_coordinate_space": "original_video_pixels",
             "display_to_original_scale": self.display_to_original_scale,
+            "screenshot_retention_enabled": self.screenshot_retention_enabled,
             "screenshot_retention_days": self.screenshot_retention_days,
             "screenshot_retention_mb": self.screenshot_retention_mb,
             "notification_enabled": self.notification_enabled,

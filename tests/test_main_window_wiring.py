@@ -133,35 +133,82 @@ class MainWindowRetentionTests(unittest.TestCase):
         os.utime(file, (stamp, stamp))
         return file
 
-    def test_settings_panel_shows_the_defaults_from_the_config(self) -> None:
-        days, megabytes = self.window.settings_panel.retention()
+    def _enable_retention(self, days: int = 15, megabytes: int = 2048) -> None:
+        panel = self.window.settings_panel
+        panel.retention_days_spin.setValue(days)
+        panel.retention_mb_spin.setValue(megabytes)
+        panel.retention_enabled_cb.setChecked(True)
 
+    def test_automatic_cleanup_is_off_on_first_launch(self) -> None:
+        """默认必须是关的：程序不该在用户还没看过设置的时候就动他的取证材料。"""
+        enabled, days, megabytes = self.window.settings_panel.retention()
+
+        self.assertFalse(enabled)
+        # 数值仍然预填成建议值，方便用户一键打开，但开关没开就不生效。
         self.assertEqual(days, 15)
         self.assertEqual(megabytes, 2048)
+        self.assertFalse(self.window.config.screenshot_retention_enabled)
+        self.assertFalse(self.window._retention_policy().enabled)
+
+    def test_default_off_keeps_expired_screenshots_even_when_pruned(self) -> None:
+        expired = self._screenshot("expired", age_days=4000)
+
+        self.window._run_retention()
+        self.window._prune_now()
+
+        self.assertTrue(expired.exists(), "开关没打开就不该删任何东西")
+        self.assertIn("未开启", self.window.source_panel.status_label.text())
+
+    def test_numbers_are_locked_until_the_switch_is_on(self) -> None:
+        panel = self.window.settings_panel
+
+        self.assertFalse(panel.retention_days_spin.isEnabled())
+        self.assertFalse(panel.retention_mb_spin.isEnabled())
+        self.assertFalse(panel.prune_btn.isEnabled())
+
+        panel.retention_enabled_cb.setChecked(True)
+
+        self.assertTrue(panel.retention_days_spin.isEnabled())
+        self.assertTrue(panel.retention_mb_spin.isEnabled())
+        self.assertTrue(panel.prune_btn.isEnabled())
 
     def test_edited_retention_is_written_into_the_config_file(self) -> None:
-        self.window.settings_panel.retention_days_spin.setValue(30)
-        self.window.settings_panel.retention_mb_spin.setValue(512)
+        self._enable_retention(days=30, megabytes=512)
 
         self.window._save_config()
 
         saved = json.loads((self.base / "config.json").read_text(encoding="utf-8"))
+        self.assertTrue(saved["screenshot_retention_enabled"])
         self.assertEqual(saved["screenshot_retention_days"], 30)
         self.assertEqual(saved["screenshot_retention_mb"], 512)
         # 界面上改一次就要生效，不能等下次启动。
         self.assertEqual(self.window.config.screenshot_retention_days, 30)
 
     def test_retention_survives_a_restart(self) -> None:
-        self.window.settings_panel.retention_days_spin.setValue(7)
+        self._enable_retention(days=7)
         self.window._save_config()
 
         reopened = MainWindow()
 
-        self.assertEqual(reopened.settings_panel.retention_days_spin.value(), 7)
+        panel = reopened.settings_panel
+        self.assertTrue(panel.retention_enabled_cb.isChecked())
+        self.assertEqual(panel.retention_days_spin.value(), 7)
 
-    def test_automatic_prune_removes_expired_screenshots(self) -> None:
+    def test_switching_off_again_is_remembered(self) -> None:
+        self._enable_retention()
+        self.window._save_config()
+        self.window.settings_panel.retention_enabled_cb.setChecked(False)
+        self.window._save_config()
+
+        reopened = MainWindow()
+
+        self.assertFalse(reopened.settings_panel.retention_enabled_cb.isChecked())
+        self.assertFalse(reopened._retention_policy().enabled)
+
+    def test_automatic_prune_removes_expired_screenshots_once_enabled(self) -> None:
         expired = self._screenshot("expired", age_days=40)
         fresh = self._screenshot("fresh", age_days=1)
+        self._enable_retention(days=15)
 
         self.window._run_retention()
 
@@ -170,26 +217,25 @@ class MainWindowRetentionTests(unittest.TestCase):
 
     def test_manual_prune_reports_what_it_did(self) -> None:
         self._screenshot("expired", age_days=40)
+        self._enable_retention(days=15)
 
         self.window._prune_now()
 
         self.assertIn("已清理 1 张", self.window.source_panel.status_label.text())
 
-    def test_manual_prune_is_available_even_when_the_config_could_not_be_read(self) -> None:
-        """配置读坏时退回默认值，自动清理会停手 —— 但用户看着界面按的那一下照做。"""
-        expired = self._screenshot("expired", age_days=40)
+    def test_automatic_prune_stops_when_the_config_could_not_be_read(self) -> None:
+        """配置读坏时退回的默认值是「关闭」，拿一份不代表用户意愿的策略去删材料不可接受。"""
+        expired = self._screenshot("expired", age_days=4000)
+        self._enable_retention(days=15)
         self.window._config_trusted = False
 
         self.window._run_retention()
-        self.assertTrue(expired.exists(), "配置不可信时不该自动删取证材料")
 
-        self.window._prune_now()
-        self.assertFalse(expired.exists())
+        self.assertTrue(expired.exists())
 
-    def test_disabled_retention_touches_nothing(self) -> None:
+    def test_zero_rules_still_mean_never_clean(self) -> None:
         expired = self._screenshot("expired", age_days=4000)
-        self.window.settings_panel.retention_days_spin.setValue(0)
-        self.window.settings_panel.retention_mb_spin.setValue(0)
+        self._enable_retention(days=0, megabytes=0)
 
         self.window._run_retention()
 
@@ -204,6 +250,18 @@ class MainWindowRetentionTests(unittest.TestCase):
         text = self.window.settings_panel.storage_label.text()
         self.assertIn("已存 2 张", text)
         self.assertIn("3 KB", text)
+        self.assertIn("自动清理已关闭", text)
+
+    def test_storage_label_follows_the_switch(self) -> None:
+        """占用提示是「现在生效的是什么」的指示，拨了开关就该跟着变。"""
+        label = self.window.settings_panel.storage_label
+
+        self.assertIn("自动清理已关闭", label.text())
+
+        self._enable_retention(days=7, megabytes=512)
+
+        self.assertIn("保留 7 天", label.text())
+        self.assertIn("512 MB", label.text())
 
 
 class RecordingDispatcher:
