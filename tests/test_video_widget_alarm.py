@@ -9,6 +9,7 @@ import numpy as np
 from PySide6.QtCore import QPointF, Qt
 from PySide6.QtGui import QImage, QPainter
 from PySide6.QtWidgets import QApplication
+from unittest.mock import patch
 
 from models import AlarmEvent, ZoneDefinition
 from video_widget import VideoWidget
@@ -108,6 +109,9 @@ class ZoneOverlayTests(unittest.TestCase):
         self.widget = VideoWidget()
         self.widget.resize(200, 150)
         self.widget.set_frame(np.full((150, 200, 3), 90, dtype=np.uint8))
+        # _video_rect 平时是在 paintEvent 里算的；这里没走绘制流程，得自己算一次，
+        # 否则它还是 (0,0,0,0)，所有顶点都会被换算到控件左上角去。
+        self.widget._video_rect = self.widget._calculate_video_rect()
 
     @staticmethod
     def _zone(name: str) -> ZoneDefinition:
@@ -118,15 +122,20 @@ class ZoneOverlayTests(unittest.TestCase):
         )
 
     def _draw(self) -> np.ndarray:
-        """把控件层画到一张干净图上，返回像素。"""
-        image = QImage(200, 150, QImage.Format.Format_RGB888)
+        """把控件层画到一张干净图上，返回像素（画布与控件同尺寸）。"""
+        size = self.widget.size()
+        image = QImage(size, QImage.Format.Format_RGB888)
         image.fill(0)
         painter = QPainter(image)
         self.widget._draw_zones(painter)
         painter.end()
         buffer = image.constBits()
-        array = np.frombuffer(buffer, dtype=np.uint8).reshape((150, image.bytesPerLine()))
-        return array[:, : 200 * 3].reshape((150, 200, 3)).copy()
+        array = np.frombuffer(buffer, dtype=np.uint8).reshape(
+            (size.height(), image.bytesPerLine())
+        )
+        return array[:, : size.width() * 3].reshape(
+            (size.height(), size.width(), 3)
+        ).copy()
 
     def test_draws_nothing_when_no_zone_is_active(self) -> None:
         self.widget.set_zones([self._zone("区域1")])
@@ -134,16 +143,102 @@ class ZoneOverlayTests(unittest.TestCase):
 
         self.assertEqual(self._draw().sum(), 0)
 
-    def test_draws_the_active_zone(self) -> None:
+    def test_draws_the_active_zone_while_hovering(self) -> None:
         zone = self._zone("区域1")
         self.widget.set_zones([zone])
         self.widget.set_active_zone(zone)
 
-        painted = self._draw()
+        with patch.object(self.widget, "underMouse", return_value=True):
+            painted = self._draw()
 
         self.assertGreater(painted.sum(), 0)
-        # 只在区域轮廓附近有像素：中心是空的（没有填充，填充归引擎画）。
-        self.assertEqual(painted[80, 100].sum(), 0)
+        # 区域中心是空的：这里只画轮廓，填充归引擎（它要画在人下面）。
+        center = self.widget._to_display(QPointF(100.0, 80.0))
+        self.assertEqual(painted[int(center.y()), int(center.x())].sum(), 0)
+
+    def test_no_editing_overlay_while_monitoring(self) -> None:
+        """鼠标不在画面上时不该有编辑痕迹 —— 虚线只能画在图像之上，会横穿在人身上。"""
+        zone = self._zone("区域1")
+        self.widget.set_zones([zone])
+        self.widget.set_active_zone(zone)
+
+        with patch.object(self.widget, "underMouse", return_value=False):
+            painted = self._draw()
+
+        self.assertEqual(painted.sum(), 0)
+
+    def test_unclosed_zone_is_always_shown(self) -> None:
+        """正在画的区域必须看得见，否则不知道下一个点会连到哪。"""
+        zone = ZoneDefinition(
+            name="编辑中",
+            polygon=[[40.0, 40.0], [160.0, 40.0]],
+            closed=False,
+        )
+        self.widget.set_zones([zone])
+        self.widget.set_active_zone(zone)
+
+        with patch.object(self.widget, "underMouse", return_value=False):
+            painted = self._draw()
+
+        self.assertGreater(painted.sum(), 0)
+
+    def test_dragging_keeps_the_overlay_visible(self) -> None:
+        zone = self._zone("区域1")
+        self.widget.set_zones([zone])
+        self.widget.set_active_zone(zone)
+        self.widget._drag_index = 0
+
+        with patch.object(self.widget, "underMouse", return_value=False):
+            painted = self._draw()
+
+        self.assertGreater(painted.sum(), 0)
+
+    def test_outline_follows_true_positions_not_clamped_handles(self) -> None:
+        """轮廓必须按顶点的真实位置画。
+
+        顶点被外推到控件之外时，标记会被夹到边缘（为了还能抓住它），但**轮廓不能跟着
+        夹** —— 引擎烧进帧里的贴地带用的是真实坐标，轮廓跟着夹就会出现两条对不上的
+        边界，而错位的那条还横穿在人身上。
+        """
+        zone = ZoneDefinition(
+            name="区域1",
+            polygon=[[20.0, 20.0], [60.0, 20.0], [150.0, 200.0]],
+            closed=False,
+        )
+        self.widget.set_zones([zone])
+        self.widget.set_active_zone(zone)
+        painted = self._draw()
+
+        start = self.widget._to_display(QPointF(60.0, 20.0))
+        end = self.widget._to_display(QPointF(150.0, 200.0))
+        marker, clamped = self.widget._handle_position(QPointF(150.0, 200.0))
+        self.assertTrue(clamped, "这个顶点应当落在控件之外（否则这条用例没意义）")
+        self.assertNotEqual(marker.y(), end.y())
+
+        def point_on(line_start: QPointF, line_end: QPointF, y: float) -> tuple[int, int]:
+            ratio = (y - line_start.y()) / (line_end.y() - line_start.y())
+            return (
+                int(line_start.x() + (line_end.x() - line_start.x()) * ratio),
+                int(y),
+            )
+
+        def has_white_near(x: int, y: int, radius: int = 5) -> bool:
+            window = painted[
+                max(0, y - radius) : y + radius, max(0, x - radius) : x + radius
+            ]
+            return bool(window.sum())
+
+        # 虚线本来就有间隙，所以按命中比例判断：真实边上大多数采样点应当有像素，
+        # 而被夹住的那条线上应当一个都没有（那里什么都没画）。
+        samples = [(x, y) for y in range(150, 381, 20) for x, _ in [point_on(start, end, y)]]
+        true_hits = sum(1 for x, y in samples if has_white_near(x, y))
+        clamped_hits = sum(
+            1 for _, y in samples for x, _ in [point_on(start, marker, y)] if has_white_near(x, y)
+        )
+        self.assertGreaterEqual(
+            true_hits, len(samples) // 2, f"真实边上的采样命中太少: {true_hits}/{len(samples)}"
+        )
+        self.assertEqual(clamped_hits, 0, "被夹住的那条线上不该有任何像素")
 
     def test_antialiasing_is_requested(self) -> None:
         zone = self._zone("区域1")

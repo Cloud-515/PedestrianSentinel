@@ -258,22 +258,48 @@ class VideoWidget(QWidget):
         height = frame_height * scale
         return QRectF((self.width() - width) / 2, (self.height() - height) / 2, width, height)
 
+    def _editing_overlay_visible(self) -> bool:
+        """监控时不该有编辑痕迹。
+
+        区域本身（贴地渲染、被行人遮挡）由引擎烧进画面里，所以"区域在哪"始终看得见；
+        而编辑用的虚线轮廓与顶点手柄是界面元素，只能画在图像之上 —— 一直显示的话就会
+        横穿在人身上，看着突兀。只在用户真的可能编辑时才画：鼠标停在画面上、正在拖
+        顶点、或者区域还没闭合（正在画）。
+        """
+        if self._active_zone is None or not self._active_zone.polygon:
+            return False
+        if self._drag_index is not None or not self._active_zone.closed:
+            return True
+        return self.underMouse()
+
+    def enterEvent(self, event: object) -> None:
+        # 视频暂停时不会有新帧来触发重绘，所以进出画面都要主动刷新一次，
+        # 否则编辑层要等到下一次画面更新才出现/消失。
+        del event
+        self.update()
+
+    def leaveEvent(self, event: object) -> None:
+        del event
+        self.update()
+
     def _draw_zones(self, painter: QPainter) -> None:
         """只画**编辑用的那一层**：激活区域的虚线轮廓与顶点手柄。
 
         区域本身（贴地效果、被行人遮挡）由引擎烧进画面里 —— 它必须画在人下面才能被
         遮挡，而控件只能画在图像之上。这里如果再把实线画一遍，就会出现两条错开的线：
         原来就是这样，线看着又粗又糊，而且横穿在人身上。
-
-        虚线是刻意选的样式：它是界面元素（"你正在编辑这条边界"），不该被误读成画面里
-        的实体边界。顶点手柄也只画激活区域的 —— 每个区域都挂一串圆点，监控时很吵。
         """
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         zone = self._active_zone
-        if zone is None or not zone.polygon:
+        if zone is None or not zone.polygon or not self._editing_overlay_visible():
             return
-        handles = [self._handle_position(QPointF(point[0], point[1])) for point in zone.polygon]
-        points = [handle for handle, _ in handles]
+        # 轮廓按顶点的**真实**位置画，标记按夹住后的位置画。
+        # 两者混用会让边界在屏幕上画到错的地方去：引擎烧进帧里的贴地带用的是真实坐标，
+        # 于是界面上会出现两条对不上的边界，其中一条还横穿在人身上。
+        points = [self._to_display(QPointF(point[0], point[1])) for point in zone.polygon]
+        handles = [
+            self._handle_position(QPointF(point[0], point[1])) for point in zone.polygon
+        ]
 
         def trace() -> None:
             if len(points) >= 2:
@@ -289,30 +315,32 @@ class VideoWidget(QWidget):
         painter.setPen(QPen(QColor(255, 255, 255, 230), 1.6, Qt.PenStyle.DashLine))
         trace()
         painter.setPen(QPen(QColor(0, 0, 0, 180), 1.2))
-        for (position, clamped), handle in zip(handles, points):
+        for (marker, clamped), true_position in zip(handles, points):
             if not clamped:
                 painter.setBrush(QColor("#FFFFFF"))
-                painter.drawEllipse(position, 4, 4)
+                painter.drawEllipse(marker, 4, 4)
                 continue
             # 被夹到边缘的顶点：画成指向真实方向的三角，提示"它还在更外面"。
             painter.setBrush(QColor("#FFFFFF"))
-            direction = QPointF(handle.x() - position.x(), handle.y() - position.y())
+            direction = QPointF(
+                true_position.x() - marker.x(), true_position.y() - marker.y()
+            )
             if direction.isNull():
-                painter.drawEllipse(position, 4, 4)
+                painter.drawEllipse(marker, 4, 4)
                 continue
             length = (direction.x() ** 2 + direction.y() ** 2) ** 0.5
             unit = QPointF(direction.x() / length, direction.y() / length)
             perpendicular = QPointF(-unit.y(), unit.x())
             painter.drawPolygon(
                 [
-                    QPointF(position.x() + unit.x() * 8, position.y() + unit.y() * 8),
+                    QPointF(marker.x() + unit.x() * 8, marker.y() + unit.y() * 8),
                     QPointF(
-                        position.x() - unit.x() * 3 + perpendicular.x() * 5,
-                        position.y() - unit.y() * 3 + perpendicular.y() * 5,
+                        marker.x() - unit.x() * 3 + perpendicular.x() * 5,
+                        marker.y() - unit.y() * 3 + perpendicular.y() * 5,
                     ),
                     QPointF(
-                        position.x() - unit.x() * 3 - perpendicular.x() * 5,
-                        position.y() - unit.y() * 3 - perpendicular.y() * 5,
+                        marker.x() - unit.x() * 3 - perpendicular.x() * 5,
+                        marker.y() - unit.y() * 3 - perpendicular.y() * 5,
                     ),
                 ]
             )

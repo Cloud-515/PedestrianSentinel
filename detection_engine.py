@@ -273,6 +273,14 @@ class DetectionEngine:
         self._draw_ground_zones(annotated, in_zone_ids)
         self._restore_people(annotated, frame, boxes)
 
+        for zone in self.zones:
+            if len(zone.polygon) >= 2:
+                # 区域名属于信息层，画在遮挡之后 —— 画在前面的话，路过的人会把名字
+                # 擦掉一块，看着像渲染出错。
+                self._draw_zone_name(
+                    annotated, zone, np.asarray(zone.polygon, dtype=np.float32)
+                )
+
         for index, (x1, y1, x2, y2) in enumerate(boxes):
             track_id = track_ids[index] if index < len(track_ids) else None
             inside = any(track_id in ids for ids in in_zone_ids.values())
@@ -334,7 +342,6 @@ class DetectionEngine:
                 cv2.polylines(
                     annotated, [points], False, self._bgr(zone.color), 2, cv2.LINE_AA
                 )
-            self._draw_zone_name(annotated, zone, polygon)
 
     def _draw_ground_zone(
         self,
