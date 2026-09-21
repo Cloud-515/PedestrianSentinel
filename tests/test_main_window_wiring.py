@@ -256,6 +256,8 @@ class MainWindowRetentionTests(unittest.TestCase):
         """占用提示是「现在生效的是什么」的指示，拨了开关就该跟着变。"""
         label = self.window.settings_panel.storage_label
 
+        # 启动时的占用统计已经推到窗口显示之后（启动路径上不扫目录），测试里手动触发一次。
+        self.window._refresh_storage_usage()
         self.assertIn("自动清理已关闭", label.text())
 
         self._enable_retention(days=7, megabytes=512)

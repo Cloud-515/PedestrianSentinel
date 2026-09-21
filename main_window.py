@@ -4,13 +4,14 @@ import logging
 from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import numpy as np
-from PySide6.QtCore import QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QSize, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QPixmap, QResizeEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QButtonGroup,
     QCheckBox,
     QColorDialog,
@@ -46,8 +47,6 @@ from PySide6.QtWidgets import (
 import app_paths
 from alarm_service import EventStore
 from config_store import ConfigStore
-from compute_devices import enumerate_inference_devices
-from detection_worker import DetectionWorker
 from inference_profiles import resolve_inference_policy
 from models import (
     DEFAULT_RETENTION_DAYS,
@@ -84,12 +83,43 @@ from source_history import add_history_entry
 from video_source import VideoSourceSpec
 from video_widget import VideoWidget
 
+if TYPE_CHECKING:
+    # 只给类型检查看：这条链在运行时是**延迟导入**的（见 start_detection）——
+    # detection_worker 要 ultralytics + supervision + trackers，实测约 8 秒，压在启动
+    # 路径上就是一段白屏等待，而它只有「真的开始推理」时才需要。
+    from detection_worker import DetectionWorker
+
 logger = logging.getLogger(__name__)
 
 APP_DIR = app_paths.APP_DIR
 CONFIG_PATH = app_paths.data("config.json")
 EVENTS_DIR = app_paths.data("events")
 PROFILES_DIR = app_paths.data("profiles")
+
+
+# ---------------------------------------------------------------------------
+# 后台探测：可用推理设备
+# ---------------------------------------------------------------------------
+
+class DeviceProbe(QThread):
+    """在后台算可用推理设备，算完发 ``ready``。
+
+    ``compute_devices.enumerate_inference_devices`` 要 ``import torch``（实测约 4 秒），
+    压在主线程上就是启动时的一段白屏等待。放到线程里：窗口先出来、状态栏写着
+    「正在检测推理设备…」，探测完再把下拉框填上并放开「打开」。
+    """
+
+    ready = Signal(list)
+
+    def run(self) -> None:
+        try:
+            from compute_devices import enumerate_inference_devices
+
+            options = enumerate_inference_devices()
+        except Exception:  # noqa: BLE001 - 探测失败按「只有 CPU」处理，不该让启动挂掉
+            logger.exception("枚举推理设备失败")
+            options = [("cpu", "CPU")]
+        self.ready.emit(options)
 
 
 # ---------------------------------------------------------------------------
@@ -1414,6 +1444,9 @@ class EventPanel(QGroupBox):
         "记录时间", "视频源", "区域", "目标ID", "进入时刻", "报警时刻",
         "退出时刻", "状态", "闯入时长", "进入取证", "报警取证",
     ]
+    # 吸收多余宽度的那一列（「退出时刻」）。定义成常量：列宽模式要按它恢复，两处写死
+    # 数字迟早会对不上。
+    STRETCH_COLUMN = 6
 
     def __init__(
         self,
@@ -1432,7 +1465,7 @@ class EventPanel(QGroupBox):
         # 让「退出时刻」吸收多余宽度（查看器那边才是可拖的）。
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(self.STRETCH_COLUMN, QHeaderView.ResizeMode.Stretch)
         self.table.setMinimumHeight(220)
         self.table.cellDoubleClicked.connect(self._show_details)
         layout.addWidget(self.table)
@@ -1451,6 +1484,29 @@ class EventPanel(QGroupBox):
             AlarmDetailDialog(event, self._resolver, self).exec()
 
     def append_event(self, event: AlarmEvent) -> None:
+        self._write_row(event)
+        self.table.scrollToBottom()
+
+    def load_events(self, events: list[AlarmEvent]) -> None:
+        """成批填表（启动时那 200 条）。
+
+        填的时候必须把列宽模式切掉 ResizeToContents：11 列都按内容自适应时，每写一个
+        单元格都会触发一次列宽重算，而每次重算要遍历所有行 —— 200 条 × 11 列下来是
+        **秒级**（实测启动时这一项就占 1.6 秒）。填完再恢复模式，Qt 只重算一遍。
+        """
+        header = self.table.horizontalHeader()
+        self.table.setUpdatesEnabled(False)
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        try:
+            for event in events:
+                self._write_row(event)
+        finally:
+            header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(self.STRETCH_COLUMN, QHeaderView.ResizeMode.Stretch)
+            self.table.setUpdatesEnabled(True)
+        self.table.scrollToBottom()
+
+    def _write_row(self, event: AlarmEvent) -> None:
         row = self._rows_by_session.get(event.session_id)
         if row is None:
             row = self.table.rowCount()
@@ -1467,7 +1523,6 @@ class EventPanel(QGroupBox):
             item.setToolTip(value)
             if column == 0:
                 item.setData(Qt.ItemDataRole.UserRole, event)
-        self.table.scrollToBottom()
 
     def clear(self) -> None:
         self.table.setRowCount(0)
@@ -1527,13 +1582,16 @@ class MainWindow(QMainWindow):
         self._build_layout()
         self._load_controls()
         self._connect_signals()
-        self._load_event_history()
-        self._log_effective_settings()
-        self._refresh_storage_usage()
         self._retention_timer.start()
-        # 启动时先让窗口画出来再扫目录：目录很大时这一步不该拖慢启动。放在事件循环
-        # 里做还有个好处 —— 自动化测试不跑事件循环，就不会在无准备的情况下动磁盘。
-        # 配置读坏而回落默认值时不自动清理（见 _run_retention）。
+        # 下面这些都不影响窗口能不能用，全部推到窗口画出来之后再做 —— 启动时它们是一段
+        # 白屏等待（实测：设备探测要 import torch 约 4 秒，占用统计要遍历截图目录几百个
+        # 文件，低功耗可用性检查要 import openvino）。现在窗口立刻可用，状态栏先写着
+        # 「正在检测推理设备…」；「生效设置」那条日志也等设备探测回来再写（要记真实设备）。
+        #
+        # 放在事件循环里做还有个好处：自动化测试不跑事件循环，就不会在无准备的情况下
+        # 动磁盘、也不会去 import torch。配置读坏而回落默认值时不自动清理（见 _run_retention）。
+        QTimer.singleShot(0, self._probe_devices)
+        QTimer.singleShot(0, self._refresh_storage_usage)
         QTimer.singleShot(0, self._run_retention)
 
     def _build_layout(self) -> None:
@@ -1607,6 +1665,7 @@ class MainWindow(QMainWindow):
         return loaded
 
     def _load_controls(self) -> None:
+        # 这一步内部会载入报警记录（见 _apply_operation_mode），所以下面不再重复载入。
         self._apply_operation_mode(self.config.operation_mode, persist=False)
         self.source_panel.source_edit.setText(
             self.config.video_source
@@ -1618,7 +1677,32 @@ class MainWindow(QMainWindow):
             if self.config.operation_mode == "video"
             else self.config.camera_history
         )
-        device_options = enumerate_inference_devices()
+        # 推理设备要 import torch 才知道（实测约 4 秒），不能压在这条启动路径上：交给
+        # 后台线程探测（见 _probe_devices），结果回来之前「打开」先禁用着 —— 否则用户
+        # 可能带着一个还没填好的设备列表就开始检测。
+        self.source_panel.set_status("正在检测推理设备…")
+        self.source_panel.open_btn.setEnabled(False)
+        self._settings_binder.load(self.config)
+        self._refresh_notification_status()
+        self.playback_panel.loop_cb.setChecked(self.config.loop_playback)
+        speed_value = max(1, min(16, round(self.config.playback_speed / 0.25)))
+        self.playback_panel.speed_slider.setValue(speed_value)
+        self._restore_active_profile()
+        self.video_widget.set_zones(self.zones)
+        self.video_widget.set_active_zone(self.active_zone)
+        self._refresh_zone_panel()
+        self._refresh_profiles()
+        self._set_profile_dirty(False)
+        self._update_playback_enabled()
+
+    def _probe_devices(self) -> None:
+        """在后台算可用推理设备（理由见 _load_controls）。"""
+        self._device_probe = DeviceProbe(self)
+        self._device_probe.ready.connect(self._apply_device_options)
+        self._device_probe.start()
+
+    def _apply_device_options(self, device_options: list[tuple[str, str]]) -> None:
+        """设备探测结果回来了：填下拉框、恢复上次选的设备、放开「打开」。"""
         restored = self.source_panel.set_device_options(
             device_options,
             self.config.inference_device,
@@ -1636,19 +1720,10 @@ class MainWindow(QMainWindow):
             self.source_panel.set_status(
                 f"检测到 {len(device_options) - 1} 个可用 GPU"
             )
-        self._settings_binder.load(self.config)
+        self.source_panel.open_btn.setEnabled(True)
         self._update_cpu_low_power_availability()
-        self._refresh_notification_status()
-        self.playback_panel.loop_cb.setChecked(self.config.loop_playback)
-        speed_value = max(1, min(16, round(self.config.playback_speed / 0.25)))
-        self.playback_panel.speed_slider.setValue(speed_value)
-        self._restore_active_profile()
-        self.video_widget.set_zones(self.zones)
-        self.video_widget.set_active_zone(self.active_zone)
-        self._refresh_zone_panel()
-        self._refresh_profiles()
-        self._set_profile_dirty(False)
-        self._update_playback_enabled()
+        # 「生效设置」这条日志要记的是真正生效的设备，所以等探测回来再写（见 __init__）。
+        self._log_effective_settings()
 
     def _connect_signals(self) -> None:
         self.source_panel.open_btn.clicked.connect(self.start_detection)
@@ -2317,6 +2392,13 @@ class MainWindow(QMainWindow):
                 f"CPU 低功耗模式不可用：{resolution.unavailable_reason}"
             )
             return
+        # 推理那条链（ultralytics + supervision + trackers，实测约 8 秒）是延迟导入的：
+        # 它只有真的开始推理时才需要，压在启动路径上只是白屏。这里先让状态栏把话说出来
+        # 再导 —— 否则窗口会卡住好几秒，而界面上一个字都不变，看着像死机。
+        self.source_panel.set_status("正在加载推理组件…")
+        QApplication.processEvents()
+        from detection_worker import DetectionWorker
+
         self.worker = DetectionWorker(
             spec=spec,
             model_path=resolution.policy.model_path,
@@ -2525,11 +2607,34 @@ class MainWindow(QMainWindow):
         self.config.display_to_original_scale = self.video_widget.coordinate_mapping()
         try:
             self.config_store.save(self.config)
+            self._save_active_profile()
         except OSError as error:
             # 磁盘满、目录只读、文件被占用都会走到这里。界面不提示的话，用户看到的
             # 是一份「改了也存不下」的设置，而没有任何线索。
             logger.exception("Unable to save configuration")
             self.source_panel.set_status(f"配置未能保存：{error}")
+
+    def _save_active_profile(self) -> None:
+        """区域有改动时，把当前配置组也一起落盘。
+
+        以前只有「保存配置组」按钮会写 ``profiles\\名字.json``，而**启动时配置组优先**
+        （_restore_active_profile 用它覆盖 config.json 里的区域）—— 于是画完区域直接
+        关窗，改动只躺在 config.json 里，下次启动被配置组盖掉，等于白画。现在跟着
+        防抖保存一起写，状态栏那句「未保存」也会跟着变成「已保存」。
+
+        没有当前配置组（从没命名过）时就只写 config.json —— 下次启动会回落到它，
+        改动同样不会丢，所以不必替用户凭空造一个配置组。
+        """
+        name = self.config.active_profile
+        if not self.profile_dirty or not name or not self.profile_store.exists(name):
+            return
+        try:
+            self.profile_store.save(ZoneProfile(name=name, zones=self.zones))
+        except ValueError as error:
+            # 名字非法之类：配置组没写成，但 config.json 里那份已经落盘了。
+            logger.warning("配置组自动保存失败：%s", error)
+            return
+        self._set_profile_dirty(False)
 
     def closeEvent(self, event: object) -> None:
         self._save_timer.stop()
