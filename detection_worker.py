@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
+from collections.abc import Callable
 from typing import Optional
 
 import numpy as np
@@ -10,7 +12,7 @@ from PySide6.QtCore import QThread, Signal
 from alarm_service import AlarmPlayer, EventStore
 from detection_engine import DetectionEngine
 from inference_profiles import InferencePolicy
-from models import SessionTransition, ZoneDefinition
+from models import AlarmEvent, SessionTransition, ZoneDefinition
 from video_source import VideoSource, VideoSourceSpec
 
 logger = logging.getLogger(__name__)
@@ -28,6 +30,9 @@ class DetectionWorker(QThread):
     # 再长会让网络恢复后的接回变慢，再短则长时间断开时会一直高频重开设备、刷日志。
     RECONNECT_BASE_DELAY = 1.0
     RECONNECT_MAX_DELAY = 30.0
+
+    # 跳帧提示最多每这么久报一次：跟不上时几乎每帧都要跳，逐帧刷状态栏没法看。
+    SKIP_REPORT_INTERVAL_SECONDS = 1.0
 
     @classmethod
     def _reconnect_delay(cls, attempts: int) -> float:
@@ -69,6 +74,8 @@ class DetectionWorker(QThread):
         self._armed = True
         self._arm_generation = 0
         self._applied_arm_generation = 0
+        self._skipped_frames = 0
+        self._skip_reported_at = 0.0
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -83,7 +90,7 @@ class DetectionWorker(QThread):
         1080p 一帧 BGR 是 6 MB，而界面每帧都要做一次颜色转换加缩放绘制；低功耗
         预设能跑到 100 fps，比界面快得多。此时队列里积压的是帧，而内存增长和画面
         滞后都是按秒算的（每积压一秒就是几百 MB）。监控模式下的读取循环本来也没有
-        节流 —— 文件模式那边靠 wait_interval 自己限速，摄像头/网络流没有。
+        节流；文件模式那边靠 pace() 对齐播放进度，它管的是取帧节奏，不是投递。
 
         只丢「显示」，检测照跑：跳过检测会让驻留计时和告警判定跟着失真，那才是
         这个程序的立身之本。标注帧也照画（不能省掉 render），因为同一帧还要用作
@@ -214,7 +221,7 @@ class DetectionWorker(QThread):
                             min(1.0, video_time / source.duration_seconds)
                         )
                     if source.spec.is_file:
-                        self.msleep(max(1, int(source.wait_interval() * 1000)))
+                        self._pace_file_playback(source, speed)
                     continue
 
                 annotated, transitions = engine.process(
@@ -229,7 +236,7 @@ class DetectionWorker(QThread):
                 for transition in transitions:
                     self._handle_transition(transition, annotated)
                 if source.spec.is_file:
-                    self.msleep(max(1, int(source.wait_interval() * 1000)))
+                    self._pace_file_playback(source, speed)
         except Exception as error:
             failed = True
             logger.exception("Detection worker stopped unexpectedly")
@@ -240,6 +247,28 @@ class DetectionWorker(QThread):
             source.close()
             if not failed:
                 self.status_changed.emit("检测已停止")
+
+    def _pace_file_playback(self, source: VideoSource, speed: float) -> None:
+        """文件播放的节拍：让**视频位置**跟上墙钟，跟不上就把帧跳掉。
+
+        原来每帧固定睡 ``1/(fps×速度)``，睡眠加在推理之上，于是推理比帧间隔慢的机器
+        会慢放（1.00× 实际跑 0.25×）。现在由 ``VideoSource.pace`` 按墙钟对齐：该等的
+        等，该跳的跳，播放速度始终是设定的那个。
+
+        跳掉的帧**不参与检测**，所以必须报出来 —— 否则看的人以为一直在全量检测，而
+        画面已经一段段跳过去了。
+        """
+        skipped = source.pace()
+        if not skipped:
+            return
+        self._skipped_frames += skipped
+        now = time.monotonic()
+        if now - self._skip_reported_at >= self.SKIP_REPORT_INTERVAL_SECONDS:
+            self._skip_reported_at = now
+            self.status_changed.emit(
+                f"推理跟不上，已跳帧 {self._skipped_frames} 张"
+                f"（保持 {speed:.2f}x 播放；跳过的帧不参与检测）"
+            )
 
     def _sync_armed_state(self, engine: DetectionEngine) -> bool:
         with self._control_lock:
@@ -257,16 +286,38 @@ class DetectionWorker(QThread):
                 return
         event = transition.event
         if transition.kind == "entered":
-            self.event_store.open_session(event, frame)
+            if not self._write_record(self.event_store.open_session, event, frame):
+                return
             self.event_updated.emit(event)
         elif transition.kind == "alarmed":
-            self.event_store.mark_alarmed(event, frame)
+            if not self._write_record(self.event_store.mark_alarmed, event, frame):
+                return
+            # 告警音照旧要响：写盘失败不该让"有人闯进来了"这件事也不响。
             self.alarm_player.trigger()
             self.event_updated.emit(event)
             self.event_ready.emit(event)
         else:
-            self.event_store.close_session(event)
+            if not self._write_record(self.event_store.close_session, event):
+                return
             self.event_updated.emit(event)
+
+    def _write_record(self, write: Callable[..., object], event: AlarmEvent, *args) -> bool:
+        """写报警记录，失败只报出来、**不**让检测停下。
+
+        原来这里一旦抛异常，异常会一路冒到 ``run()`` 的外层 except，整个检测线程随之
+        结束 —— 于是"某一条记录写不下去"的代价是"从此不再设防"，而界面上只留一行
+        「检测错误」。真实案例：裁片那条路径曾把事件里的 source 遮成了图像数组，
+        ``json.dumps`` 当场抛异常，一条报警就把检测打停了。
+
+        失败时不发界面更新：不能让表里出现一条磁盘上没有的记录。
+        """
+        try:
+            write(event, *args)
+        except (OSError, TypeError, ValueError) as error:
+            logger.exception("报警记录写入失败")
+            self.status_changed.emit(f"报警记录写入失败：{error}（检测继续）")
+            return False
+        return True
 
     def _finalize_sessions(self, engine: DetectionEngine, video_time: float | None) -> None:
         if video_time is None:

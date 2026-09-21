@@ -35,6 +35,10 @@ class FakeVideoSource:
     def close(self) -> None:
         self.closed = True
 
+    def pace(self) -> int:
+        """文件播放的节拍对齐（真实实现见 VideoSource.pace）。"""
+        return 0
+
 
 class WorkerDeviceTests(unittest.TestCase):
     def events_dir(self) -> Path:
@@ -214,8 +218,8 @@ class WorkerDeviceTests(unittest.TestCase):
             def is_paused(self) -> bool:
                 return False
 
-            def wait_interval(self) -> float:
-                return 0.001
+            def pace(self) -> int:
+                return 0
 
             def restart_file(self) -> bool:
                 return False
@@ -362,8 +366,8 @@ class ScriptedSource:
     def is_paused(self) -> bool:
         return False
 
-    def wait_interval(self) -> float:
-        return 0.001
+    def pace(self) -> int:
+        return 0
 
     def restart_file(self) -> bool:
         return False
@@ -886,6 +890,70 @@ class EventStoreClearTests(unittest.TestCase):
         events = store.load_recent()
 
         self.assertEqual([event.session_id for event in events], ["v1"])
+
+
+class RecordWriteFailureTests(unittest.TestCase):
+    """一条记录写不下去，不该把检测一起停掉。
+
+    真实案例（2026-09-21）：裁片那条路径把事件里的 ``source`` 遮成了图像数组，
+    ``json.dumps`` 当场抛异常，异常一路冒到 ``run()`` 外层，整个检测线程结束 ——
+    界面上只留一行「检测错误」，而从此不再设防。写盘失败必须只是写盘失败。
+    """
+
+    def test_a_failed_record_keeps_detection_running(self) -> None:
+        event = AlarmEvent(
+            source="test.mp4",
+            zone_name="区域",
+            track_id="1",
+            entered_at_seconds=1.0,
+            alarm_at_seconds=None,
+            wall_time="2026-08-17 10:00:00",
+            operation_mode="video",
+        )
+        frame = np.zeros((8, 8, 3), dtype=np.uint8)
+        spec = VideoSourceSpec("test.mp4", operation_mode="video")
+        source = ScriptedSource(
+            spec,
+            reads=[
+                (True, frame, 1.0),
+                (True, frame, 2.0),
+                (True, frame, 3.0),
+                (False, None, None),
+            ],
+        )
+        engine = Mock()
+        engine.finalize_active_sessions.return_value = []
+        engine.process.side_effect = [
+            (frame, [SessionTransition("entered", event)]),
+            (frame, []),
+            (frame, []),
+        ]
+        store = Mock()
+        store.open_session.side_effect = TypeError("Object of type ndarray is not JSON serializable")
+        worker = DetectionWorker(
+            spec=spec,
+            model_path="model.pt",
+            device="cpu",
+            zones=[],
+            event_store=store,
+        )
+        worker.alarm_player = Mock()
+        statuses: list[str] = []
+        updates: list[AlarmEvent] = []
+        worker.status_changed.connect(statuses.append)
+        worker.event_updated.connect(updates.append)
+
+        with (
+            patch("detection_worker.VideoSource", return_value=source),
+            patch("detection_worker.DetectionEngine", return_value=engine),
+        ):
+            worker.run()
+
+        self.assertEqual(engine.process.call_count, 3, "写盘失败之后检测必须继续跑")
+        self.assertTrue(
+            any("报警记录写入失败" in text for text in statuses), statuses
+        )
+        self.assertEqual(updates, [], "磁盘上没有的记录不该出现在界面里")
 
 
 if __name__ == "__main__":
