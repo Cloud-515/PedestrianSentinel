@@ -26,6 +26,7 @@ from PySide6 import QtCore
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QHeaderView,
     QLabel,
@@ -173,8 +174,11 @@ class AlarmHistoryDialogTests(unittest.TestCase):
 
     def test_search_requires_every_word_to_match(self) -> None:
         """空格分开的多个词是「与」：搜「南侧 77」找的是那条记录，不是所有含南侧的。"""
-        self.record(zone="北侧入口", track="12")
-        self.record(zone="南侧通道", track="77")
+        # 记录时间也是被搜的列，所以这里固定一个不含「12」的时间：默认值取的是「现在」，
+        # 跑到 12 点那几个小时里这条测试就会自己失败。
+        fixed = "2026-09-21 08:00:00"
+        self.record(zone="北侧入口", track="12", wall_time=fixed)
+        self.record(zone="南侧通道", track="77", wall_time=fixed)
 
         dialog = self.dialog()
         dialog.search_edit.setText("南侧 77")
@@ -486,6 +490,73 @@ class AlarmHistoryDialogTests(unittest.TestCase):
 
     # -- 窗口本身 -----------------------------------------------------------
 
+    def test_the_header_stays_aligned_with_the_cells_when_scrolled(self) -> None:
+        """滚动、拖分隔条之后，每一列的表头 x 与表体 x 都要逐列相等。
+
+        这就是「表头与表体对齐」本身。它们本该永远相等（表头是表格控件的一部分，不是
+        另一块要手动同步的表），所以这条同时是给以后改列宽策略的人留的护栏。
+        """
+        dialog = self.dialog()
+        dialog.resize(1000, 700)
+        dialog.show()
+        self.addCleanup(dialog.close)
+        self.app.processEvents()
+
+        table = dialog.table
+        for column in range(len(AlarmHistoryDialog.HEADERS)):
+            table.setColumnWidth(column, 150)
+        bar = table.horizontalScrollBar()
+
+        for value in (0, 137, bar.maximum() // 2, bar.maximum()):
+            with self.subTest(scroll=value):
+                bar.setValue(value)
+                self.app.processEvents()
+                self.assert_header_matches_body(dialog)
+
+        with self.subTest(action="拖分隔条改表宽"):
+            dialog.findChild(QSplitter).setSizes([500, 700])
+            self.app.processEvents()
+            self.assert_header_matches_body(dialog)
+
+    def assert_header_matches_body(self, dialog: AlarmHistoryDialog) -> None:
+        table = dialog.table
+        header = table.horizontalHeader()
+        for column in range(table.columnCount()):
+            self.assertEqual(
+                table.columnViewportPosition(column),
+                header.sectionViewportPosition(column),
+                f"第 {column} 列表头与表体错位",
+            )
+
+    def test_the_horizontal_scrollbar_range_matches_the_overflow_in_pixels(self) -> None:
+        """横向滚动条的范围要按像素算。
+
+        Qt 默认按「列」算：十列里看得见四列，范围就是 0..6，而内容实际超出七百多像素
+        —— 拖起来一格跳一列，拇指的大小和位置也和看到的画面对不上。
+        """
+        dialog = self.dialog()
+        dialog.resize(1000, 700)
+        dialog.show()
+        self.addCleanup(dialog.close)
+        self.app.processEvents()
+
+        table = dialog.table
+        for column in range(len(AlarmHistoryDialog.HEADERS)):
+            table.setColumnWidth(column, 150)
+        self.app.processEvents()
+
+        overflow = table.horizontalHeader().length() - table.viewport().width()
+        self.assertGreater(overflow, 0, "这条测的是横向溢出时的情况")
+        self.assertEqual(table.horizontalScrollBar().maximum(), overflow)
+
+    def test_the_header_labels_line_up_with_the_cells(self) -> None:
+        """表头文字靠左：Qt 默认居中，列一宽列名就跑到列中间，看着像表头错位。"""
+        dialog = self.dialog()
+
+        alignment = dialog.table.horizontalHeader().defaultAlignment()
+
+        self.assertTrue(alignment & Qt.AlignmentFlag.AlignLeft, alignment)
+
     def test_the_viewer_opens_at_the_size_of_the_main_window(self) -> None:
         parent = QWidget()
         self.addCleanup(parent.deleteLater)
@@ -523,6 +594,19 @@ class EventPanelTests(unittest.TestCase):
     def test_there_is_no_clear_button_left(self) -> None:
         """报警记录按留存策略是永久保留的（只清截图），界面上不再留「清空」这个入口。"""
         self.assertFalse(hasattr(EventPanel(), "clear_btn"))
+
+    def test_the_panel_table_lines_up_and_scrolls_the_same_way(self) -> None:
+        """两张表共用一份表设置：列名的对齐方式与横向滚动方式不该只在一边生效。"""
+        panel = EventPanel()
+
+        self.assertEqual(
+            panel.table.horizontalScrollMode(),
+            QAbstractItemView.ScrollMode.ScrollPerPixel,
+        )
+        self.assertTrue(
+            panel.table.horizontalHeader().defaultAlignment()
+            & Qt.AlignmentFlag.AlignLeft
+        )
 
     def test_an_updated_session_stays_on_its_own_row(self) -> None:
         panel = EventPanel()

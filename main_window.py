@@ -1004,6 +1004,16 @@ def _configure_event_table(table: QTableWidget, headers: list[str]) -> None:
         "QTableWidget::item:selected { background-color: rgba(1, 174, 231, 128); }"
     )
     table.verticalHeader().setVisible(False)
+    # 横向滚动按像素。Qt 的默认是「按列」：滚动条的范围于是变成「第几列」，十列里看得见
+    # 四列就是 0..6 —— 而内容实际超出七百多像素。拖起来一格跳一列，拇指的大小与位置也和
+    # 看到的画面对不上，正是「横向滚动不同步」。（纵向按行是对的，不动。）
+    table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+    # 表头文字靠左，和下面的单元格对齐。Qt 默认把表头文字居中：列一宽，列名就跑到列的中间
+    # 去，看着就像「表头和数据列错位」—— 列越宽越明显，所以取证路径列、拖宽过的列上尤其
+    # 显眼。靠左之后列名正对着它下面那列的第一个字符，错不错位一眼就能判断。
+    table.horizontalHeader().setDefaultAlignment(
+        Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+    )
 
 
 def _record_time(event: AlarmEvent) -> datetime | None:
