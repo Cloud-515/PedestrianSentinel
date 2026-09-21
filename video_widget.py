@@ -25,6 +25,10 @@ class VideoWidget(QWidget):
         self._zones: list[ZoneDefinition] = []
         self._active_zone: ZoneDefinition | None = None
         self._drag_index: int | None = None
+        # 上一次按下是否真的新增了顶点（存它的下标）。双击闭合时要靠它判断"要不要
+        # 把刚才那一下加的点去掉" —— 用位置判断不可靠：双击落在画面外某个已有顶点上
+        # 时，位置同样对得上，那样就会误删一个正常顶点。
+        self._last_added_vertex: int | None = None
         self._video_rect = QRectF()
         self._pending_alarm_events: dict[tuple[str, str], AlarmEvent] = {}
         self._displayed_alarm_events: list[AlarmEvent] = []
@@ -181,9 +185,14 @@ class VideoWidget(QWidget):
         if self._active_zone is None or self._image is None:
             return
         position = event.position()
-        original = self._to_original(position)
-        if original is None:
-            return
+        # 每次按下都重新判定"这一下有没有加点"，供紧随其后的双击闭合使用。
+        self._last_added_vertex = None
+        # 先看是不是点在某个顶点上，再看是不是落在画面内。
+        #
+        # 这个顺序是必须的：顶点可以落在画面之外（换过不同分辨率的视频源、或者把顶点
+        # 拖出去过，都会这样），而"点是否在画面内"的判断会把画面外的顶点一并挡掉 ——
+        # 于是那个顶点既拖不动也删不掉，永远卡在画面外。只有**新增**顶点才必须落在
+        # 画面内（点在黑边上不该凭空加一个点）。
         nearest = self._nearest_vertex(position)
         if event.button() == Qt.MouseButton.RightButton:
             if nearest is not None:
@@ -198,14 +207,21 @@ class VideoWidget(QWidget):
             return
         if self._active_zone.closed:
             return
+        original = self._to_original(position)
+        if original is None:
+            return
         self._active_zone.polygon.append([original.x(), original.y()])
+        self._last_added_vertex = len(self._active_zone.polygon) - 1
         self.zone_changed.emit(self._active_zone)
         self.update()
 
     def mouseMoveEvent(self, event: object) -> None:
         if self._active_zone is None or self._drag_index is None:
             return
-        original = self._to_original(event.position())
+        # 不要求落在画面内：允许把顶点拖出画面，也允许把画面外的顶点拖回来。指针在
+        # 画面外时按同一个线性映射外推即可，坐标会被夹在一个宽松范围内（见
+        # _to_original），免得配置里出现天文数字。
+        original = self._to_original(event.position(), clamp_to_video=False)
         if original is None:
             return
         self._active_zone.polygon[self._drag_index] = [original.x(), original.y()]
@@ -218,13 +234,19 @@ class VideoWidget(QWidget):
     def mouseDoubleClickEvent(self, event: object) -> None:
         if self._active_zone is None or self._active_zone.closed:
             return
-        original = self._to_original(event.position())
+        original = self._to_original(event.position(), clamp_to_video=False)
         if original is None:
             return
-        if self._active_zone.polygon:
-            last = self._active_zone.polygon[-1]
+        # 双击的第一下（press）若已经在落点处加过一个顶点，这里把它去掉再闭合。
+        # 判据是"press 真的加过点"（_last_added_vertex），而不是位置对得上 —— 双击
+        # 落在画面外某个已有顶点上时位置同样对得上，那样会误删一个正常顶点。
+        added = self._last_added_vertex
+        self._last_added_vertex = None
+        polygon = self._active_zone.polygon
+        if added is not None and polygon and added == len(polygon) - 1:
+            last = polygon[-1]
             if abs(last[0] - original.x()) <= 1 and abs(last[1] - original.y()) <= 1:
-                self._active_zone.polygon.pop()
+                polygon.pop()
         self.close_active_zone()
 
     def _calculate_video_rect(self) -> QRectF:
@@ -250,7 +272,8 @@ class VideoWidget(QWidget):
         zone = self._active_zone
         if zone is None or not zone.polygon:
             return
-        points = [self._to_display(QPointF(point[0], point[1])) for point in zone.polygon]
+        handles = [self._handle_position(QPointF(point[0], point[1])) for point in zone.polygon]
+        points = [handle for handle, _ in handles]
 
         def trace() -> None:
             if len(points) >= 2:
@@ -266,15 +289,60 @@ class VideoWidget(QWidget):
         painter.setPen(QPen(QColor(255, 255, 255, 230), 1.6, Qt.PenStyle.DashLine))
         trace()
         painter.setPen(QPen(QColor(0, 0, 0, 180), 1.2))
-        for point in points:
+        for (position, clamped), handle in zip(handles, points):
+            if not clamped:
+                painter.setBrush(QColor("#FFFFFF"))
+                painter.drawEllipse(position, 4, 4)
+                continue
+            # 被夹到边缘的顶点：画成指向真实方向的三角，提示"它还在更外面"。
             painter.setBrush(QColor("#FFFFFF"))
-            painter.drawEllipse(point, 4, 4)
+            direction = QPointF(handle.x() - position.x(), handle.y() - position.y())
+            if direction.isNull():
+                painter.drawEllipse(position, 4, 4)
+                continue
+            length = (direction.x() ** 2 + direction.y() ** 2) ** 0.5
+            unit = QPointF(direction.x() / length, direction.y() / length)
+            perpendicular = QPointF(-unit.y(), unit.x())
+            painter.drawPolygon(
+                [
+                    QPointF(position.x() + unit.x() * 8, position.y() + unit.y() * 8),
+                    QPointF(
+                        position.x() - unit.x() * 3 + perpendicular.x() * 5,
+                        position.y() - unit.y() * 3 + perpendicular.y() * 5,
+                    ),
+                    QPointF(
+                        position.x() - unit.x() * 3 - perpendicular.x() * 5,
+                        position.y() - unit.y() * 3 - perpendicular.y() * 5,
+                    ),
+                ]
+            )
 
-    def _to_original(self, point: QPointF) -> QPointF | None:
-        if not self._video_rect.contains(point) or self._frame_size[0] == 0:
+    # 拖动时允许顶点离画面多远（画面尺寸的比例）。留一点余量是有意义的：警戒区一部分
+    # 落到画面之外是合理的（比如想让它贴着画面边缘、不留缝）。但余量不能大 —— 顶点在
+    # 屏幕上的位置是按比例外推的，允许拖出太远就会跑到控件可视区之外，那就真的抓不
+    # 回来了（这正是"画面外的顶点拖不动"这类问题的另一半）。
+    OFF_FRAME_MARGIN = 0.05
+
+    def _to_original(self, point: QPointF, *, clamp_to_video: bool = True) -> QPointF | None:
+        """把控件坐标换算成画面坐标。
+
+        ``clamp_to_video=True``（默认）要求点落在画面区域内 —— 用于"新增顶点"，点在
+        黑边上不该凭空加点。``False`` 时按同一个线性映射外推，于是画面外的顶点也能被
+        拖动、也能被拖回画面里。
+        """
+        if self._frame_size[0] == 0 or self._frame_size[1] == 0:
+            return None
+        if self._video_rect.width() <= 0 or self._video_rect.height() <= 0:
+            return None
+        if clamp_to_video and not self._video_rect.contains(point):
             return None
         x = (point.x() - self._video_rect.x()) * self._frame_size[0] / self._video_rect.width()
         y = (point.y() - self._video_rect.y()) * self._frame_size[1] / self._video_rect.height()
+        if not clamp_to_video:
+            x = min(self._frame_size[0] * (1 + self.OFF_FRAME_MARGIN),
+                    max(-self._frame_size[0] * self.OFF_FRAME_MARGIN, x))
+            y = min(self._frame_size[1] * (1 + self.OFF_FRAME_MARGIN),
+                    max(-self._frame_size[1] * self.OFF_FRAME_MARGIN, y))
         return QPointF(x, y)
 
     def _to_display(self, point: QPointF) -> QPointF:
@@ -288,7 +356,37 @@ class VideoWidget(QWidget):
         if self._active_zone is None:
             return None
         for index, point in enumerate(self._active_zone.polygon):
-            display = self._to_display(QPointF(point[0], point[1]))
+            display, _ = self._handle_position(QPointF(point[0], point[1]))
             if (display - position).manhattanLength() <= 12:
                 return index
         return None
+
+    # 顶点标记离控件边缘的间距。
+    HANDLE_INSET = 6.0
+
+    def _handle_position(self, point: QPointF) -> tuple[QPointF, bool]:
+        """顶点在控件里的落点，返回 (落点, 是否被夹到边缘)。
+
+        为什么要夹：顶点坐标允许落在画面之外（换过不同分辨率的视频源、或者把顶点拖出去
+        都会这样），而屏幕上的位置是按比例外推的 —— 窗口不大时，画面外的顶点会落到控件
+        之外，那样它既看不见也点不到，就永远卡住了。夹到边缘并画成三角标记，至少让人
+        看得见、抓得住、拖得回来。
+
+        绘制与命中判定都走这里，两者必须用同一个位置，否则会出现"看得见却点不中"。
+        """
+        display = self._to_display(point)
+        bounds = QRectF(self.rect()).adjusted(
+            self.HANDLE_INSET,
+            self.HANDLE_INSET,
+            -self.HANDLE_INSET,
+            -self.HANDLE_INSET,
+        )
+        if bounds.contains(display):
+            return display, False
+        return (
+            QPointF(
+                min(max(display.x(), bounds.left()), bounds.right()),
+                min(max(display.y(), bounds.top()), bounds.bottom()),
+            ),
+            True,
+        )
