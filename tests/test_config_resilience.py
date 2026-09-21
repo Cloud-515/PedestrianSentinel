@@ -21,7 +21,14 @@ import unittest
 from pathlib import Path
 
 from config_store import ConfigStore
-from models import AlarmEvent, AppConfig, ZoneDefinition, ZoneProfile
+from models import (
+    MAX_COLUMN_WIDTH,
+    MIN_COLUMN_WIDTH,
+    AlarmEvent,
+    AppConfig,
+    ZoneDefinition,
+    ZoneProfile,
+)
 
 GOOD_ZONES = [
     {
@@ -234,6 +241,49 @@ class FieldCoercionTests(unittest.TestCase):
         self.assertTrue(restored.screenshot_retention_enabled)
         self.assertEqual(restored.screenshot_retention_days, 3)
         self.assertEqual(restored.screenshot_retention_mb, 256)
+
+    def test_column_widths_round_trip(self) -> None:
+        config = AppConfig.from_dict(
+            {**base_config(), "history_column_widths": {"区域": 260, "记录时间": 180}}
+        )
+
+        self.assertEqual(config.history_column_widths, {"区域": 260, "记录时间": 180})
+        restored = AppConfig.from_dict(config.to_dict())
+        self.assertEqual(restored.history_column_widths, {"区域": 260, "记录时间": 180})
+
+    def test_column_widths_are_dropped_one_by_one_when_broken(self) -> None:
+        """这是程序自己写的界面状态，坏条目丢掉就行 —— 宽度随时还能拖回来。"""
+        config = AppConfig.from_dict(
+            {
+                **base_config(),
+                "history_column_widths": {
+                    "区域": 260,
+                    "写成了文字": "很宽",
+                    "负的": -5,
+                    "布尔值": True,
+                    5: 100,  # JSON 里键都是字符串，这里模拟手改出来的非字符串键
+                },
+            }
+        )
+
+        self.assertEqual(config.history_column_widths, {"区域": 260})
+
+    def test_column_widths_are_clamped(self) -> None:
+        config = AppConfig.from_dict(
+            {**base_config(), "history_column_widths": {"太窄": 1, "太宽": 999999}}
+        )
+
+        self.assertEqual(
+            config.history_column_widths,
+            {"太窄": MIN_COLUMN_WIDTH, "太宽": MAX_COLUMN_WIDTH},
+        )
+
+    def test_column_widths_written_as_a_list_fall_back_to_empty(self) -> None:
+        config = AppConfig.from_dict(
+            {**base_config(), "history_column_widths": [100, 200]}
+        )
+
+        self.assertEqual(config.history_column_widths, {})
 
     def test_broken_fields_are_reported_in_the_log(self) -> None:
         """回落要出声，否则用户只会觉得「我的设置莫名变了」。"""

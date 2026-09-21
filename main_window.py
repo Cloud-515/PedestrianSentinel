@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -987,15 +988,11 @@ class AlarmDetailDialog(QDialog):
         layout.addLayout(screenshots)
 
 
-def _configure_event_table(
-    table: QTableWidget,
-    headers: list[str],
-    stretch_column: int,
-) -> None:
-    """报警记录表的共同设置（常驻面板与查看器共用）。
+def _configure_event_table(table: QTableWidget, headers: list[str]) -> None:
+    """报警记录表的共同外观（常驻面板与查看器共用）。
 
-    ``stretch_column`` 是吸收多余宽度的那一列：两处的列数不一样，让各自挑一列伸展，
-    比定死一个尺寸好 —— 表宽随窗口变。
+    列宽策略两边不一样，各自在调用处设置：面板窄，按内容铺满；查看器可以拖，而且要把
+    拖过的宽度存下来。
     """
     table.setColumnCount(len(headers))
     table.setHorizontalHeaderLabels(headers)
@@ -1007,9 +1004,37 @@ def _configure_event_table(
         "QTableWidget::item:selected { background-color: rgba(1, 174, 231, 128); }"
     )
     table.verticalHeader().setVisible(False)
-    header = table.horizontalHeader()
-    header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-    header.setSectionResizeMode(stretch_column, QHeaderView.ResizeMode.Stretch)
+
+
+def _record_time(event: AlarmEvent) -> datetime | None:
+    """记录时间（``wall_time``）解析成 datetime；认不出来返回 None。
+
+    程序写的是 ``"%Y-%m-%d %H:%M:%S"`` 的本地时间文本。手工编辑过、或者很旧的记录可能
+    是别的写法 —— 那就不参与时间筛选，而不是让整份记录读不出来。
+
+    用 fromisoformat 而不是 strptime：它认这个格式，还额外认带毫秒、带 ISO 变体的写法，
+    并且快得多 —— 时间筛选要在每次筛选时把整份记录过一遍。
+    """
+    try:
+        return datetime.fromisoformat(event.wall_time)
+    except (TypeError, ValueError):
+        return None
+
+
+def _time_filter_start(code: str, now: datetime) -> datetime | None:
+    """时间档位的下界；「全部时间」返回 None。
+
+    「今天」按当天 0 点算，不是「往前推 24 小时」：现场说的「今天」就是日历上的今天。
+    """
+    if code == "hour":
+        return now - timedelta(hours=1)
+    if code == "today":
+        return now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if code == "week":
+        return now - timedelta(days=7)
+    if code == "month":
+        return now - timedelta(days=30)
+    return None
 
 
 class AlarmHistoryDialog(QDialog):
@@ -1027,12 +1052,23 @@ class AlarmHistoryDialog(QDialog):
         "记录时间", "运行模式", "视频源", "区域", "目标ID",
         "进入时刻", "报警时刻", "退出时刻", "状态", "闯入时长",
     ]
+    # 时间筛选的档位：(下拉里显示的文字, 档位代码)。用固定档位而不是两个日期选择器：
+    # 现场问的是「刚才 / 今天 / 这几天有没有人进来」，翻记录时手点日历反而慢。
+    TIME_FILTERS = (
+        ("全部时间", ""),
+        ("最近 1 小时", "hour"),
+        ("今天", "today"),
+        ("最近 7 天", "week"),
+        ("最近 30 天", "month"),
+    )
 
     def __init__(
         self,
         store: EventStore,
         resolver: Callable[[str], Path | None] | None = None,
         parent: Optional[QWidget] = None,
+        *,
+        column_widths: dict[str, int] | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("查看报警记录")
@@ -1042,6 +1078,7 @@ class AlarmHistoryDialog(QDialog):
         self._store = store
         self._resolver = resolver
         self._events: list[AlarmEvent] = []
+        self._saved_widths = dict(column_widths or {})
 
         layout = QVBoxLayout(self)
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -1062,17 +1099,25 @@ class AlarmHistoryDialog(QDialog):
         layout.setContentsMargins(0, 0, 0, 0)
 
         filters = QHBoxLayout()
-        self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("搜索：时间 / 视频源 / 区域 / 目标ID / 状态")
-        self.search_edit.setClearButtonEnabled(True)
-        self.search_edit.textChanged.connect(self._apply_filter)
-        filters.addWidget(self.search_edit, 1)
+        self.time_combo = QComboBox()
+        self.time_combo.setToolTip(
+            "按记录时间筛：现场问的是「刚才 / 今天 / 这几天有没有人进来」。"
+        )
+        for label, code in self.TIME_FILTERS:
+            self.time_combo.addItem(label, code)
+        self.time_combo.currentIndexChanged.connect(self._apply_filter)
+        filters.addWidget(self.time_combo)
         self.mode_combo = QComboBox()
         self.mode_combo.currentIndexChanged.connect(self._apply_filter)
         filters.addWidget(self.mode_combo)
         self.status_combo = QComboBox()
         self.status_combo.currentIndexChanged.connect(self._apply_filter)
         filters.addWidget(self.status_combo)
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("搜索：时间 / 视频源 / 区域 / 目标ID / 状态")
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.textChanged.connect(self._apply_filter)
+        filters.addWidget(self.search_edit, 1)
         self.refresh_btn = QPushButton("刷新")
         self.refresh_btn.setToolTip(
             "重新读一遍记录文件：检测一直在写，翻记录时新报的警靠它出现。"
@@ -1082,15 +1127,54 @@ class AlarmHistoryDialog(QDialog):
         layout.addLayout(filters)
 
         self.table = QTableWidget(0, len(self.HEADERS))
-        _configure_event_table(self.table, self.HEADERS, len(self.HEADERS) - 1)
+        _configure_event_table(self.table, self.HEADERS)
+        header = self.table.horizontalHeader()
+        # 列宽交给用户拖：要看的是「谁、什么时候、哪个区域」，不同点位关心的列不一样，
+        # 按内容铺一遍只是第一次打开的起点。
+        #
+        # 最后一列由它吸收剩余宽度：十列拖窄之后右边会空出一条，看着像没画完。
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        header.setStretchLastSection(True)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setMinimumHeight(220)
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
+        self._restore_column_widths()
         layout.addWidget(self.table, 1)
 
         self.count_label = QLabel()
         layout.addWidget(self.count_label)
         return side
+
+    def _restore_column_widths(self) -> None:
+        """把上次拖过的列宽放回去；一条都没有时先按内容铺一遍。
+
+        按列名找，不按下标：以后加一列，按下标存的那份会整体错位。
+        """
+        restored = 0
+        for column, name in enumerate(self._draggable_headers()):
+            width = self._saved_widths.get(name)
+            if width:
+                self.table.setColumnWidth(column, width)
+                restored += 1
+        if not restored:
+            self.table.resizeColumnsToContents()
+
+    def column_widths(self) -> dict[str, int]:
+        """当前列宽（列名 → 像素）。关窗时由主窗口写进 config.json。
+
+        最后一列不在这里：它的宽度由表宽决定（剩余多少就是多少），存下来只会在下次打开
+        时把一条早就过时的数字写进去。
+        """
+        header = self.table.horizontalHeader()
+        return {
+            name: header.sectionSize(column)
+            for column, name in enumerate(self._draggable_headers())
+        }
+
+    @classmethod
+    def _draggable_headers(cls) -> list[str]:
+        """可拖（也是可记忆）的列，即除最后一列之外的那些。"""
+        return cls.HEADERS[:-1]
 
     # -- 右栏 ---------------------------------------------------------------
 
@@ -1190,7 +1274,13 @@ class AlarmHistoryDialog(QDialog):
         combo.setCurrentIndex(index if index >= 0 else 0)
         combo.blockSignals(False)
 
-    def _matches(self, event: AlarmEvent) -> bool:
+    def _matches(self, event: AlarmEvent, window_start: datetime | None) -> bool:
+        if window_start is not None:
+            recorded = _record_time(event)
+            # 认不出时间的记录不参与时间筛选：说它在窗口内是编的，说它不在也是编的。
+            # 计数那行会显示「显示 N / 共 M 条」，被筛掉多少看得见。
+            if recorded is None or recorded < window_start:
+                return False
         mode = self.mode_combo.currentData() or ""
         if mode and _mode_label(event.operation_mode) != mode:
             return False
@@ -1219,7 +1309,14 @@ class AlarmHistoryDialog(QDialog):
     def _apply_filter(self, *ignored: object) -> None:
         del ignored
         selected = self._selected_event()
-        visible = [event for event in self._events if self._matches(event)]
+        # 时间窗口在这里算一次：它是「现在」往前推出来的，逐条记录各算一次既慢又会
+        # 在跨秒时算出两个不同的下界。
+        window_start = _time_filter_start(
+            self.time_combo.currentData() or "", datetime.now()
+        )
+        visible = [
+            event for event in self._events if self._matches(event, window_start)
+        ]
         # 重填期间关掉选中信号：搜索框里打字是连着来的，每敲一个字都重画一次右栏（两张图
         # 要重新解码）会明显发顿。重填完再把选中行按会话 ID 找回来。
         #
@@ -1296,7 +1393,12 @@ class EventPanel(QGroupBox):
         layout = QVBoxLayout(self)
         self.table = QTableWidget(0, len(self.HEADERS))
         self._rows_by_session: dict[str, int] = {}
-        _configure_event_table(self.table, self.HEADERS, 6)
+        _configure_event_table(self.table, self.HEADERS)
+        # 面板只有四百来像素宽，装不下十一个按内容铺开的列，所以这里固定按内容铺满，
+        # 让「退出时刻」吸收多余宽度（查看器那边才是可拖的）。
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
         self.table.setMinimumHeight(220)
         self.table.cellDoubleClicked.connect(self._show_details)
         layout.addWidget(self.table)
@@ -2273,11 +2375,18 @@ class MainWindow(QMainWindow):
 
         查看器自己读全量记录、也不按运行模式过滤（面板那张表只装当前模式的最近 200 条），
         所以打开时会重新读一遍文件 —— 检测正在跑的话，刚报的那条警也在里面。
+
+        列宽在这里进、出：进去的是上次拖过的宽度，出来的是这次拖成的样子，关窗即存。
         """
         dialog = AlarmHistoryDialog(
-            self.event_store, self.event_store.resolve_screenshot, self
+            self.event_store,
+            self.event_store.resolve_screenshot,
+            self,
+            column_widths=self.config.history_column_widths,
         )
         dialog.exec()
+        self.config.history_column_widths = dialog.column_widths()
+        self._schedule_config_save()
 
     def _schedule_config_save(self) -> None:
         self._save_timer.start()

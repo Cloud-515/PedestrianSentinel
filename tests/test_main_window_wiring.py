@@ -312,6 +312,28 @@ class MainWindowAlarmHistoryTests(unittest.TestCase):
         self.assertIs(dialog_class.call_args.args[2], self.window)
         dialog_class.return_value.exec.assert_called_once()
 
+    def test_column_widths_go_in_and_come_back_out_of_the_viewer(self) -> None:
+        """上次拖过的列宽交给查看器，这次拖成的样子收回来存下 —— 关窗即存。"""
+        self.window.config.history_column_widths = {"区域": 260}
+
+        with patch.object(main_window, "AlarmHistoryDialog") as dialog_class:
+            dialog_class.return_value.column_widths.return_value = {"区域": 300}
+            self.window.event_panel.view_btn.click()
+
+        self.assertEqual(dialog_class.call_args.kwargs["column_widths"], {"区域": 260})
+        self.assertEqual(self.window.config.history_column_widths, {"区域": 300})
+        self.assertTrue(self.window._save_timer.isActive(), "没安排落盘")
+
+    def test_column_widths_survive_a_restart(self) -> None:
+        self.window.config.history_column_widths = {"区域": 300, "记录时间": 190}
+        self.window._save_config()
+
+        reopened = MainWindow()
+
+        self.assertEqual(
+            reopened.config.history_column_widths, {"区域": 300, "记录时间": 190}
+        )
+
 
 class RecordingDispatcher:
     """替掉真正的发送器：只记录被交出去的作业，不碰网络。"""

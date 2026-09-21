@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -22,7 +23,13 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
 from PySide6 import QtCore
-from PySide6.QtWidgets import QApplication, QLabel, QSplitter, QWidget
+from PySide6.QtWidgets import (
+    QApplication,
+    QHeaderView,
+    QLabel,
+    QSplitter,
+    QWidget,
+)
 
 import main_window
 from alarm_service import EventStore
@@ -49,6 +56,7 @@ class AlarmHistoryDialogTests(unittest.TestCase):
         track: str = "12",
         mode: str = "monitor",
         alarm: bool = True,
+        wall_time: str | None = None,
     ) -> AlarmEvent:
         """真写一条记录（含两张取证截图），跟检测线程落盘的那条路径一致。"""
         event = AlarmEvent(
@@ -57,7 +65,7 @@ class AlarmHistoryDialogTests(unittest.TestCase):
             track_id=track,
             entered_at_seconds=1.0,
             alarm_at_seconds=3.0 if alarm else None,
-            wall_time="2026-09-21 10:00:00",
+            wall_time=wall_time or self.now(),
             operation_mode=mode,
             exited_at_seconds=6.0,
             duration_seconds=5.0,
@@ -67,6 +75,14 @@ class AlarmHistoryDialogTests(unittest.TestCase):
             self.store.mark_alarmed(event, self.frame)
         self.store.close_session(event)
         return event
+
+    @staticmethod
+    def now() -> str:
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    @classmethod
+    def days_ago(cls, days: float) -> str:
+        return (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
 
     def dialog(self, parent: QWidget | None = None) -> AlarmHistoryDialog:
         dialog = AlarmHistoryDialog(self.store, self.store.resolve_screenshot, parent)
@@ -179,6 +195,121 @@ class AlarmHistoryDialogTests(unittest.TestCase):
         dialog.search_edit.setText(event.session_id)
 
         self.assertEqual(dialog.table.rowCount(), 0)
+
+    def test_the_time_filter_narrows_by_record_time(self) -> None:
+        self.record(zone="刚刚", wall_time=self.days_ago(0))
+        self.record(zone="三天前", wall_time=self.days_ago(3))
+        self.record(zone="四十天前", wall_time=self.days_ago(40))
+
+        dialog = self.dialog()
+        self.assertEqual(len(self.column(dialog, "区域")), 3, "默认是全部时间")
+
+        dialog.time_combo.setCurrentIndex(dialog.time_combo.findData("hour"))
+        self.assertEqual(self.column(dialog, "区域"), ["刚刚"])
+
+        dialog.time_combo.setCurrentIndex(dialog.time_combo.findData("today"))
+        self.assertEqual(self.column(dialog, "区域"), ["刚刚"])
+
+        dialog.time_combo.setCurrentIndex(dialog.time_combo.findData("week"))
+        self.assertEqual(self.column(dialog, "区域"), ["刚刚", "三天前"])
+
+        dialog.time_combo.setCurrentIndex(dialog.time_combo.findData("month"))
+        self.assertEqual(self.column(dialog, "区域"), ["刚刚", "三天前"])
+
+        dialog.time_combo.setCurrentIndex(0)
+        self.assertEqual(len(self.column(dialog, "区域")), 3)
+
+    def test_today_means_since_midnight_not_the_last_24_hours(self) -> None:
+        """现场说的「今天」是日历上的今天。"""
+        just_after_midnight = datetime.now().replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        if just_after_midnight > datetime.now() - timedelta(hours=1):
+            # 刚过零点时「今天」与「最近 1 小时」几乎重合，这条就没什么可测的了。
+            self.skipTest("现在是凌晨，两个档位本来就几乎一样")
+        self.record(zone="零点后", wall_time=just_after_midnight.strftime("%Y-%m-%d %H:%M:%S"))
+
+        dialog = self.dialog()
+        dialog.time_combo.setCurrentIndex(dialog.time_combo.findData("today"))
+        self.assertEqual(self.column(dialog, "区域"), ["零点后"])
+
+        dialog.time_combo.setCurrentIndex(dialog.time_combo.findData("hour"))
+        self.assertEqual(dialog.table.rowCount(), 0)
+
+    def test_the_time_filter_ignores_records_with_an_unreadable_time(self) -> None:
+        """时间认不出来的记录不进时间窗口：说它在窗口内是编的，说它不在也是编的。"""
+        self.record(zone="手改过的", wall_time="不知道什么时候")
+
+        dialog = self.dialog()
+        self.assertEqual(self.column(dialog, "区域"), ["手改过的"])
+
+        dialog.time_combo.setCurrentIndex(dialog.time_combo.findData("month"))
+
+        self.assertEqual(dialog.table.rowCount(), 0)
+        self.assertEqual(dialog.count_label.text(), "显示 0 / 共 1 条")
+
+    def test_the_time_filter_combines_with_the_search(self) -> None:
+        self.record(zone="北侧入口", track="12", wall_time=self.days_ago(0))
+        self.record(zone="北侧入口", track="77", wall_time=self.days_ago(40))
+        self.record(zone="南侧通道", track="99", wall_time=self.days_ago(0))
+
+        dialog = self.dialog()
+        dialog.time_combo.setCurrentIndex(dialog.time_combo.findData("week"))
+        dialog.search_edit.setText("北侧")
+
+        self.assertEqual(self.column(dialog, "区域"), ["北侧入口"])
+        self.assertEqual(self.column(dialog, "目标ID"), ["12"])
+
+    # -- 列宽 ---------------------------------------------------------------
+
+    def test_the_columns_can_be_dragged_and_reported(self) -> None:
+        """列宽要能自由拖：不同点位关心的列不一样，按内容铺一遍只是个起点。"""
+        dialog = self.dialog()
+        header = dialog.table.horizontalHeader()
+
+        self.assertTrue(
+            all(
+                header.sectionResizeMode(column) == QHeaderView.ResizeMode.Interactive
+                for column in range(len(AlarmHistoryDialog.HEADERS))
+            ),
+            "所有列都该是可拖的",
+        )
+        dialog.table.setColumnWidth(3, 260)
+
+        # 拖完就是拖完的宽度，不被内容宽度顶回去。
+        self.assertEqual(dialog.table.columnWidth(3), 260)
+        self.assertEqual(dialog.column_widths()["区域"], 260)
+
+    def test_the_last_column_absorbs_the_rest_and_is_not_remembered(self) -> None:
+        """最后一列填满右边剩下的地方（否则拖窄之后右边空一条），所以它没得记。"""
+        dialog = self.dialog()
+        last = len(AlarmHistoryDialog.HEADERS) - 1
+
+        self.assertTrue(dialog.table.horizontalHeader().stretchLastSection())
+        self.assertNotIn(AlarmHistoryDialog.HEADERS[last], dialog.column_widths())
+
+    def test_every_draggable_column_has_a_width_even_without_saved_state(self) -> None:
+        dialog = self.dialog()
+
+        widths = dialog.column_widths()
+
+        self.assertEqual(set(widths), set(AlarmHistoryDialog.HEADERS[:-1]))
+        self.assertTrue(all(width > 0 for width in widths.values()), widths)
+
+    def test_saved_column_widths_are_restored_by_name(self) -> None:
+        dialog = AlarmHistoryDialog(
+            self.store,
+            self.store.resolve_screenshot,
+            None,
+            column_widths={"区域": 260, "早就不存在的列": 300},
+        )
+        self.addCleanup(dialog.deleteLater)
+
+        area = AlarmHistoryDialog.HEADERS.index("区域")
+        self.assertEqual(dialog.table.columnWidth(area), 260)
+        self.assertEqual(
+            set(dialog.column_widths()), set(AlarmHistoryDialog.HEADERS[:-1])
+        )
 
     def test_the_mode_and_status_filters_narrow_the_table(self) -> None:
         self.record(zone="报了警的", mode="monitor")

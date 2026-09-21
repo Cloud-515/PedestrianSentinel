@@ -29,6 +29,11 @@ DEFAULT_RETENTION_MB = 2048
 MAX_RETENTION_DAYS = 3650
 MAX_RETENTION_MB = 102400  # 100 GB
 
+# 「查看记录」弹窗里列宽的可接受区间。下限保证列还能认出来，上限挡住手改 config.json
+# 写进去的一个离谱数字（比如 999999）把表变成一条缝。
+MIN_COLUMN_WIDTH = 24
+MAX_COLUMN_WIDTH = 2000
+
 # 远程通知的请求体形状。常量放在这里是因为它们属于配置 schema（要写进 config.json
 # 并被校验），notifications.py 再从这里取。
 NOTIFICATION_FORMAT_GENERIC = "generic"
@@ -221,6 +226,32 @@ def _clamp(value: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, value))
 
 
+def _coerce_column_widths(value: object) -> dict[str, int]:
+    """「查看记录」弹窗里拖过的列宽：列名 → 像素。
+
+    用列名做键而不是按位置存一份列表：以后给表加一列，按下标存的宽度会整体错位，而
+    错位只表现为「列宽有点怪」，很难让人联想到是升级造成的。
+
+    坏条目直接丢掉、保留其余：这是程序自己写的界面状态，不是用户手工维护的数据，为它
+    刷日志不值得 —— 宽度本身随时还能拖回来。
+    """
+    if not isinstance(value, dict):
+        if value:
+            _warn_field("history_column_widths", value, {})
+        return {}
+    widths: dict[str, int] = {}
+    for name, width in value.items():
+        if not isinstance(name, str) or isinstance(width, bool):
+            continue
+        try:
+            pixels = int(width)  # type: ignore[arg-type]
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if pixels > 0:
+            widths[name] = _clamp(pixels, MIN_COLUMN_WIDTH, MAX_COLUMN_WIDTH)
+    return widths
+
+
 def _coerce_zone_list(value: object) -> list["ZoneDefinition"]:
     if value is None:
         return []
@@ -348,6 +379,9 @@ class AppConfig:
     # 视频模式（测试播放）里的报警要不要也发通知。**默认不发**：拿一段视频试一遍，
     # 群机器人就会被刷一串「闯入报警」，而本地蜂鸣被刷是无所谓的 —— 往外部广播不一样。
     notification_in_video_mode: bool = False
+    # 「查看记录」弹窗里用户拖过的列宽（列名 → 像素）。它只是界面状态，但存下来才有
+    # 意义：列宽是按现场要看的字段拖的，每次打开都回到默认宽度等于白拖一遍。
+    history_column_widths: dict[str, int] = field(default_factory=dict)
     version: int = CONFIG_VERSION
 
     @classmethod
@@ -447,6 +481,9 @@ class AppConfig:
                 False,
                 key="notification_in_video_mode",
             ),
+            history_column_widths=_coerce_column_widths(
+                data.get("history_column_widths")
+            ),
             # 读进来的就是当前结构了（迁移在上面就地做掉），所以版本号按当前值写，
             # 而不是照抄文件里的旧值。
             version=CONFIG_VERSION,
@@ -480,6 +517,7 @@ class AppConfig:
             "notification_format": self.notification_format,
             "notification_include_screenshot": self.notification_include_screenshot,
             "notification_in_video_mode": self.notification_in_video_mode,
+            "history_column_widths": self.history_column_widths,
             "zones": [zone.to_dict() for zone in self.zones],
         }
 
