@@ -6,8 +6,8 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QPixmap
+from PySide6.QtCore import Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
@@ -788,6 +788,29 @@ class PlaybackPanel(QGroupBox):
 # 右侧面板：报警记录区
 # ---------------------------------------------------------------------------
 
+class PreviewImageLabel(QLabel):
+    """详情里的截图预览：双击交给系统默认程序打开原图。
+
+    这里显示的是缩放到 330×300 的预览，而取证要看的是原图 —— 目标手里拿的什么、
+    区域边界压在哪、有没有第二个同伙，都得放大才看得出来。所以双击直接把原文件交给
+    系统默认程序（Windows 上就是默认图片查看器），程序里不必再做一个看图器。
+    """
+
+    activated = Signal(str)
+
+    def __init__(self, path: str, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._path = path
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setMinimumSize(330, 240)
+        self.setToolTip(f"双击用系统默认程序打开原图：\n{path}")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mouseDoubleClickEvent(self, event: object) -> None:
+        del event
+        self.activated.emit(self._path)
+
+
 class AlarmDetailDialog(QDialog):
     def __init__(
         self,
@@ -815,14 +838,14 @@ class AlarmDetailDialog(QDialog):
         ]
         for label, value in details:
             layout.addWidget(QLabel(f"{label}: {value}"))
+        hint = QLabel("提示：双击截图可用系统默认程序打开原图")
+        hint.setStyleSheet("color: #7A8A99; font-size: 11px;")
+        layout.addWidget(hint)
         screenshots = QHBoxLayout()
         for title, screenshot_path in (
             ("进入取证", event.entry_screenshot_path or event.screenshot_path),
             ("报警取证", event.alarm_screenshot_path),
         ):
-            screenshot_label = QLabel(f"{title}不可用")
-            screenshot_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            screenshot_label.setMinimumSize(330, 240)
             resolved = resolver(screenshot_path) if resolver is not None else None
             if resolved is None and screenshot_path:
                 # 解析器没给（或没找到）时退回直接按路径打开：相对路径、被移动过的
@@ -832,7 +855,8 @@ class AlarmDetailDialog(QDialog):
             if resolved is not None:
                 pixmap = QPixmap(str(resolved))
                 if not pixmap.isNull():
-                    screenshot_label.setPixmap(
+                    preview = PreviewImageLabel(str(resolved))
+                    preview.setPixmap(
                         pixmap.scaled(
                             330,
                             300,
@@ -840,14 +864,28 @@ class AlarmDetailDialog(QDialog):
                             Qt.TransformationMode.SmoothTransformation,
                         )
                     )
-                    screenshots.addWidget(screenshot_label)
+                    preview.activated.connect(self._open_in_default_viewer)
+                    screenshots.addWidget(preview)
                     continue
             # 显示不出来时说清是哪一种：本来没报警 / 没写进去 / 文件被清理或删掉。
-            reason = EventStore.unavailable_reason(event, screenshot_path)
-            screenshot_label.setText(f"{title}不可用\n{reason}")
-            screenshot_label.setWordWrap(True)
-            screenshots.addWidget(screenshot_label)
+            missing = QLabel(f"{title}不可用\n{EventStore.unavailable_reason(event, screenshot_path)}")
+            missing.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            missing.setMinimumSize(330, 240)
+            missing.setWordWrap(True)
+            screenshots.addWidget(missing)
         layout.addLayout(screenshots)
+
+    def _open_in_default_viewer(self, path: str) -> None:
+        """把原图交给系统默认程序。
+
+        用 QDesktopServices 而不是 os.startfile：不需要平台分支，行为就是"用默认程序
+        打开"，而且返回 False 时能明确报错 —— 否则双击没反应，用户只会以为程序坏了。
+        """
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
+            logger.warning("无法用系统默认程序打开 %s", path)
+            QMessageBox.warning(
+                self, "打开失败", f"系统里没有能打开这个文件的程序：\n{path}"
+            )
 
 
 class EventPanel(QGroupBox):
