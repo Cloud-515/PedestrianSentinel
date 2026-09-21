@@ -42,6 +42,25 @@ NOTIFICATION_FORMATS = (NOTIFICATION_FORMAT_GENERIC, NOTIFICATION_FORMAT_TEXT_BO
 
 _COLOR_PATTERN = re.compile(r"^#[0-9A-Fa-f]{6}$")
 
+# 一个会话的三个时刻。用名字而不是直接传秒数：视频模式下那几个秒数是**视频里的位置**，
+# 真实钟点另有来源（见 AlarmEvent.moment_clock），把两者混成一个参数正是「视频模式只能
+# 显示 2.00s」的根源。
+Moment = Literal["entered", "alarmed", "exited"]
+
+
+def parse_clock(text: object) -> datetime | None:
+    """把记录里的钟点文本（``"2026-09-21 14:51:48"``）解析成 datetime；认不出来返回 None。
+
+    用 fromisoformat 而不是 strptime：它认这个格式，还额外认带毫秒、带 ISO 变体的写法，
+    而且快得多 —— 查看器按时间筛选时会逐条过一遍。
+    """
+    if not isinstance(text, str) or not text:
+        return None
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
 # 界面上显示的中文状态。JSONL 里的 status 字段仍然写英文（机器读的那一份），
 # 这里只管给人看的那一份。
 _STATUS_LABELS = {
@@ -538,6 +557,19 @@ class AlarmEvent:
     entry_screenshot_path: str = ""
     alarm_screenshot_path: str = ""
     status: Literal["active", "alarmed", "completed"] = "active"
+    # 三个时刻各自的**真实钟点**（"YYYY-MM-DD HH:MM:SS"），落盘时记下。
+    #
+    # 为什么非要单独记：``*_at_seconds`` 在监控模式下是 epoch 秒（视频源读的是
+    # time.time()），换算出钟点没问题；但**视频模式下它是视频里的位置**，拿它当时间会
+    # 显示成 1970 年。所以那三个时刻的钟点只能单独存 —— 存下来之前，界面上只能显示
+    # 「2.00s」这种视频位置。
+    #
+    # ``wall_time`` 不参与这三个时刻：它只表示「这条记录本身的钟点」（界面上的记录时间），
+    # 而它的语义在历史上有过变化（见 EventStore 读记录时那两处注释）—— 早期版本是在
+    # 报警那一刻才建出事件的，那批记录的 wall_time 其实是报警钟点。
+    entered_wall_time: str = ""
+    alarmed_wall_time: str = ""
+    exited_wall_time: str = ""
 
     def __post_init__(self) -> None:
         if self.alarm_screenshot_path and not self.screenshot_path:
@@ -561,16 +593,49 @@ class AlarmEvent:
             return "未触发报警"
         return _STATUS_LABELS.get(self.status, self.status)
 
-    @staticmethod
-    def _format_timestamp(value: float) -> str:
-        return datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    def _moment(self, moment: Moment) -> tuple[float | None, str]:
+        """(记录里的秒数, 落盘时记下的钟点文本)。"""
+        if moment == "entered":
+            return self.entered_at_seconds, self.entered_wall_time
+        if moment == "alarmed":
+            return self.alarm_at_seconds, self.alarmed_wall_time
+        return self.exited_at_seconds, self.exited_wall_time
 
-    def format_event_time(self, value: float | None, precision: int = 2) -> str:
+    def moment_clock(self, moment: Moment) -> datetime | None:
+        """某个时刻的真实钟点；记录里没有就返回 None。
+
+        监控模式下 ``*_at_seconds`` 本身就是 epoch 秒，换算即得。视频模式下它是视频里的
+        位置，真实钟点来自落盘时记下的那三个 ``*_wall_time`` 字段；老记录没有它们，那就
+        返回 None —— 界面如实说「没记」，不拿视频位置冒充时间。
+        """
+        value, recorded = self._moment(moment)
+        if value is None:
+            return None
+        if self.operation_mode == "monitor":
+            return datetime.fromtimestamp(value)
+        return parse_clock(recorded)
+
+    def moment_offset(self, moment: Moment) -> float | None:
+        """该时刻在视频里的位置（秒）。
+
+        视频模式下界面上把它附在钟点后面：钟点用来对日志、和别人说的「几点几分」对上，
+        位置用来在播放器里找到那一刻 —— 两样都有用。
+        """
+        return self._moment(moment)[0]
+
+    def format_moment(self, moment: Moment) -> str:
+        """表格里的时刻文本：``14:51:48``。
+
+        只到秒，也不带日期：日期就在旁边的「记录时间」列里，而毫秒在取证里没有意义
+        （同一个会话的三个时刻相隔以秒计）。真实钟点认不出来时说清那是视频位置。
+        """
+        clock = self.moment_clock(moment)
+        if clock is not None:
+            return clock.strftime("%H:%M:%S")
+        value = self.moment_offset(moment)
         if value is None:
             return "未记录"
-        if self.operation_mode == "monitor":
-            return self._format_timestamp(value)
-        return f"{value:.{precision}f}s"
+        return f"视频 {value:.2f}s"
 
     def to_row(self) -> list[str]:
         return [
@@ -578,9 +643,9 @@ class AlarmEvent:
             self.source,
             self.zone_name,
             self.track_id,
-            self.format_event_time(self.entered_at_seconds),
-            self.format_event_time(self.alarm_at_seconds),
-            self.format_event_time(self.exited_at_seconds),
+            self.format_moment("entered"),
+            self.format_moment("alarmed"),
+            self.format_moment("exited"),
             self.status_label,
             f"{self.duration_seconds:.2f}s" if self.duration_seconds is not None else "未结算",
             self.entry_screenshot_path or self.screenshot_path,

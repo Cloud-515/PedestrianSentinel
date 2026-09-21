@@ -22,6 +22,17 @@ logger = logging.getLogger(__name__)
 _OPENED_MARKER = re.compile(r'"action"\s*:\s*"opened"')
 _SCHEMA_MARKER = re.compile(r'"schema_version"\s*:')
 _LEGACY_MARKER = re.compile(r'"entered_at_seconds"\s*:')
+# 取证截图文件名里的落盘钟点：20260921-143610_<会话ID>_alarm.jpg
+#
+# 只认这一种命名。更早的命名是 2026-08-12_11-20-07_区域_1_id0.jpg，那里面的时间戳**等于
+# 会话开始那一刻**、不是报警那一刻（拿现有 1755 条记录对过，全部差 0 秒），所以它不能
+# 用来还原报警钟点 —— 认它反而会把进入时刻说成报警时刻。
+_SCREENSHOT_STAMP = re.compile(r"(?<!\d)(\d{8})-(\d{6})_")
+
+
+def _clock_now() -> str:
+    """落盘那一刻的真实钟点，格式与记录里的 wall_time 一致。"""
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 class AlarmPlayer:
@@ -101,6 +112,10 @@ class EventStore:
             "alarm_screenshot_path": event.alarm_screenshot_path,
             "screenshot_path": event.screenshot_path,
             "status": event.status,
+            # 三个时刻各自的真实钟点（视频模式下 *_at_seconds 只是视频里的位置）。
+            "entered_wall_time": event.entered_wall_time,
+            "alarmed_wall_time": event.alarmed_wall_time,
+            "exited_wall_time": event.exited_wall_time,
         }
 
     def _append(self, payload: dict[str, object]) -> None:
@@ -177,18 +192,25 @@ class EventStore:
 
     def open_session(self, event: AlarmEvent, frame: np.ndarray) -> AlarmEvent:
         event.entry_screenshot_path = self._save_screenshot(event, frame, "entry")
+        # 进入这一刻的钟点：事件就是在有人进入区域时建出来的，所以它和 wall_time 是同一个
+        # 时刻。两个都写下来 —— wall_time 是「记录时间」那一列，这个字段是「进入时间」。
+        event.entered_wall_time = event.entered_wall_time or _clock_now()
         self._append({"schema_version": 2, "action": "opened", "event": self._event_payload(event)})
         return event
 
     def mark_alarmed(self, event: AlarmEvent, frame: np.ndarray) -> AlarmEvent:
         event.alarm_screenshot_path = self._save_screenshot(event, frame, "alarm")
         event.screenshot_path = event.alarm_screenshot_path or event.entry_screenshot_path
+        # 报警那一刻的真实钟点。视频模式下 alarm_at_seconds 只是视频里的位置，没有它
+        # 界面上就只能显示「2.00s」。
+        event.alarmed_wall_time = _clock_now()
         self._append(
             {
                 "schema_version": 2,
                 "action": "alarmed",
                 "session_id": event.session_id,
                 "alarm_at_seconds": event.alarm_at_seconds,
+                "alarmed_wall_time": event.alarmed_wall_time,
                 "alarm_screenshot_path": event.alarm_screenshot_path,
                 "screenshot_path": event.screenshot_path,
                 "status": event.status,
@@ -197,12 +219,14 @@ class EventStore:
         return event
 
     def close_session(self, event: AlarmEvent) -> AlarmEvent:
+        event.exited_wall_time = _clock_now()
         self._append(
             {
                 "schema_version": 2,
                 "action": "closed",
                 "session_id": event.session_id,
                 "exited_at_seconds": event.exited_at_seconds,
+                "exited_wall_time": event.exited_wall_time,
                 "duration_seconds": event.duration_seconds,
                 "status": event.status,
             }
@@ -341,10 +365,15 @@ class EventStore:
                 self._apply_v2_payload(payload, events_by_session, order)
                 continue
             event = self._event_from_payload(payload)
+            # 早期版本的单行记录：当时是**通过驻留判定、决定报警那一刻**才建出事件的
+            # （见当时 detection_engine 的建法），所以那条记录的 wall_time 是报警钟点、
+            # 不是进入钟点。这里把它认成报警钟点，进入钟点则如实留空 —— 反过来按
+            # 「进入 = wall_time」显示，会把报警时间说成进入时间。
+            event.alarmed_wall_time = event.alarmed_wall_time or event.wall_time
             events_by_session[event.session_id] = event
             if event.session_id not in order:
                 order.append(event.session_id)
-        return [events_by_session[session_id] for session_id in order]
+        return [self._recover_clock(events_by_session[session_id]) for session_id in order]
 
     @staticmethod
     def _event_from_payload(payload: dict[str, object]) -> AlarmEvent:
@@ -376,6 +405,9 @@ class EventStore:
             entry_screenshot_path=str(payload.get("entry_screenshot_path", "")),
             alarm_screenshot_path=str(payload.get("alarm_screenshot_path", screenshot_path)),
             status=str(payload.get("status", "completed" if payload.get("exited_at_seconds") is not None else "alarmed")),
+            entered_wall_time=str(payload.get("entered_wall_time", "")),
+            alarmed_wall_time=str(payload.get("alarmed_wall_time", "")),
+            exited_wall_time=str(payload.get("exited_wall_time", "")),
         )
 
     @classmethod
@@ -391,6 +423,12 @@ class EventStore:
             if not isinstance(event_payload, dict):
                 return
             event = cls._event_from_payload(event_payload)
+            # v2 的 opened 行是**有人进入区域时**写下的（见 detection_engine），所以它的
+            # wall_time 就是进入钟点 —— 但只对「那时还没有 entered_wall_time 字段」的记录
+            # 这么补（键都不存在）。键在、值为空，是清空记录把老记录重写成了 v2 形态，那种
+            # 情况下进入钟点确实没记过，不能拿 wall_time 顶上（它是报警钟点）。
+            if "entered_wall_time" not in event_payload:
+                event.entered_wall_time = event.wall_time
             events_by_session[event.session_id] = event
             order.append(event.session_id)
             return
@@ -400,13 +438,43 @@ class EventStore:
             return
         if action == "alarmed":
             event.alarm_at_seconds = float(payload["alarm_at_seconds"])
+            event.alarmed_wall_time = str(payload.get("alarmed_wall_time", ""))
             event.alarm_screenshot_path = str(payload.get("alarm_screenshot_path", ""))
             event.screenshot_path = str(payload.get("screenshot_path", event.alarm_screenshot_path))
             event.status = "alarmed"
         elif action == "closed":
             event.exited_at_seconds = float(payload["exited_at_seconds"])
+            event.exited_wall_time = str(payload.get("exited_wall_time", ""))
             event.duration_seconds = float(payload["duration_seconds"])
             event.status = "completed"
+
+    @staticmethod
+    def _clock_from_screenshot(path: str) -> str:
+        """从取证截图的文件名里读出落盘钟点（"2026-09-21 14:36:10"）；读不出返回空串。
+
+        文件名是 ``{时间戳}_{会话ID}_{角色}.jpg``，时间戳取的就是**落盘那一刻**（见
+        ``_save_screenshot``）。所以「记录里没写报警钟点」的那批记录，钟点其实一直躺在
+        文件名里 —— 加这两个字段之前写下的记录，靠它就能显示出真实时间。
+        """
+        match = _SCREENSHOT_STAMP.search(Path(path).name)
+        if match is None:
+            return ""
+        try:
+            stamp = datetime.strptime(match.group(1) + match.group(2), "%Y%m%d%H%M%S")
+        except ValueError:
+            return ""
+        return stamp.strftime("%Y-%m-%d %H:%M:%S")
+
+    def _recover_clock(self, event: AlarmEvent) -> AlarmEvent:
+        """给「加字段之前写下」的记录补上报警钟点。
+
+        只补报警那一刻：进入那一刻的钟点记在 ``wall_time`` 里；退出那一刻没有截图，
+        文件名里也就没有它，补不了 —— 界面会如实说没记，而不是拿视频位置冒充时间。
+        """
+        if event.operation_mode != "video" or event.alarmed_wall_time:
+            return event
+        event.alarmed_wall_time = self._clock_from_screenshot(event.alarm_screenshot_path)
+        return event
 
     def clear(self, operation_mode: str | None = None) -> None:
         with self._lock:

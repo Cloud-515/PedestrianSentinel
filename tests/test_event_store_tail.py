@@ -14,7 +14,11 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+import numpy as np
+
+import alarm_service
 from alarm_service import EventStore
 from models import AlarmEvent
 
@@ -289,6 +293,190 @@ class TailReadTests(unittest.TestCase):
                 json.dumps({"session_id": "旧", "entered_at_seconds": 1.0})
             )
         )
+
+
+class RealClockTests(unittest.TestCase):
+    """三个时刻的**真实钟点**：写记录时记下，读记录时还原。
+
+    视频模式下 ``*_at_seconds`` 是视频里的位置（2.00s 这种），不是钟点；真实钟点靠
+    ``alarmed_wall_time`` / ``exited_wall_time`` 两个字段。这里钉住：新记录要写、要能
+    读回来；加字段之前写下的记录，报警钟点还能从截图文件名里捞回来。
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.store = EventStore(Path(self.temporary.name) / "events")
+
+    def event(self, **overrides: object) -> AlarmEvent:
+        values: dict[str, object] = {
+            "source": "test.mp4",
+            "zone_name": "北侧入口",
+            "track_id": "0",
+            "entered_at_seconds": 1.0,
+            "alarm_at_seconds": 3.0,
+            "wall_time": "2026-09-21 14:51:48",
+            "operation_mode": "video",
+            "exited_at_seconds": 6.0,
+            "duration_seconds": 5.0,
+        }
+        values.update(overrides)
+        return AlarmEvent(**values)  # type: ignore[arg-type]
+
+    def test_a_new_session_records_the_clock_of_each_moment(self) -> None:
+        frame = np.full((40, 60, 3), 120, dtype=np.uint8)
+        event = self.event()
+
+        with patch.object(
+            alarm_service,
+            "_clock_now",
+            side_effect=[
+                "2026-09-21 14:51:48",  # 进入
+                "2026-09-21 14:51:51",  # 报警
+                "2026-09-21 14:51:54",  # 退出
+            ],
+        ):
+            self.store.open_session(event, frame)
+            self.store.mark_alarmed(event, frame)
+            self.store.close_session(event)
+
+        loaded = self.store.load_all()[-1]
+        self.assertEqual(
+            loaded.to_row()[4:7], ["14:51:48", "14:51:51", "14:51:54"]
+        )
+        for moment in ("entered", "alarmed", "exited"):
+            self.assertIsNotNone(loaded.moment_clock(moment), moment)
+        # 视频位置没被顶掉：详情里还要用它。
+        self.assertEqual(loaded.moment_offset("alarmed"), 3.0)
+
+    def test_the_clocks_survive_a_reload(self) -> None:
+        self.store._append(
+            {
+                "schema_version": 2,
+                "action": "opened",
+                "event": EventStore._event_payload(
+                    self.event(
+                        entered_wall_time="2026-09-21 14:51:48",
+                        alarmed_wall_time="2026-09-21 14:51:51",
+                        exited_wall_time="2026-09-21 14:51:54",
+                    )
+                ),
+            }
+        )
+
+        loaded = self.store.load_all()[-1]
+
+        self.assertEqual(loaded.entered_wall_time, "2026-09-21 14:51:48")
+        self.assertEqual(loaded.alarmed_wall_time, "2026-09-21 14:51:51")
+        self.assertEqual(loaded.exited_wall_time, "2026-09-21 14:51:54")
+        self.assertEqual(loaded.to_row()[4:7], ["14:51:48", "14:51:51", "14:51:54"])
+
+    def test_a_v2_record_written_before_the_field_existed_uses_wall_time_as_the_entry(self) -> None:
+        """加字段之前的 v2 记录（没有 entered_wall_time 键）：它的 wall_time 就是进入钟点。"""
+        payload = EventStore._event_payload(self.event())
+        del payload["entered_wall_time"]
+        self.store._append({"schema_version": 2, "action": "opened", "event": payload})
+
+        loaded = self.store.load_all()[-1]
+
+        self.assertEqual(loaded.entered_wall_time, "2026-09-21 14:51:48")
+        self.assertEqual(loaded.format_moment("entered"), "14:51:48")
+
+    def test_the_alarm_clock_is_recovered_from_the_screenshot_name(self) -> None:
+        """加字段之前写下的记录，报警钟点还躺在截图文件名里（文件名取的就是落盘时刻）。"""
+        self.store._append(
+            {
+                "schema_version": 2,
+                "action": "opened",
+                "event": EventStore._event_payload(
+                    self.event(
+                        alarm_screenshot_path="screenshots/20260921-143610_abc123_alarm.jpg"
+                    )
+                ),
+            }
+        )
+
+        loaded = self.store.load_all()[-1]
+
+        self.assertEqual(loaded.alarmed_wall_time, "2026-09-21 14:36:10")
+        self.assertEqual(loaded.format_moment("alarmed"), "14:36:10")
+
+    def test_the_old_naming_is_not_used_to_recover_the_alarm_clock(self) -> None:
+        """更早的命名里那个时间戳是**会话开始**，不是报警那一刻（现有记录实测差 0 秒）。
+
+        认它会把「进入时间」说成「报警时间」，比显示视频位置更糟。
+        """
+        self.store._append(
+            {
+                "schema_version": 2,
+                "action": "opened",
+                "event": EventStore._event_payload(
+                    self.event(
+                        alarm_screenshot_path="screenshots/2026-08-12_11-20-07_区域_1_id0.jpg"
+                    )
+                ),
+            }
+        )
+
+        loaded = self.store.load_all()[-1]
+
+        self.assertEqual(loaded.alarmed_wall_time, "")
+        self.assertEqual(loaded.format_moment("alarmed"), "视频 3.00s")
+
+    def test_the_exit_clock_is_never_invented(self) -> None:
+        """退出那一刻没有截图、也没有字段：就说没记，不拿视频位置冒充时间。"""
+        self.store._append(
+            {
+                "schema_version": 2,
+                "action": "opened",
+                "event": EventStore._event_payload(self.event()),
+            }
+        )
+
+        loaded = self.store.load_all()[-1]
+
+        self.assertIsNone(loaded.moment_clock("exited"))
+        self.assertEqual(loaded.format_moment("exited"), "视频 6.00s")
+
+    def test_rewriting_a_legacy_record_does_not_pass_its_alarm_clock_as_the_entry(self) -> None:
+        """清空记录会把老记录重写成 v2 形态，重写后不能把 wall_time（报警钟点）当成进入钟点。
+
+        这是最容易踩的一处：v2 的 opened 行按定义就是「进入时写的」，所以读的时候会拿
+        wall_time 补进入钟点；而老记录被重写之后也是 v2 形态，可它的 wall_time 是报警钟点。
+        """
+        self.store.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self.store.log_path.write_text(
+            json.dumps(
+                {
+                    "time": "2026-09-21 14:51:48",
+                    "video_source": "test.mp4",
+                    "operation_mode": "video",
+                    "zone_name": "北侧入口",
+                    "track_id": "0",
+                    "entered_at_seconds": 1.0,
+                    "alarm_at_seconds": 3.0,
+                    "exited_at_seconds": 6.0,
+                    "duration_seconds": 5.0,
+                    "screenshot_path": "",
+                    "status": "completed",
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        legacy = self.store.load_all()[-1]
+        self.assertEqual(legacy.format_moment("entered"), "视频 1.00s")
+        self.assertEqual(legacy.format_moment("alarmed"), "14:51:48")
+
+        self.store.clear("monitor")  # 读-改-写：留下视频记录，重写成 v2 形态
+        rewritten = self.store.load_all()[-1]
+
+        self.assertEqual(
+            rewritten.format_moment("entered"), "视频 1.00s", "进入钟点被顶成了报警钟点"
+        )
+        self.assertEqual(rewritten.format_moment("alarmed"), "14:51:48")
 
 
 if __name__ == "__main__":

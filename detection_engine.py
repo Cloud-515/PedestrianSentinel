@@ -189,6 +189,9 @@ class DetectionEngine:
                 key = (zone.name, track_id)
                 session = self.active_sessions.get(key)
                 if session is None:
+                    # 进入那一刻：事件就是在这里建出来的，所以 wall_time（记录时间）与
+                    # entered_wall_time（进入时间）指的是同一个时刻，两个都记下来。
+                    started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     event = AlarmEvent(
                         source=source,
                         operation_mode=operation_mode,
@@ -196,7 +199,8 @@ class DetectionEngine:
                         track_id=str(track_id),
                         entered_at_seconds=video_time,
                         alarm_at_seconds=None,
-                        wall_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        wall_time=started_at,
+                        entered_wall_time=started_at,
                     )
                     session = ActiveIntrusion(event, video_time)
                     self.active_sessions[key] = session

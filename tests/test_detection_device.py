@@ -31,6 +31,7 @@ class TrackedDetections:
 
 class DetectionDeviceTests(unittest.TestCase):
     def test_monitor_event_times_use_local_computer_time(self) -> None:
+        """监控模式下 *_at_seconds 就是 epoch 秒（摄像头读的是 time.time()），直接换算。"""
         timestamp = 1786588135.995
         event = AlarmEvent(
             source="rtsp://camera",
@@ -42,13 +43,36 @@ class DetectionDeviceTests(unittest.TestCase):
             operation_mode="monitor",
         )
 
-        entered_at = datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-        alarm_at = datetime.fromtimestamp(timestamp + 12.041).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        entered_at = datetime.fromtimestamp(timestamp).strftime("%H:%M:%S")
+        alarm_at = datetime.fromtimestamp(timestamp + 12.041).strftime("%H:%M:%S")
 
-        self.assertEqual(event.format_event_time(event.entered_at_seconds, precision=3), entered_at)
+        self.assertEqual(event.format_moment("entered"), entered_at)
         self.assertEqual(event.to_row()[4:7], [entered_at, alarm_at, "未记录"])
 
-    def test_video_event_times_remain_playback_seconds(self) -> None:
+    def test_video_event_times_show_the_recorded_clock_not_the_playback_position(self) -> None:
+        """视频模式下 *_at_seconds 是视频里的位置，表格里该显示落盘时记下的钟点。"""
+        event = AlarmEvent(
+            source="test.mp4",
+            zone_name="区域1",
+            track_id="0",
+            entered_at_seconds=12.3456,
+            alarm_at_seconds=24.5678,
+            wall_time="2026-08-13 10:29:08",
+            operation_mode="video",
+            entered_wall_time="2026-08-13 10:29:08",
+            alarmed_wall_time="2026-08-13 10:29:20",
+            exited_wall_time="2026-08-13 10:29:31",
+            exited_at_seconds=35.6789,
+        )
+
+        self.assertEqual(
+            event.to_row()[4:7], ["10:29:08", "10:29:20", "10:29:31"]
+        )
+        # 视频位置没丢：详情里附在钟点后面（见 main_window._moment_detail）。
+        self.assertEqual(event.moment_offset("alarmed"), 24.5678)
+
+    def test_a_video_event_without_recorded_clocks_falls_back_to_the_position(self) -> None:
+        """没记钟点的记录（老记录）：表格里说清那是视频位置，不拿它冒充时间。"""
         event = AlarmEvent(
             source="test.mp4",
             zone_name="区域1",
@@ -59,8 +83,9 @@ class DetectionDeviceTests(unittest.TestCase):
             operation_mode="video",
         )
 
-        self.assertEqual(event.format_event_time(event.entered_at_seconds, precision=3), "12.346s")
-        self.assertEqual(event.to_row()[4:6], ["12.35s", "24.57s"])
+        self.assertIsNone(event.moment_clock("entered"))
+        self.assertIsNone(event.moment_clock("alarmed"))
+        self.assertEqual(event.to_row()[4:6], ["视频 12.35s", "视频 24.57s"])
 
     def test_event_status_column_shows_chinese_not_raw_machine_value(self) -> None:
         """状态列以前直接印 status 字段，中文界面上会出现 active/completed。"""

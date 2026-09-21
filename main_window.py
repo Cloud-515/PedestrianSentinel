@@ -58,8 +58,10 @@ from models import (
     NOTIFICATION_FORMAT_TEXT_BOT,
     AlarmEvent,
     AppConfig,
+    Moment,
     ZoneDefinition,
     ZoneProfile,
+    parse_clock,
 )
 from notifications import (
     NotificationDispatcher,
@@ -866,13 +868,33 @@ def _mode_label(operation_mode: str) -> str:
     return {"video": "视频模式", "monitor": "监控模式"}.get(operation_mode, "未记录")
 
 
+def _moment_detail(event: AlarmEvent, moment: Moment) -> str:
+    """详情里的一个时刻：真实钟点，视频模式下再附上它在视频里的位置。
+
+    钟点用来对日志、和别人说的「几点几分」对上；视频位置用来在播放器里找到那一刻 ——
+    两样都有用，所以附在括号里，而不是二选一。都没有（老记录）时如实说没记：推算会被
+    播放速度带偏（同一段视频里，视频位置差 2.04 秒的两条记录，真实钟点差可能是 1 秒也
+    可能是 4 秒），拿推算值冒充时间等于给取证材料编一个精确到秒的假数字。
+    """
+    clock = event.moment_clock(moment)
+    offset = event.moment_offset(moment)
+    if clock is not None:
+        stamp = clock.strftime("%H:%M:%S")
+        if offset is None or event.operation_mode != "video":
+            return stamp
+        return f"{stamp}（视频位置 {offset:.2f}s）"
+    if offset is None:
+        return "未记录"
+    return f"未记录真实钟点（这条记录只存了视频位置 {offset:.2f}s）"
+
+
 def _detail_rows(event: AlarmEvent) -> list[tuple[str, str]]:
     """详情里逐行显示的字段。两个弹窗共用一份，免得加字段时只改了一处。"""
     return [
         ("记录时间", event.wall_time or "未记录"),
-        ("进入时间", event.format_event_time(event.entered_at_seconds, precision=3)),
-        ("报警时间", event.format_event_time(event.alarm_at_seconds, precision=3)),
-        ("退出时间", event.format_event_time(event.exited_at_seconds, precision=3)),
+        ("进入时间", _moment_detail(event, "entered")),
+        ("报警时间", _moment_detail(event, "alarmed")),
+        ("退出时间", _moment_detail(event, "exited")),
         (
             "闯入时长",
             f"{event.duration_seconds:.2f}s"
@@ -1019,16 +1041,10 @@ def _configure_event_table(table: QTableWidget, headers: list[str]) -> None:
 def _record_time(event: AlarmEvent) -> datetime | None:
     """记录时间（``wall_time``）解析成 datetime；认不出来返回 None。
 
-    程序写的是 ``"%Y-%m-%d %H:%M:%S"`` 的本地时间文本。手工编辑过、或者很旧的记录可能
+    程序写的是 ``"%Y-%m-%d %H:%M:%S"`` 的本地时间文本；手工编辑过、或者很旧的记录可能
     是别的写法 —— 那就不参与时间筛选，而不是让整份记录读不出来。
-
-    用 fromisoformat 而不是 strptime：它认这个格式，还额外认带毫秒、带 ISO 变体的写法，
-    并且快得多 —— 时间筛选要在每次筛选时把整份记录过一遍。
     """
-    try:
-        return datetime.fromisoformat(event.wall_time)
-    except (TypeError, ValueError):
-        return None
+    return parse_clock(event.wall_time)
 
 
 def _time_filter_start(code: str, now: datetime) -> datetime | None:

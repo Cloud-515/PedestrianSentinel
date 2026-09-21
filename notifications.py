@@ -102,7 +102,7 @@ def build_text(event: AlarmEvent) -> str:
             f"时间：{event.wall_time}",
             f"目标 ID：{event.track_id}",
             f"视频源：{event.source}",
-            f"报警时刻：{event.format_event_time(event.alarm_at_seconds)}",
+            f"报警时刻：{event.format_moment('alarmed')}",
         ]
     )
 

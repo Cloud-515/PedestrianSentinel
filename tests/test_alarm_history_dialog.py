@@ -34,11 +34,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import alarm_service
 import main_window
 from alarm_service import EventStore
 from main_window import AlarmHistoryDialog, EventPanel, PreviewImageLabel
 from models import AlarmEvent
-
 
 class AlarmHistoryDialogTests(unittest.TestCase):
     @classmethod
@@ -357,6 +357,94 @@ class AlarmHistoryDialogTests(unittest.TestCase):
         )
         self.assertEqual(dialog.column_widths()["闯入时长"], 180)
         self.assertEqual(set(dialog.column_widths()), set(AlarmHistoryDialog.HEADERS))
+
+    # -- 三个时刻的显示 -----------------------------------------------------
+
+    def test_video_mode_times_are_clocks_with_the_video_position_beside_them(self) -> None:
+        """视频模式：钟点用来对日志，视频位置用来在播放器里找到那一刻 —— 两个都要。"""
+        with patch.object(
+            alarm_service,
+            "_clock_now",
+            side_effect=[
+                "2026-09-21 14:51:48",  # 进入（事件建立那一刻）
+                "2026-09-21 14:51:51",  # 报警
+                "2026-09-21 14:51:53",  # 退出
+            ],
+        ):
+            self.record(zone="北侧入口", mode="video", wall_time="2026-09-21 14:51:48")
+
+        dialog = self.dialog()
+        text = self.detail_text(dialog)
+
+        self.assertIn("进入时间: 14:51:48（视频位置 1.00s）", text)
+        self.assertIn("报警时间: 14:51:51（视频位置 3.00s）", text)
+        self.assertIn("退出时间: 14:51:53（视频位置 6.00s）", text)
+        # 表格里三列也是真实钟点，不再出现「15.867s」那种。
+        self.assertEqual(self.column(dialog, "进入时刻"), ["14:51:48"])
+        self.assertEqual(self.column(dialog, "报警时刻"), ["14:51:51"])
+        self.assertEqual(self.column(dialog, "退出时刻"), ["14:51:53"])
+
+    def test_monitor_mode_times_are_clocks_without_milliseconds(self) -> None:
+        """监控模式的三个时刻本来就是钟点，只是不再显示日期与毫秒。"""
+        entered = datetime(2026, 9, 21, 14, 51, 48).timestamp()
+        self.store._append(
+            {
+                "schema_version": 2,
+                "action": "opened",
+                "event": EventStore._event_payload(
+                    AlarmEvent(
+                        source="rtsp://camera/live",
+                        zone_name="北侧入口",
+                        track_id="12",
+                        entered_at_seconds=entered,
+                        alarm_at_seconds=entered + 3,
+                        wall_time="2026-09-21 14:51:48",
+                        operation_mode="monitor",
+                        exited_at_seconds=entered + 6,
+                        duration_seconds=6.0,
+                    )
+                ),
+            }
+        )
+
+        dialog = self.dialog()
+
+        self.assertEqual(self.column(dialog, "进入时刻"), ["14:51:48"])
+        self.assertEqual(self.column(dialog, "报警时刻"), ["14:51:51"])
+        self.assertEqual(self.column(dialog, "退出时刻"), ["14:51:54"])
+        text = self.detail_text(dialog)
+        self.assertIn("报警时间: 14:51:51", text)
+        self.assertNotIn("14:51:51.", text, "详情里不该再出现毫秒")
+
+    def test_an_old_record_says_the_clock_was_not_recorded(self) -> None:
+        """老记录没有报警钟点（文件名里的时间戳也不是它）：如实说没记，别编一个。"""
+        self.store._append(
+            {
+                "schema_version": 2,
+                "action": "opened",
+                "event": EventStore._event_payload(
+                    AlarmEvent(
+                        source="test.mp4",
+                        zone_name="北侧入口",
+                        track_id="12",
+                        entered_at_seconds=1.0,
+                        alarm_at_seconds=3.0,
+                        wall_time="2026-08-12 11:20:07",
+                        operation_mode="video",
+                        exited_at_seconds=6.0,
+                        duration_seconds=5.0,
+                        # 老命名：里面的时间戳是会话开始，不是报警那一刻。
+                        alarm_screenshot_path="screenshots/2026-08-12_11-20-07_区域_1_id0.jpg",
+                    )
+                ),
+            }
+        )
+
+        dialog = self.dialog()
+        text = self.detail_text(dialog)
+
+        self.assertIn("报警时间: 未记录真实钟点（这条记录只存了视频位置 3.00s）", text)
+        self.assertEqual(self.column(dialog, "报警时刻"), ["视频 3.00s"])
 
     def test_the_mode_and_status_filters_narrow_the_table(self) -> None:
         self.record(zone="报了警的", mode="monitor")
