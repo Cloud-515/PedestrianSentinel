@@ -80,6 +80,16 @@ def _healthy_modules(root: Path) -> dict[str, object]:
     openvino = modules["openvino"]
     openvino.__version__ = "2024.6.0-fake"  # type: ignore[attr-defined]
 
+    # 取证截图探针会真编码一张 JPEG 并写盘（它要验的正是"写不写得进去"），
+    # 所以假 cv2/numpy 得提供它用到的那两个接口。
+    class _EncodedBuffer:
+        def tobytes(self) -> bytes:
+            return b"\xff\xd8fake-jpeg"
+
+    modules["numpy"].zeros = lambda *args, **kwargs: object()  # type: ignore[attr-defined]
+    modules["numpy"].uint8 = "uint8"  # type: ignore[attr-defined]
+    modules["cv2"].imencode = lambda extension, image: (True, _EncodedBuffer())  # type: ignore[attr-defined]
+
     # 自检会核对缓存目录是否落在程序数据目录里，假货得给出那个位置。
     mpl_cache = root / "matplotlib"
     mpl_cache.mkdir(parents=True, exist_ok=True)
@@ -514,6 +524,57 @@ class DeepSelfTestTests(SelfTestBase):
         self.assertIn("告警音", report)
         # 没声卡的机器上照样要把推理验完，否则一台机器只能得出半个结论。
         self.assertEqual(len(policy_probe.call_args_list), 2)
+
+
+class ImageWriteProbeTests(unittest.TestCase):
+    """取证截图写入探针。
+
+    它要挡住的是最阴的一类故障：**写图失败但没有任何报错**。裸 cv2.imwrite 在非 ASCII
+    路径下会返回 False 且什么都不写，而发布包的目录名就是中文 —— 一旦哪天第三方库不再
+    打那个 Unicode 补丁，打包版里每一次取证截图都会写不进去，而界面上只显示"报警取证
+    不可用"。这个探针在每次构建的浅自检里真写一张 JPEG，把这件事提前暴露。
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+
+    def run_probe(self, target: Path) -> tuple[list[str], str]:
+        records: list[str] = []
+        failures: list[str] = []
+        with patch.object(app_paths, "data", return_value=target):
+            main._probe_image_write(
+                lambda label, value: records.append(f"{label}={value}"), failures
+            )
+        return failures, "\n".join(records)
+
+    def test_passes_on_a_plain_path_and_cleans_up_after_itself(self) -> None:
+        failures, report = self.run_probe(self.root / "logs" / "probe.jpg")
+
+        self.assertEqual(failures, [])
+        self.assertIn("ok", report)
+        # 探针不该在数据目录里留下垃圾。
+        self.assertEqual(list((self.root / "logs").glob("*.jpg")), [])
+
+    def test_passes_on_a_non_ascii_path(self) -> None:
+        """发布包目录名是中文，这条路径必须验到。"""
+        failures, report = self.run_probe(
+            self.root / "行人警戒区域监控" / "logs" / "probe.jpg"
+        )
+
+        self.assertEqual(failures, [], report)
+        self.assertIn("ok", report)
+
+    def test_reports_failure_instead_of_raising(self) -> None:
+        """写不进去要记成失败，而不是让自检自己炸掉（那样报告一个字都写不出来）。"""
+        blocked = self.root / "blocked"
+        blocked.write_text("我不是目录", encoding="utf-8")
+
+        failures, report = self.run_probe(blocked / "logs" / "probe.jpg")
+
+        self.assertTrue(failures)
+        self.assertIn("FAIL", report)
 
 
 class StartupBannerTests(unittest.TestCase):

@@ -100,8 +100,9 @@ class WorkerDeviceTests(unittest.TestCase):
         self.assertEqual(loaded.alarm_at_seconds, 12.0)
         self.assertEqual(loaded.exited_at_seconds, 15.0)
         self.assertEqual(loaded.duration_seconds, 5.0)
-        self.assertTrue(Path(loaded.entry_screenshot_path).exists())
-        self.assertTrue(Path(loaded.alarm_screenshot_path).exists())
+        # 记录里存的是相对路径，靠 resolve_screenshot 解析成实际文件。
+        self.assertIsNotNone(store.resolve_screenshot(loaded.entry_screenshot_path))
+        self.assertIsNotNone(store.resolve_screenshot(loaded.alarm_screenshot_path))
 
     def test_event_store_loads_legacy_single_screenshot_record(self) -> None:
         root = self.events_dir()
@@ -477,6 +478,118 @@ class ReconnectBackoffTests(unittest.TestCase):
         self.assertIn("视频播放结束", statuses)
 
 
+class ScreenshotStorageTests(unittest.TestCase):
+    """取证截图的落盘与解析。
+
+    两个真问题在这里钉住：
+
+    * 裸 ``cv2.imwrite`` 在非 ASCII 路径下会静默失败（返回 False，文件根本没写）。
+      程序里之所以一直没出事，是因为 ultralytics 导入时把 ``cv2.imwrite`` 换成了自己
+      的 Unicode 安全版本 —— 也就是说"取证能不能落盘"一直在依赖第三方的猴子补丁。
+      所以改成 ``imencode`` + ``write_bytes``。
+    * 记录里存绝对路径时，绿色版被拷到别处（说明书要求整个文件夹一起拷贝）之后所有
+      旧记录都会"取证不可用"。改成存相对 events 目录的路径，并为旧记录保留按文件名
+      兜底找回。
+    """
+
+    def store(self, name: str = "events") -> EventStore:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        return EventStore(Path(temporary.name) / name)
+
+    @staticmethod
+    def event() -> AlarmEvent:
+        return AlarmEvent(
+            source="0",
+            zone_name="区域 1",
+            track_id="7",
+            entered_at_seconds=1.0,
+            alarm_at_seconds=2.0,
+            wall_time="2026-09-21 10:00:00",
+            operation_mode="monitor",
+        )
+
+    def test_screenshot_is_written_under_a_non_ascii_path(self) -> None:
+        """中文目录下也必须写成功 —— 发布包的目录名就是中文。"""
+        store = self.store("行人警戒区域监控")
+
+        event = store.mark_alarmed(self.event(), np.zeros((16, 16, 3), dtype=np.uint8))
+
+        self.assertNotEqual(event.alarm_screenshot_path, "")
+        resolved = store.resolve_screenshot(event.alarm_screenshot_path)
+        self.assertIsNotNone(resolved)
+        self.assertGreater(resolved.stat().st_size, 0)
+
+    def test_stored_path_is_relative_to_the_events_root(self) -> None:
+        """存相对路径，绿色版被拷到别处之后旧记录才不会全部失效。"""
+        store = self.store()
+
+        event = store.open_session(self.event(), np.zeros((8, 8, 3), dtype=np.uint8))
+
+        self.assertFalse(Path(event.entry_screenshot_path).is_absolute())
+        self.assertTrue(event.entry_screenshot_path.startswith("screenshots/"))
+        # 往返一次仍然能解析到同一个文件。
+        loaded = store.load_recent()[0]
+        self.assertEqual(
+            store.resolve_screenshot(loaded.entry_screenshot_path),
+            store.resolve_screenshot(event.entry_screenshot_path),
+        )
+
+    def test_resolve_finds_old_absolute_records_by_filename(self) -> None:
+        """旧记录存的是绝对路径；目录换过之后按文件名也能找回。"""
+        store = self.store()
+        event = store.open_session(self.event(), np.zeros((8, 8, 3), dtype=np.uint8))
+        filename = Path(event.entry_screenshot_path).name
+        stale = str(Path("D:/旧的安装目录/events/screenshots") / filename)
+
+        self.assertEqual(
+            store.resolve_screenshot(stale),
+            store.screenshot_dir / filename,
+        )
+
+    def test_resolve_returns_none_for_missing_files(self) -> None:
+        store = self.store()
+
+        self.assertIsNone(store.resolve_screenshot(""))
+        self.assertIsNone(store.resolve_screenshot("screenshots/从来没有过.jpg"))
+
+    def test_empty_frame_is_skipped_with_a_warning(self) -> None:
+        """会话收尾时用占位帧，不该写出一张坏图，也不该悄悄吞掉。"""
+        store = self.store()
+
+        with self.assertLogs("alarm_service", level="WARNING") as captured:
+            event = store.open_session(self.event(), np.empty((0, 0, 3), dtype=np.uint8))
+
+        self.assertEqual(event.entry_screenshot_path, "")
+        self.assertTrue(any("帧无效" in line for line in captured.output))
+
+    def test_relative_path_keeps_foreign_paths_absolute(self) -> None:
+        """不在 events 目录下的路径保留绝对形式，总比丢了强。"""
+        store = self.store()
+
+        self.assertEqual(store.relative_path("D:/别处/x.jpg"), "D:\\别处\\x.jpg")
+        self.assertEqual(store.relative_path("screenshots/x.jpg"), "screenshots/x.jpg")
+
+    def test_unavailable_reason_distinguishes_the_three_cases(self) -> None:
+        """原来一律显示"不可用"，三种完全不同的情况看起来一模一样。"""
+        quiet = AlarmEvent(
+            source="0",
+            zone_name="区域 1",
+            track_id="7",
+            entered_at_seconds=1.0,
+            alarm_at_seconds=None,
+            wall_time="2026-09-21 10:00:00",
+            operation_mode="monitor",
+        )
+        self.assertIn("未触发报警", EventStore.unavailable_reason(quiet, ""))
+
+        alarmed = self.event()
+        self.assertIn("截图未写入", EventStore.unavailable_reason(alarmed, ""))
+        self.assertIn(
+            "文件缺失", EventStore.unavailable_reason(alarmed, "screenshots/x.jpg")
+        )
+
+
 class FrameBackpressureTests(unittest.TestCase):
     """界面跟不上时丢显示帧，但检测一帧都不能少。
 
@@ -717,8 +830,9 @@ class EventStoreClearTests(unittest.TestCase):
             operation_mode="monitor",
         )
         store.open_session(event, frame)
-        screenshot = Path(event.entry_screenshot_path)
-        self.assertTrue(screenshot.exists())
+        screenshot = store.resolve_screenshot(event.entry_screenshot_path)
+        self.assertIsNotNone(screenshot)
+        self.assertTrue(screenshot.is_file())
 
         store.clear("monitor")
 

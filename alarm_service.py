@@ -63,6 +63,20 @@ class EventStore:
     # 两三次读取就够；块再大就浪费在「读了却不看」的字节上。
     READ_CHUNK_BYTES = 64 * 1024
 
+    @staticmethod
+    def unavailable_reason(event: AlarmEvent, path: str) -> str:
+        """截图显示不出来时，给用户一句能看懂的解释。
+
+        原来一律显示"不可用"，而三种完全不同的情况（本来就没报警、记录里没有路径、文件
+        被清理或删掉了）看起来一模一样 —— 于是"记录里经常出现报警取证不可用"成了一个
+        说不清的现象，也没法判断要不要处理。
+        """
+        if not event.alarmed:
+            return "未触发报警（本就没有报警截图）"
+        if not path:
+            return "截图未写入（记录里没有路径，请看 logs\\app.log 里的取证截图告警）"
+        return "截图文件缺失（可能已被留存策略清理，或被人手动删除）"
+
     def __init__(self, root: str | Path = "events") -> None:
         self.root = Path(root)
         self.screenshot_dir = self.root / "screenshots"
@@ -95,12 +109,63 @@ class EventStore:
                 event_file.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
     def _save_screenshot(self, event: AlarmEvent, frame: np.ndarray, kind: str) -> str:
-        self.screenshot_dir.mkdir(parents=True, exist_ok=True)
-        filename = f"{event.session_id}_{kind}.jpg"
-        screenshot_path = self.screenshot_dir / filename
-        if not cv2.imwrite(str(screenshot_path), frame):
+        """保存一张取证截图，返回**相对 events 根目录**的路径（失败返回空串）。
+
+        两处都是踩过坑才这么写的：
+
+        * 用 ``imencode`` + ``write_bytes`` 而不是 ``cv2.imwrite``。**cv2.imwrite 在非
+          ASCII 路径下会静默失败**（返回 False，文件根本没写），而发布包的目录名是中文
+          （行人警戒区域监控），于是打包版里每一次取证截图都写不进去 —— 记录写着"已报警"、
+          截图路径却是空的，界面上显示成"报警取证不可用"。开发目录是纯 ASCII，所以这个
+          问题在开发机上一直没暴露。
+        * 存相对路径。绿色版的说明书写着"整个文件夹要一起拷贝"，而绝对路径一旦被拷到
+          别处就全部失效 —— 相对路径让记录跟着 events 目录走。
+        """
+        if frame.size == 0 or frame.ndim != 3:
+            # 空帧（比如会话收尾时用占位帧）不该写成一张坏图，也不该悄悄吞掉。
+            logger.warning("取证截图(%s)跳过：帧无效 %s", kind, getattr(frame, "shape", None))
             return ""
-        return str(screenshot_path)
+        self.screenshot_dir.mkdir(parents=True, exist_ok=True)
+        screenshot_path = self.screenshot_dir / f"{event.session_id}_{kind}.jpg"
+        encoded, buffer = cv2.imencode(".jpg", frame)
+        if not encoded:
+            logger.warning("取证截图(%s)编码失败: %s", kind, screenshot_path.name)
+            return ""
+        try:
+            screenshot_path.write_bytes(buffer.tobytes())
+        except OSError as error:
+            logger.warning("取证截图(%s)写入失败 %s: %s", kind, screenshot_path, error)
+            return ""
+        return self.relative_path(screenshot_path)
+
+    def relative_path(self, path: str | Path) -> str:
+        """把绝对路径换算成相对 events 根目录的路径（已经是相对的则原样返回）。"""
+        candidate = Path(path)
+        if not candidate.is_absolute():
+            return candidate.as_posix()
+        try:
+            return candidate.relative_to(self.root).as_posix()
+        except ValueError:
+            # 不在 events 目录下（用户手改过配置之类）：保留绝对路径，总比丢了强。
+            logger.warning("截图不在 events 目录内，按绝对路径记录: %s", candidate)
+            return str(candidate)
+
+    def resolve_screenshot(self, path: str) -> Path | None:
+        """把记录里的截图路径解析成实际文件；找不到返回 None。
+
+        新记录存的是相对路径（跟着 events 目录走）。旧记录存的是绝对路径，所以还要兜一层：
+        绝对路径找不到文件时，按**文件名**到当前截图目录里再找一次 —— 换过安装目录、把
+        绿色版拷到别处的旧记录因此还能恢复。
+        """
+        if not path:
+            return None
+        candidate = Path(path)
+        if not candidate.is_absolute():
+            candidate = self.root / candidate
+        if candidate.is_file():
+            return candidate
+        fallback = self.screenshot_dir / Path(path).name
+        return fallback if fallback.is_file() else None
 
     def open_session(self, event: AlarmEvent, frame: np.ndarray) -> AlarmEvent:
         event.entry_screenshot_path = self._save_screenshot(event, frame, "entry")

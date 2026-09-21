@@ -308,6 +308,49 @@ def _write_asset_manifest() -> int:
     return 0
 
 
+def _probe_image_write(
+    record: Callable[[str, object], None],
+    failures: list[str],
+) -> None:
+    """真写一张 JPEG，确认取证截图这条路走得通。
+
+    为什么值得单独一探：**cv2.imwrite 在非 ASCII 路径下会静默失败**（返回 False，文件
+    根本没写），而发布包的目录名是中文（行人警戒区域监控）。后果是打包版里每一次取证
+    截图都写不进去 —— 记录写着"已报警"、截图路径却是空的，界面上显示"报警取证不可用"，
+    而开发目录是纯 ASCII，所以在开发机上永远看不出来。
+
+    写入落在程序数据目录下（可能正是中文路径），写完就删。
+    """
+    import cv2
+    import numpy as np
+
+    import app_paths
+
+    probe_path = app_paths.data("logs", "selftest-image-write.jpg")
+    try:
+        probe_path.parent.mkdir(parents=True, exist_ok=True)
+        encoded, buffer = cv2.imencode(".jpg", np.zeros((16, 16, 3), dtype=np.uint8))
+        if not encoded:
+            failures.append("JPEG 编码失败（cv2.imencode 返回 False）")
+            record("取证截图写入", "FAIL cv2.imencode 返回 False")
+            return
+        probe_path.write_bytes(buffer.tobytes())
+        size = probe_path.stat().st_size
+        if size <= 0:
+            failures.append(f"取证截图写入后是空文件: {probe_path}")
+            record("取证截图写入", f"FAIL 空文件 {probe_path}")
+            return
+        record("取证截图写入", f"ok | {size} 字节 | {probe_path.parent}")
+    except OSError as error:
+        failures.append(f"取证截图无法写入（{probe_path}）: {error!r}")
+        record("取证截图写入", f"FAIL {error!r}")
+    finally:
+        try:
+            probe_path.unlink()
+        except OSError:
+            pass
+
+
 def _probe_version(
     record: Callable[[str, object], None],
     failures: list[str],
@@ -505,6 +548,7 @@ def _run_selftest(argv: list[str]) -> int:
     step("import main_window", _probe_main_window)
     step("版本比对", lambda: _probe_version(record, failures))
     step("发布资源", lambda: _probe_assets(record, failures))
+    step("取证截图写入", lambda: _probe_image_write(record, failures))
     step("alarm wav", _probe_alarm_wav)
     model_path = step("yolo11n.pt", _probe_model)
     step("openvino int8 dir", _probe_low_power_dir)

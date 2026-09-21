@@ -144,7 +144,9 @@ def main() -> int:
 
     Path(arguments.out).parent.mkdir(parents=True, exist_ok=True)
     engine_out = Path(f"{arguments.out}_engine.png")
-    cv2.imwrite(str(engine_out), annotated)
+    # cv2.imwrite 失败只返回 False、不抛异常；调视觉时静默失败最费时间，所以要报出来。
+    if not cv2.imwrite(str(engine_out), annotated):
+        raise SystemExit(f"写不出 {engine_out}（路径里有非 ASCII 字符时 cv2 可能失败）")
     print(f"引擎标注帧: {engine_out}  ({annotated.shape[1]}x{annotated.shape[0]})")
     print(f"区域: {[zone.name for zone in zones]}")
     print(f"检出并进入区域的目标数: {len(sessions)}")
@@ -154,7 +156,8 @@ def main() -> int:
         print("未渲染控件层（没有可用的 Qt 环境）")
         return 0
     widget_out = Path(f"{arguments.out}_widget.png")
-    cv2.imwrite(str(widget_out), widget_image)
+    if not cv2.imwrite(str(widget_out), widget_image):
+        raise SystemExit(f"写不出 {widget_out}")
     print(f"控件合成帧: {widget_out}")
     return 0
 

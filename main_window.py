@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from pathlib import Path
 from typing import Optional
 
@@ -788,7 +789,12 @@ class PlaybackPanel(QGroupBox):
 # ---------------------------------------------------------------------------
 
 class AlarmDetailDialog(QDialog):
-    def __init__(self, event: AlarmEvent, parent: Optional[QWidget] = None) -> None:
+    def __init__(
+        self,
+        event: AlarmEvent,
+        resolver: Callable[[str], Path | None] | None = None,
+        parent: Optional[QWidget] = None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("报警详情")
         self.resize(720, 620)
@@ -817,8 +823,14 @@ class AlarmDetailDialog(QDialog):
             screenshot_label = QLabel(f"{title}不可用")
             screenshot_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             screenshot_label.setMinimumSize(330, 240)
-            if screenshot_path:
-                pixmap = QPixmap(screenshot_path)
+            resolved = resolver(screenshot_path) if resolver is not None else None
+            if resolved is None and screenshot_path:
+                # 解析器没给（或没找到）时退回直接按路径打开：相对路径、被移动过的
+                # 记录都靠解析器处理，这里只是最后的兜底。
+                direct = Path(screenshot_path)
+                resolved = direct if direct.is_file() else None
+            if resolved is not None:
+                pixmap = QPixmap(str(resolved))
                 if not pixmap.isNull():
                     screenshot_label.setPixmap(
                         pixmap.scaled(
@@ -828,6 +840,12 @@ class AlarmDetailDialog(QDialog):
                             Qt.TransformationMode.SmoothTransformation,
                         )
                     )
+                    screenshots.addWidget(screenshot_label)
+                    continue
+            # 显示不出来时说清是哪一种：本来没报警 / 没写进去 / 文件被清理或删掉。
+            reason = EventStore.unavailable_reason(event, screenshot_path)
+            screenshot_label.setText(f"{title}不可用\n{reason}")
+            screenshot_label.setWordWrap(True)
             screenshots.addWidget(screenshot_label)
         layout.addLayout(screenshots)
 
@@ -838,8 +856,15 @@ class EventPanel(QGroupBox):
         "退出时刻", "状态", "闯入时长", "进入取证", "报警取证",
     ]
 
-    def __init__(self, parent: Optional[QWidget] = None) -> None:
+    def __init__(
+        self,
+        resolver: Callable[[str], Path | None] | None = None,
+        parent: Optional[QWidget] = None,
+    ) -> None:
         super().__init__("报警记录", parent)
+        # 记录里存的是相对 events 目录的路径，由 EventStore 解析成实际文件
+        # （旧记录存的是绝对路径，解析器还负责按文件名兜底找回）。
+        self._resolver = resolver
         layout = QVBoxLayout(self)
         self.table = QTableWidget(0, len(self.HEADERS))
         self._rows_by_session: dict[str, int] = {}
@@ -865,7 +890,7 @@ class EventPanel(QGroupBox):
         item = self.table.item(row, 0)
         event = item.data(Qt.ItemDataRole.UserRole) if item else None
         if isinstance(event, AlarmEvent):
-            AlarmDetailDialog(event, self).exec()
+            AlarmDetailDialog(event, self._resolver, self).exec()
 
     def append_event(self, event: AlarmEvent) -> None:
         row = self._rows_by_session.get(event.session_id)
@@ -931,7 +956,7 @@ class MainWindow(QMainWindow):
         self.settings_panel = SettingsPanel()
         self.zone_panel = ZonePanel()
         self.playback_panel = PlaybackPanel()
-        self.event_panel = EventPanel()
+        self.event_panel = EventPanel(self.event_store.resolve_screenshot)
 
         self._settings_binder = SettingsBinder(self.settings_panel.field_bindings())
         self.notification_dispatcher = NotificationDispatcher()
