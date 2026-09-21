@@ -4,6 +4,7 @@ import json
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -519,6 +520,35 @@ class ScreenshotStorageTests(unittest.TestCase):
         resolved = store.resolve_screenshot(event.alarm_screenshot_path)
         self.assertIsNotNone(resolved)
         self.assertGreater(resolved.stat().st_size, 0)
+
+    def test_screenshot_name_starts_with_a_timestamp(self) -> None:
+        """文件名以时间戳开头：在文件夹里一眼能看出时间，按名称排序就是按时间排序。"""
+        store = self.store()
+
+        event = store.mark_alarmed(self.event(), np.zeros((8, 8, 3), dtype=np.uint8))
+
+        name = Path(event.alarm_screenshot_path).name
+        self.assertRegex(
+            name,
+            r"^\d{8}-\d{6}_[0-9a-f]{32}_alarm\.jpg$",
+            f"命名应当形如 20260921-103045_<会话ID>_alarm.jpg，实际是 {name}",
+        )
+
+    def test_screenshot_names_sort_chronologically(self) -> None:
+        """按名称排序 == 按时间排序（UUID 命名做不到这一点）。"""
+        store = self.store()
+        early = datetime(2026, 9, 21, 10, 30, 45)
+        later = datetime(2026, 9, 21, 10, 30, 46)
+
+        with patch("alarm_service.datetime") as clock:
+            clock.now.return_value = early
+            first = store.open_session(self.event(), np.zeros((8, 8, 3), dtype=np.uint8))
+            clock.now.return_value = later
+            second = store.open_session(self.event(), np.zeros((8, 8, 3), dtype=np.uint8))
+
+        first_name = Path(first.entry_screenshot_path).name
+        second_name = Path(second.entry_screenshot_path).name
+        self.assertLess(first_name, second_name)
 
     def test_stored_path_is_relative_to_the_events_root(self) -> None:
         """存相对路径，绿色版被拷到别处之后旧记录才不会全部失效。"""

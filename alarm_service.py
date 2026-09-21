@@ -6,6 +6,7 @@ import os
 import re
 import threading
 from collections.abc import Iterable
+from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -126,7 +127,14 @@ class EventStore:
             logger.warning("取证截图(%s)跳过：帧无效 %s", kind, getattr(frame, "shape", None))
             return ""
         self.screenshot_dir.mkdir(parents=True, exist_ok=True)
-        screenshot_path = self.screenshot_dir / f"{event.session_id}_{kind}.jpg"
+        # 文件名：时间戳 + 会话ID + 角色。
+        #
+        # 时间戳取**落盘那一刻**，而不是事件里的 entered/alarm_at_seconds —— 后者在视频
+        # 模式下是播放位置（秒数），拿它当时间会写出 1970 年。落盘时刻既真实，又和文件的
+        # 修改时间一致（按修改时间排序与按文件名排序结果相同，留存清理用的也是修改时间）。
+        # 会话ID 留着是为了能从文件名一眼回溯到 JSONL 里的那条记录。
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        screenshot_path = self.screenshot_dir / f"{stamp}_{event.session_id}_{kind}.jpg"
         encoded, buffer = cv2.imencode(".jpg", frame)
         if not encoded:
             logger.warning("取证截图(%s)编码失败: %s", kind, screenshot_path.name)
