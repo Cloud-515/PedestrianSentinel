@@ -23,6 +23,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
 from PySide6 import QtCore
+from PySide6.QtCore import QPoint, Qt
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
     QHeaderView,
@@ -280,20 +282,61 @@ class AlarmHistoryDialogTests(unittest.TestCase):
         self.assertEqual(dialog.table.columnWidth(3), 260)
         self.assertEqual(dialog.column_widths()["区域"], 260)
 
-    def test_the_last_column_absorbs_the_rest_and_is_not_remembered(self) -> None:
-        """最后一列填满右边剩下的地方（否则拖窄之后右边空一条），所以它没得记。"""
+    def test_dragging_one_boundary_resizes_only_that_column(self) -> None:
+        """拖一条边界只该动它左边那一列。
+
+        这里用 QTest 真的按鼠标，而不是直接 setColumnWidth：问题就出在鼠标拖动这条
+        路径上 —— 最后一列开着 stretchLastSection 时，拖中间任何一条边界它都会跟着
+        补偿，看上去就是「拖一个动两个」。
+        """
         dialog = self.dialog()
-        last = len(AlarmHistoryDialog.HEADERS) - 1
+        dialog.resize(1000, 700)
+        dialog.show()
+        self.addCleanup(dialog.close)
+        self.app.processEvents()
 
-        self.assertTrue(dialog.table.horizontalHeader().stretchLastSection())
-        self.assertNotIn(AlarmHistoryDialog.HEADERS[last], dialog.column_widths())
+        for column in (0, 2, 5, len(AlarmHistoryDialog.HEADERS) - 1):
+            with self.subTest(column=AlarmHistoryDialog.HEADERS[column]):
+                before = self.section_sizes(dialog)
 
-    def test_every_draggable_column_has_a_width_even_without_saved_state(self) -> None:
+                self.drag_boundary(dialog, column, 60)
+
+                after = self.section_sizes(dialog)
+                changed = [
+                    index
+                    for index, (old, new) in enumerate(zip(before, after))
+                    if old != new
+                ]
+                self.assertEqual(
+                    changed, [column], f"拖第 {column} 条边界时动了这些列：{changed}"
+                )
+                self.assertEqual(after[column], before[column] + 60)
+
+    @staticmethod
+    def section_sizes(dialog: AlarmHistoryDialog) -> list[int]:
+        header = dialog.table.horizontalHeader()
+        return [header.sectionSize(c) for c in range(dialog.table.columnCount())]
+
+    @staticmethod
+    def drag_boundary(dialog: AlarmHistoryDialog, column: int, delta: int) -> None:
+        """在表头上真的拖一次第 column 条边界（+delta 像素）。"""
+        header = dialog.table.horizontalHeader()
+        start = sum(header.sectionSize(c) for c in range(column + 1)) + header.offset() - 1
+        viewport = header.viewport()
+        QTest.mousePress(viewport, Qt.MouseButton.LeftButton, pos=QPoint(start, 8))
+        QTest.mouseMove(viewport, QPoint(start + delta, 8))
+        QApplication.processEvents()
+        QTest.mouseRelease(
+            viewport, Qt.MouseButton.LeftButton, pos=QPoint(start + delta, 8)
+        )
+        QApplication.processEvents()
+
+    def test_every_column_has_a_width_even_without_saved_state(self) -> None:
         dialog = self.dialog()
 
         widths = dialog.column_widths()
 
-        self.assertEqual(set(widths), set(AlarmHistoryDialog.HEADERS[:-1]))
+        self.assertEqual(set(widths), set(AlarmHistoryDialog.HEADERS))
         self.assertTrue(all(width > 0 for width in widths.values()), widths)
 
     def test_saved_column_widths_are_restored_by_name(self) -> None:
@@ -301,15 +344,15 @@ class AlarmHistoryDialogTests(unittest.TestCase):
             self.store,
             self.store.resolve_screenshot,
             None,
-            column_widths={"区域": 260, "早就不存在的列": 300},
+            column_widths={"区域": 260, "闯入时长": 180, "早就不存在的列": 300},
         )
         self.addCleanup(dialog.deleteLater)
 
-        area = AlarmHistoryDialog.HEADERS.index("区域")
-        self.assertEqual(dialog.table.columnWidth(area), 260)
         self.assertEqual(
-            set(dialog.column_widths()), set(AlarmHistoryDialog.HEADERS[:-1])
+            dialog.table.columnWidth(AlarmHistoryDialog.HEADERS.index("区域")), 260
         )
+        self.assertEqual(dialog.column_widths()["闯入时长"], 180)
+        self.assertEqual(set(dialog.column_widths()), set(AlarmHistoryDialog.HEADERS))
 
     def test_the_mode_and_status_filters_narrow_the_table(self) -> None:
         self.record(zone="报了警的", mode="monitor")

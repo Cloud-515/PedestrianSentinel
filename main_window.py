@@ -1132,9 +1132,12 @@ class AlarmHistoryDialog(QDialog):
         # 列宽交给用户拖：要看的是「谁、什么时候、哪个区域」，不同点位关心的列不一样，
         # 按内容铺一遍只是第一次打开的起点。
         #
-        # 最后一列由它吸收剩余宽度：十列拖窄之后右边会空出一条，看着像没画完。
+        # 最后一列**不**吸收剩余宽度（setStretchLastSection 默认就是关的，这里写出来是
+        # 因为开过一次）：开着它的话，拖中间任何一条边界时最后一列都会跟着补偿，看上去
+        # 就是「拖一个动两个」。宽度之和小于表宽时右边会空出一条，那是拖窄的自然结果，
+        # 拖回去就没了。
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        header.setStretchLastSection(True)
+        header.setStretchLastSection(False)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setMinimumHeight(220)
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
@@ -1150,31 +1153,22 @@ class AlarmHistoryDialog(QDialog):
 
         按列名找，不按下标：以后加一列，按下标存的那份会整体错位。
         """
-        restored = 0
-        for column, name in enumerate(self._draggable_headers()):
-            width = self._saved_widths.get(name)
-            if width:
-                self.table.setColumnWidth(column, width)
-                restored += 1
-        if not restored:
+        header = self.table.horizontalHeader()
+        if not self._saved_widths:
             self.table.resizeColumnsToContents()
+            return
+        for column, name in enumerate(self.HEADERS):
+            width = self._saved_widths.get(name)
+            # 只存了一部分时（比如以后加了新列），没存过的那列按内容铺。
+            header.resizeSection(column, width or header.sectionSizeHint(column))
 
     def column_widths(self) -> dict[str, int]:
-        """当前列宽（列名 → 像素）。关窗时由主窗口写进 config.json。
-
-        最后一列不在这里：它的宽度由表宽决定（剩余多少就是多少），存下来只会在下次打开
-        时把一条早就过时的数字写进去。
-        """
+        """当前列宽（列名 → 像素）。关窗时由主窗口写进 config.json。"""
         header = self.table.horizontalHeader()
         return {
             name: header.sectionSize(column)
-            for column, name in enumerate(self._draggable_headers())
+            for column, name in enumerate(self.HEADERS)
         }
-
-    @classmethod
-    def _draggable_headers(cls) -> list[str]:
-        """可拖（也是可记忆）的列，即除最后一列之外的那些。"""
-        return cls.HEADERS[:-1]
 
     # -- 右栏 ---------------------------------------------------------------
 
