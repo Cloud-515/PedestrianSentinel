@@ -237,23 +237,38 @@ class VideoWidget(QWidget):
         return QRectF((self.width() - width) / 2, (self.height() - height) / 2, width, height)
 
     def _draw_zones(self, painter: QPainter) -> None:
-        for zone in self._zones:
-            points = [self._to_display(QPointF(point[0], point[1])) for point in zone.polygon]
-            if not points:
-                continue
-            is_active = zone is self._active_zone
-            pen = QPen(QColor(zone.color), 3 if is_active else 2)
-            painter.setPen(pen)
-            painter.setBrush(Qt.BrushStyle.NoBrush)
+        """只画**编辑用的那一层**：激活区域的虚线轮廓与顶点手柄。
+
+        区域本身（贴地效果、被行人遮挡）由引擎烧进画面里 —— 它必须画在人下面才能被
+        遮挡，而控件只能画在图像之上。这里如果再把实线画一遍，就会出现两条错开的线：
+        原来就是这样，线看着又粗又糊，而且横穿在人身上。
+
+        虚线是刻意选的样式：它是界面元素（"你正在编辑这条边界"），不该被误读成画面里
+        的实体边界。顶点手柄也只画激活区域的 —— 每个区域都挂一串圆点，监控时很吵。
+        """
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        zone = self._active_zone
+        if zone is None or not zone.polygon:
+            return
+        points = [self._to_display(QPointF(point[0], point[1])) for point in zone.polygon]
+
+        def trace() -> None:
             if len(points) >= 2:
                 painter.drawPolyline(points)
             if len(points) >= 3 and zone.closed:
                 painter.drawLine(points[-1], points[0])
-            for point in points:
-                painter.setBrush(QColor("#FFFFFF") if is_active else QColor(zone.color))
-                painter.drawEllipse(point, 5 if is_active else 4, 5 if is_active else 4)
-            painter.setPen(QColor(zone.color))
-            painter.drawText(points[0] + QPointF(8, -8), zone.name)
+
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        # 深色垫底 + 白色虚线：垫底保证在浅色地面上也看得见，白色让它一眼就是界面
+        # 元素（"你正在编辑这条边界"），不会被误读成画面里的实体警戒线。
+        painter.setPen(QPen(QColor(0, 0, 0, 150), 3.0))
+        trace()
+        painter.setPen(QPen(QColor(255, 255, 255, 230), 1.6, Qt.PenStyle.DashLine))
+        trace()
+        painter.setPen(QPen(QColor(0, 0, 0, 180), 1.2))
+        for point in points:
+            painter.setBrush(QColor("#FFFFFF"))
+            painter.drawEllipse(point, 4, 4)
 
     def _to_original(self, point: QPointF) -> QPointF | None:
         if not self._video_rect.contains(point) or self._frame_size[0] == 0:
