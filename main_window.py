@@ -291,7 +291,10 @@ class SettingsPanel(QGroupBox):
         self.monitor_radio.setChecked(True)
         self.cpu_low_power_cb = QCheckBox("CPU 低功耗模式")
         self.cpu_low_power_cb.setToolTip(
-            "仅在 CPU 推理时使用 OpenVINO INT8、512 输入和每 4 帧检测。"
+            "仅在 CPU 推理时使用 OpenVINO INT8、512 输入和每 4 帧检测，"
+            "并且只检测警戒区范围（外扩 30%）。\n"
+            "区域内的人反而检得更可靠（同样的输入像素全花在要害处），"
+            "代价是区域外的行人不再画框。"
         )
         layout.addWidget(self.video_radio)
         layout.addWidget(self.monitor_radio)
@@ -394,14 +397,6 @@ class SettingsPanel(QGroupBox):
         color = {True: "#4CAF50", False: "#E53935", None: "#7A8A99"}[ok]
         self.notification_status_label.setStyleSheet(f"color: {color}; font-size: 11px;")
         self.notification_status_label.setText(text)
-
-    def set_notification_controls_enabled(self, enabled: bool) -> None:
-        # 地址与格式在运行中也能改：改完下一条报警就用新设置，不必停下检测。
-        self.notification_enabled_cb.setEnabled(enabled)
-        self.notification_url_edit.setEnabled(enabled)
-        self.notification_format_combo.setEnabled(enabled)
-        self.notification_screenshot_cb.setEnabled(enabled)
-        self.notification_test_btn.setEnabled(enabled)
 
     def _build_retention_box(self) -> QGroupBox:
         box = QGroupBox("取证留存")
@@ -528,7 +523,14 @@ class SettingsPanel(QGroupBox):
     def set_cpu_low_power_available(self, available: bool, reason: str = "") -> None:
         self.cpu_low_power_cb.setEnabled(True)
         self.cpu_low_power_cb.setToolTip(
-            reason if not available else "仅在 CPU 推理时使用 OpenVINO INT8、512 输入和每 4 帧检测。"
+            reason
+            if not available
+            else (
+                "仅在 CPU 推理时使用 OpenVINO INT8、512 输入和每 4 帧检测，"
+                "并且只检测警戒区范围（外扩 30%）。\n"
+                "区域内的人反而检得更可靠（同样的输入像素全花在要害处），"
+                "代价是区域外的行人不再画框。"
+            )
         )
 
     def set_cpu_low_power_enabled(self, enabled: bool) -> None:
@@ -888,12 +890,24 @@ def _moment_detail(event: AlarmEvent, moment: Moment) -> str:
     return f"未记录真实钟点（这条记录只存了视频位置 {offset:.2f}s）"
 
 
+def _confidence_detail(event: AlarmEvent) -> str:
+    """报警那一刻模型有多确定。
+
+    误报排查里这是第一个要看的数：0.86 和 0.62 是两回事。老记录没这个字段，如实
+    说没记 —— 不去推算，也不拿"没记录"充作"很确定"。
+    """
+    if event.alarm_confidence is None:
+        return "未记录（这条记录早于该字段）"
+    return f"{event.alarm_confidence:.2f}"
+
+
 def _detail_rows(event: AlarmEvent) -> list[tuple[str, str]]:
     """详情里逐行显示的字段。两个弹窗共用一份，免得加字段时只改了一处。"""
     return [
         ("记录时间", event.wall_time or "未记录"),
         ("进入时间", _moment_detail(event, "entered")),
         ("报警时间", _moment_detail(event, "alarmed")),
+        ("报警置信度", _confidence_detail(event)),
         ("退出时间", _moment_detail(event, "exited")),
         (
             "闯入时长",
@@ -1556,6 +1570,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(splitter)
 
     def _load_config(self) -> AppConfig:
+        self._config_write_refused = False
         try:
             loaded = self.config_store.load()
         except Exception as error:  # noqa: BLE001 - 配置文件坏成什么样都不该让程序起不来
@@ -1566,7 +1581,21 @@ class MainWindow(QMainWindow):
             logger.exception("Unable to load configuration")
             self._config_trusted = False
             backup = self.config_store.quarantine()
-            hint = f"\n原文件已备份为 {backup.name}。" if backup else ""
+            # 改名也可能失败（文件被同步盘/杀软/别的程序占着）。那时原文件还在原处，
+            # 而且我们读不动它 —— 这份文件只能由人来处置，本次运行就一律不落盘：
+            # 否则用户关窗时那份默认配置会把它盖掉，区域与设置一起没了（改名失败时
+            # 连备份都没有）。注意判据是「改名失败且文件仍在」，不是「配置不可信」——
+            # 隔离成功时文件已经被挪走，本会话的改动理应照常存下来。
+            self._config_writable = backup is not None or not self.config_store.path.exists()
+            if backup:
+                hint = f"\n原文件已备份为 {backup.name}，可手工修好后放回。"
+            elif self._config_writable:
+                hint = "\n原文件不存在。"
+            else:
+                hint = (
+                    "\n原文件没能挪走（可能被其他程序占用），本次运行不会写入配置，"
+                    "原文件保持不动。"
+                )
             QMessageBox.warning(
                 self,
                 "配置读取失败",
@@ -1574,6 +1603,7 @@ class MainWindow(QMainWindow):
             )
             return AppConfig()
         self._config_trusted = True
+        self._config_writable = True
         return loaded
 
     def _load_controls(self) -> None:
@@ -1612,9 +1642,7 @@ class MainWindow(QMainWindow):
         self.playback_panel.loop_cb.setChecked(self.config.loop_playback)
         speed_value = max(1, min(16, round(self.config.playback_speed / 0.25)))
         self.playback_panel.speed_slider.setValue(speed_value)
-        if self.config.active_profile and self.profile_store.exists(self.config.active_profile):
-            self.zones = self.profile_store.load(self.config.active_profile).zones
-            self.active_zone = self.zones[0] if self.zones else None
+        self._restore_active_profile()
         self.video_widget.set_zones(self.zones)
         self.video_widget.set_active_zone(self.active_zone)
         self._refresh_zone_panel()
@@ -1673,6 +1701,51 @@ class MainWindow(QMainWindow):
         except OSError as error:
             logger.exception("Unable to load alarm event history")
             self.source_panel.set_status(f"报警记录读取失败: {error}")
+
+    def _restore_active_profile(self) -> None:
+        """把 config.json 里记着的那个配置组读回来。
+
+        读不出来时不能把异常留给调用方 —— 这段跑在 ``__init__`` 里，异常会让窗口根本
+        建不起来，用户每次启动都只看到一个「程序出错」，只能自己猜到去 profiles 目录
+        里删文件。于是改成：坏文件改名留档，区域用 config.json 里那一份（上次退出时
+        写下的，正是当时生效的区域），再把这件事说出来。指向它的指针一并摘掉 ——
+        那个配置组已经不在原处了，留着只会让界面上挂一条点不动的条目。
+        """
+        name = self.config.active_profile
+        if not name:
+            return
+        if not self.profile_store.is_valid_name(name):
+            # config.json 能手改，改出一个带斜杠/冒号的名字就永远对应不上文件。留着
+            # 它只会让配置组列表挂一条点不动的条目，顺手摘掉。
+            logger.warning("config.json 里的配置组名 %r 不是合法的文件名，已清除", name)
+            self.config.active_profile = ""
+            self._schedule_config_save()
+            return
+        if not self.profile_store.exists(name):
+            # 名字合法、文件不在（被手工删掉或挪走）。指针留着：用户重新点一次
+            # 「保存配置组」就把它写回去了。区域本身来自 config.json，不受影响。
+            return
+        try:
+            profile = self.profile_store.load(name)
+        except ValueError as error:
+            backup = self.profile_store.quarantine(name)
+            self.config.active_profile = ""
+            self._schedule_config_save()
+            hint = (
+                f"原文件已备份为 {backup.name}，可手工修好后放回 profiles 目录。"
+                if backup
+                else "原文件仍在 profiles 目录里，未能改名留档。"
+            )
+            logger.warning("配置组 %s 读取失败，已改用 config.json 里的区域：%s", name, error)
+            QMessageBox.warning(
+                self,
+                "配置组读取失败",
+                f"配置组“{name}”读不出来，已改用 config.json 里的区域。\n{hint}\n{error}",
+            )
+            self.source_panel.set_status(f"配置组“{name}”读取失败，已用 config.json 里的区域")
+            return
+        self.zones = profile.zones
+        self.active_zone = self.zones[0] if self.zones else None
 
     def _set_profile_controls_enabled(self, enabled: bool) -> None:
         self.zone_panel.profile_save_btn.setEnabled(enabled)
@@ -1812,6 +1885,15 @@ class MainWindow(QMainWindow):
         if self.profile_store.exists(name):
             QMessageBox.warning(self, "新建失败", "该配置组名称已存在。")
             return
+        try:
+            # 立刻建出空文件，而不是攒到用户点「保存配置组」再建：否则这个名字只是
+            # 内存里的一个指针 —— 列表里挂着一条没有对应文件的条目，切到别的配置组
+            # 之后再点它的「应用」只会报「加载配置组失败」。先建文件，让界面上的
+            # 每一条都是真的。
+            self.profile_store.save(ZoneProfile(name=name, zones=[]))
+        except ValueError as error:
+            QMessageBox.warning(self, "新建失败", str(error))
+            return
         self.config.active_profile = name
         self.zones = []
         self.active_zone = None
@@ -1820,6 +1902,7 @@ class MainWindow(QMainWindow):
         self._refresh_zone_panel()
         self._refresh_profiles()
         self._set_profile_dirty(True)
+        self._schedule_config_save()
 
     def _delete_profile(self, name: str) -> None:
         if self.worker is not None and self.worker.isRunning():
@@ -2011,11 +2094,12 @@ class MainWindow(QMainWindow):
 
         排查现场问题时，「他到底配了什么」和「他装的是哪一版」一样重要，而这两件事
         以前都只能靠问。这里记的是内存里生效的那份配置，不是文件内容 —— 配置读坏而
-        回落默认值的情况也就能一眼看出来。
+        回落默认值的情况也就能一眼看出来。可写位一起记：它决定了这次运行会不会把
+        设置写回文件，「改了设置重启就丢」能靠这两项一眼对上。
         """
         logger.info(
             "生效设置: 模式=%s 视频源=%s 设备=%s 低功耗=%s 模型=%s "
-            "留存=%s天/%sMB 远程通知=%s 配置可信=%s",
+            "留存=%s天/%sMB 远程通知=%s 配置可信=%s 配置可写=%s",
             self.config.operation_mode,
             self.source_panel.get_source(),
             self.source_panel.selected_device(),
@@ -2030,6 +2114,7 @@ class MainWindow(QMainWindow):
                 else "关闭"
             ),
             getattr(self, "_config_trusted", False),
+            getattr(self, "_config_writable", True),
         )
 
     def _notification_settings(self) -> NotificationSettings:
@@ -2412,6 +2497,17 @@ class MainWindow(QMainWindow):
         self._save_timer.start()
 
     def _save_config(self) -> None:
+        if not self._config_writable:
+            # 启动时读不到 config.json、又没能把它改名留档：这份文件只能由人来处置，
+            # 本次运行一律不落盘（理由见 _load_config）。不说一声的话，用户改完设置
+            # 关窗，会以为都存下了。
+            if not self._config_write_refused:
+                self._config_write_refused = True
+                logger.warning("config.json 未能读取且未能备份，本次运行不写入配置")
+                self.source_panel.set_status(
+                    "设置未写入：启动时读不到 config.json 且无法备份，原文件保持不动"
+                )
+            return
         current_source = self.source_panel.get_source()
         if self.config.operation_mode == "video":
             self.config.video_source = current_source
@@ -2429,8 +2525,11 @@ class MainWindow(QMainWindow):
         self.config.display_to_original_scale = self.video_widget.coordinate_mapping()
         try:
             self.config_store.save(self.config)
-        except OSError:
+        except OSError as error:
+            # 磁盘满、目录只读、文件被占用都会走到这里。界面不提示的话，用户看到的
+            # 是一份「改了也存不下」的设置，而没有任何线索。
             logger.exception("Unable to save configuration")
+            self.source_panel.set_status(f"配置未能保存：{error}")
 
     def closeEvent(self, event: object) -> None:
         self._save_timer.stop()
