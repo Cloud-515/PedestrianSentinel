@@ -279,6 +279,40 @@ class MainWindowRetentionTests(unittest.TestCase):
         self.assertTrue(self.window._usage_timer.isActive())
 
 
+class MainWindowAlarmHistoryTests(unittest.TestCase):
+    """「查看记录」按钮要把主窗口的记录库交给查看器，而不是自己弹一张空表。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.base = Path(temporary.name)
+        for name, path in (
+            ("CONFIG_PATH", self.base / "config.json"),
+            ("EVENTS_DIR", self.base / "events"),
+            ("PROFILES_DIR", self.base / "profiles"),
+        ):
+            patcher = patch.object(main_window, name, path)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.window = MainWindow()
+
+    def test_the_view_button_opens_the_viewer_on_the_windows_event_store(self) -> None:
+        with patch.object(main_window, "AlarmHistoryDialog") as dialog_class:
+            self.window.event_panel.view_btn.click()
+
+        self.assertIs(dialog_class.call_args.args[0], self.window.event_store)
+        # 截图路径的解析器也要一起交过去：记录里存的是相对 events 目录的路径。
+        self.assertEqual(
+            dialog_class.call_args.args[1], self.window.event_store.resolve_screenshot
+        )
+        self.assertIs(dialog_class.call_args.args[2], self.window)
+        dialog_class.return_value.exec.assert_called_once()
+
+
 class RecordingDispatcher:
     """替掉真正的发送器：只记录被交出去的作业，不碰网络。"""
 

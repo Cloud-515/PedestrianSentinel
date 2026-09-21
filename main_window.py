@@ -6,8 +6,8 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from PySide6.QtCore import Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QPixmap
+from PySide6.QtCore import QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QPixmap, QResizeEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
@@ -804,24 +804,155 @@ class PlaybackPanel(QGroupBox):
 class PreviewImageLabel(QLabel):
     """详情里的截图预览：双击交给系统默认程序打开原图。
 
-    这里显示的是缩放到 330×300 的预览，而取证要看的是原图 —— 目标手里拿的什么、
-    区域边界压在哪、有没有第二个同伙，都得放大才看得出来。所以双击直接把原文件交给
-    系统默认程序（Windows 上就是默认图片查看器），程序里不必再做一个看图器。
+    这里显示的是缩放后的预览，而取证要看的是原图 —— 目标手里拿的什么、区域边界压在哪、
+    有没有第二个同伙，都得放大才看得出来。所以双击直接把原文件交给系统默认程序（Windows
+    上就是默认图片查看器），程序里不必再做一个看图器。
+
+    预览按控件当前宽度等比缩放：详情栏是能拖宽拖窄的，图跟着栏宽走。定死一个尺寸的话，
+    栏一变窄图的右边就被裁掉，而裁掉的正是画面里靠边的那些人和边界线。
     """
 
     activated = Signal(str)
+    # 预览的高度上限。取证图基本是 16:9，按宽度缩放后本来也高不到哪去；这条是给竖屏
+    # 画面留的，否则一张 1080×1920 的图会占掉好几屏高度。
+    PREVIEW_MAX_HEIGHT = 300
 
-    def __init__(self, path: str, parent: Optional[QWidget] = None) -> None:
+    def __init__(
+        self,
+        path: str,
+        pixmap: QPixmap | None = None,
+        parent: Optional[QWidget] = None,
+    ) -> None:
         super().__init__(parent)
         self._path = path
+        self._source = QPixmap(pixmap) if pixmap is not None else QPixmap()
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setMinimumSize(330, 240)
+        # 宽度上告诉布局「我不影响你」：预览的宽度跟着详情栏走，而不是反过来由图片尺寸
+        # 决定栏宽 —— QLabel 有 pixmap 时最小宽度就是图片宽度，弹窗会因此再也拖不窄。
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.setToolTip(f"双击用系统默认程序打开原图：\n{path}")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._rescale()
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._rescale()
+
+    def _rescale(self) -> None:
+        if self._source.isNull() or self.width() <= 0:
+            return
+        self.setPixmap(
+            self._source.scaled(
+                self.width(),
+                self.PREVIEW_MAX_HEIGHT,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
 
     def mouseDoubleClickEvent(self, event: object) -> None:
         del event
         self.activated.emit(self._path)
+
+
+def _mode_label(operation_mode: str) -> str:
+    """运行模式的中文说法。
+
+    认不出来的（手工编辑过、或很旧的记录）说「未记录」：一律按「监控模式」说，等于替
+    一条从没记过模式的记录编了个没发生过的事实。
+    """
+    return {"video": "视频模式", "monitor": "监控模式"}.get(operation_mode, "未记录")
+
+
+def _detail_rows(event: AlarmEvent) -> list[tuple[str, str]]:
+    """详情里逐行显示的字段。两个弹窗共用一份，免得加字段时只改了一处。"""
+    return [
+        ("记录时间", event.wall_time or "未记录"),
+        ("进入时间", event.format_event_time(event.entered_at_seconds, precision=3)),
+        ("报警时间", event.format_event_time(event.alarm_at_seconds, precision=3)),
+        ("退出时间", event.format_event_time(event.exited_at_seconds, precision=3)),
+        (
+            "闯入时长",
+            f"{event.duration_seconds:.2f}s"
+            if event.duration_seconds is not None
+            else "未结算",
+        ),
+        ("状态", event.status_label),
+        ("运行模式", _mode_label(event.operation_mode)),
+        ("视频源", event.source),
+        ("警戒区域", event.zone_name),
+        ("目标 ID", event.track_id),
+    ]
+
+
+def _screenshot_entries(event: AlarmEvent) -> list[tuple[str, str]]:
+    """要显示的两张取证图：(标题, 记录里的路径)，顺序就是从上到下的顺序。
+
+    进入那张在没有单独记录时回落到 ``screenshot_path``：旧记录只存了一个路径。
+    """
+    return [
+        ("进入取证", event.entry_screenshot_path or event.screenshot_path),
+        ("报警取证", event.alarm_screenshot_path),
+    ]
+
+
+def _resolve_screenshot(
+    path: str,
+    resolver: Callable[[str], Path | None] | None,
+) -> Path | None:
+    """把记录里的路径变成实际文件；找不到返回 None。
+
+    相对路径、被搬过家的旧记录都靠解析器处理，这里只是最后的兜底：解析器没给、或者
+    它没找到时，退回直接按路径打开。
+    """
+    if not path:
+        return None
+    resolved = resolver(path) if resolver is not None else None
+    if resolved is not None:
+        return resolved
+    direct = Path(path)
+    return direct if direct.is_file() else None
+
+
+def _open_in_default_viewer(parent: QWidget, path: str) -> None:
+    """把原图交给系统默认程序。
+
+    用 QDesktopServices 而不是 os.startfile：不需要平台分支，行为就是"用默认程序打开"，
+    而且返回 False 时能明确报错 —— 否则双击没反应，用户只会以为程序坏了。
+    """
+    if not QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
+        logger.warning("无法用系统默认程序打开 %s", path)
+        QMessageBox.warning(parent, "打开失败", f"系统里没有能打开这个文件的程序：\n{path}")
+
+
+def _screenshot_widget(
+    title: str,
+    path: str,
+    event: AlarmEvent,
+    resolver: Callable[[str], Path | None] | None,
+    parent: QWidget,
+) -> QWidget:
+    """一张取证预览；显示不出来时换成写明原因的说明。
+
+    显示不出来时说清是哪一种：本来没报警 / 没写进去 / 文件被清理或删掉。图片不可用时
+    刻意不给双击入口 —— 点了没反应比没有入口更让人困惑。
+    """
+    resolved = _resolve_screenshot(path, resolver)
+    if resolved is not None:
+        pixmap = QPixmap(str(resolved))
+        if not pixmap.isNull():
+            preview = PreviewImageLabel(str(resolved), pixmap, parent)
+            preview.activated.connect(
+                lambda clicked: _open_in_default_viewer(parent, clicked)
+            )
+            return preview
+    missing = QLabel(f"{title}不可用\n{EventStore.unavailable_reason(event, path)}")
+    missing.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    missing.setMinimumSize(330, 240)
+    missing.setWordWrap(True)
+    missing.setToolTip(f"记录里的路径：{path or '（空）'}")
+    return missing
 
 
 class AlarmDetailDialog(QDialog):
@@ -835,17 +966,8 @@ class AlarmDetailDialog(QDialog):
         self.setWindowTitle("报警详情")
         self.resize(720, 620)
         layout = QVBoxLayout(self)
-        mode_label = "视频模式" if event.operation_mode == "video" else "监控模式"
         details = [
-            ("进入时间", event.format_event_time(event.entered_at_seconds, precision=3)),
-            ("报警时间", event.format_event_time(event.alarm_at_seconds, precision=3)),
-            ("退出时间", event.format_event_time(event.exited_at_seconds, precision=3)),
-            ("闯入时长", f"{event.duration_seconds:.2f}s" if event.duration_seconds is not None else "未结算"),
-            ("状态", event.status_label),
-            ("运行模式", mode_label),
-            ("视频源", event.source),
-            ("警戒区域", event.zone_name),
-            ("目标 ID", event.track_id),
+            *_detail_rows(event),
             ("进入取证", event.entry_screenshot_path or "无"),
             ("报警取证", event.alarm_screenshot_path or "无"),
         ]
@@ -858,50 +980,302 @@ class AlarmDetailDialog(QDialog):
         hint.setStyleSheet("color: #7A8A99; font-size: 11px;")
         layout.addWidget(hint)
         screenshots = QHBoxLayout()
-        for title, screenshot_path in (
-            ("进入取证", event.entry_screenshot_path or event.screenshot_path),
-            ("报警取证", event.alarm_screenshot_path),
-        ):
-            resolved = resolver(screenshot_path) if resolver is not None else None
-            if resolved is None and screenshot_path:
-                # 解析器没给（或没找到）时退回直接按路径打开：相对路径、被移动过的
-                # 记录都靠解析器处理，这里只是最后的兜底。
-                direct = Path(screenshot_path)
-                resolved = direct if direct.is_file() else None
-            if resolved is not None:
-                pixmap = QPixmap(str(resolved))
-                if not pixmap.isNull():
-                    preview = PreviewImageLabel(str(resolved))
-                    preview.setPixmap(
-                        pixmap.scaled(
-                            330,
-                            300,
-                            Qt.AspectRatioMode.KeepAspectRatio,
-                            Qt.TransformationMode.SmoothTransformation,
-                        )
-                    )
-                    preview.activated.connect(self._open_in_default_viewer)
-                    screenshots.addWidget(preview)
-                    continue
-            # 显示不出来时说清是哪一种：本来没报警 / 没写进去 / 文件被清理或删掉。
-            missing = QLabel(f"{title}不可用\n{EventStore.unavailable_reason(event, screenshot_path)}")
-            missing.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            missing.setMinimumSize(330, 240)
-            missing.setWordWrap(True)
-            screenshots.addWidget(missing)
+        for title, screenshot_path in _screenshot_entries(event):
+            screenshots.addWidget(
+                _screenshot_widget(title, screenshot_path, event, resolver, self)
+            )
         layout.addLayout(screenshots)
 
-    def _open_in_default_viewer(self, path: str) -> None:
-        """把原图交给系统默认程序。
 
-        用 QDesktopServices 而不是 os.startfile：不需要平台分支，行为就是"用默认程序
-        打开"，而且返回 False 时能明确报错 —— 否则双击没反应，用户只会以为程序坏了。
+def _configure_event_table(
+    table: QTableWidget,
+    headers: list[str],
+    stretch_column: int,
+) -> None:
+    """报警记录表的共同设置（常驻面板与查看器共用）。
+
+    ``stretch_column`` 是吸收多余宽度的那一列：两处的列数不一样，让各自挑一列伸展，
+    比定死一个尺寸好 —— 表宽随窗口变。
+    """
+    table.setColumnCount(len(headers))
+    table.setHorizontalHeaderLabels(headers)
+    table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+    table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+    table.setAlternatingRowColors(True)
+    table.setStyleSheet(
+        "QTableWidget::item:hover { background-color: transparent; }"
+        "QTableWidget::item:selected { background-color: rgba(1, 174, 231, 128); }"
+    )
+    table.verticalHeader().setVisible(False)
+    header = table.horizontalHeader()
+    header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+    header.setSectionResizeMode(stretch_column, QHeaderView.ResizeMode.Stretch)
+
+
+class AlarmHistoryDialog(QDialog):
+    """查看报警记录：左栏是全部记录加筛选，右栏是选中那条的详情与两张取证图。
+
+    常驻面板那张表只装「当前运行模式最近 200 条」—— 它每次启动都要填一遍，不能因为记录
+    文件长到几十 MB 就拖慢启动。翻记录是另一件事：这里读全量，靠上方的筛选与搜索把范围
+    收窄，选中那条在右边展开成完整详情。
+
+    两个刻意的取舍：运行模式不在右栏重复显示成英文原值，而是与筛选下拉用同一份中文说法；
+    两条截图路径也不进表格 —— 它们在右边是看得见的图，11 列挤进左栏只会让每列都窄到看不清。
+    """
+
+    HEADERS = [
+        "记录时间", "运行模式", "视频源", "区域", "目标ID",
+        "进入时刻", "报警时刻", "退出时刻", "状态", "闯入时长",
+    ]
+
+    def __init__(
+        self,
+        store: EventStore,
+        resolver: Callable[[str], Path | None] | None = None,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("查看报警记录")
+        # 和主窗口一样大：左边要放下十来列记录、右边要放下两张取证图，小弹窗里两边都只能
+        # 看到一半，翻记录就得一直拖滚动条。
+        self.resize(parent.size() if parent is not None else QSize(1100, 720))
+        self._store = store
+        self._resolver = resolver
+        self._events: list[AlarmEvent] = []
+
+        layout = QVBoxLayout(self)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.addWidget(self._build_list_side())
+        splitter.addWidget(self._build_detail_side())
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        splitter.setSizes([int(self.width() * 0.6), int(self.width() * 0.4)])
+        layout.addWidget(splitter)
+
+        self.reload()
+
+    # -- 左栏 ---------------------------------------------------------------
+
+    def _build_list_side(self) -> QWidget:
+        side = QWidget()
+        layout = QVBoxLayout(side)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        filters = QHBoxLayout()
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("搜索：时间 / 视频源 / 区域 / 目标ID / 状态")
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.textChanged.connect(self._apply_filter)
+        filters.addWidget(self.search_edit, 1)
+        self.mode_combo = QComboBox()
+        self.mode_combo.currentIndexChanged.connect(self._apply_filter)
+        filters.addWidget(self.mode_combo)
+        self.status_combo = QComboBox()
+        self.status_combo.currentIndexChanged.connect(self._apply_filter)
+        filters.addWidget(self.status_combo)
+        self.refresh_btn = QPushButton("刷新")
+        self.refresh_btn.setToolTip(
+            "重新读一遍记录文件：检测一直在写，翻记录时新报的警靠它出现。"
+        )
+        self.refresh_btn.clicked.connect(self.reload)
+        filters.addWidget(self.refresh_btn)
+        layout.addLayout(filters)
+
+        self.table = QTableWidget(0, len(self.HEADERS))
+        _configure_event_table(self.table, self.HEADERS, len(self.HEADERS) - 1)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setMinimumHeight(220)
+        self.table.itemSelectionChanged.connect(self._on_selection_changed)
+        layout.addWidget(self.table, 1)
+
+        self.count_label = QLabel()
+        layout.addWidget(self.count_label)
+        return side
+
+    # -- 右栏 ---------------------------------------------------------------
+
+    def _build_detail_side(self) -> QWidget:
+        """右栏整体可滚动：详情十来行加两张图，本来就比一屏高。"""
+        self.details_scroll = QScrollArea()
+        self.details_scroll.setWidgetResizable(True)
+        self.details_content = QWidget()
+        self.details_layout = QVBoxLayout(self.details_content)
+        self.details_scroll.setWidget(self.details_content)
+        return self.details_scroll
+
+    def _clear_details(self) -> None:
+        """清空右栏。
+
+        只往这个布局里放控件、不放子布局：取出来的控件直接与父级脱钩，子布局里的控件
+        却仍挂在 details_content 上，会留在右栏里出不去。
         """
-        if not QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
-            logger.warning("无法用系统默认程序打开 %s", path)
-            QMessageBox.warning(
-                self, "打开失败", f"系统里没有能打开这个文件的程序：\n{path}"
+        while self.details_layout.count():
+            widget = self.details_layout.takeAt(0).widget()
+            if widget is not None:
+                widget.setParent(None)
+
+    def _show_details(self, event: AlarmEvent | None) -> None:
+        self._clear_details()
+        if event is None:
+            hint = QLabel("在左侧选一条记录，这里显示它的详情与两张取证图。")
+            hint.setWordWrap(True)
+            self.details_layout.addWidget(hint)
+            self.details_layout.addStretch()
+            return
+        for label, value in _detail_rows(event):
+            row = QLabel(f"{label}: {value}")
+            # 视频源可以很长；不换行的话它会把右栏撑宽，别的行跟着一起被裁掉。
+            row.setWordWrap(True)
+            self.details_layout.addWidget(row)
+        hint = QLabel("提示：双击截图可用系统默认程序打开原图")
+        hint.setStyleSheet("color: #7A8A99; font-size: 11px;")
+        self.details_layout.addWidget(hint)
+        # 两张取证图从上到下排（进入在前、报警在后）。右栏是竖的，并排摆每张只剩半栏宽，
+        # 而取证图里要看清的是人和区域边界。
+        for title, path in _screenshot_entries(event):
+            heading = QLabel(title)
+            heading.setStyleSheet("color: #7A8A99; font-size: 11px;")
+            self.details_layout.addWidget(heading)
+            self.details_layout.addWidget(
+                _screenshot_widget(title, path, event, self._resolver, self)
             )
+        self.details_layout.addStretch()
+
+    # -- 记录与筛选 ---------------------------------------------------------
+
+    def reload(self) -> None:
+        """重新读一遍记录文件，再重画下拉与表格。
+
+        打开时和点「刷新」时都走这里：检测线程在查看器开着的时候照样在写记录，刷新读的
+        是磁盘上的最新状态。
+        """
+        selected = self._selected_event()
+        try:
+            self._events = self._store.load_all()
+        except OSError as error:
+            logger.exception("Unable to load alarm event history")
+            QMessageBox.warning(self, "读取报警记录失败", str(error))
+            self._events = []
+        self._fill_filter(
+            self.mode_combo,
+            "全部模式",
+            sorted({_mode_label(event.operation_mode) for event in self._events}),
+        )
+        self._fill_filter(
+            self.status_combo,
+            "全部状态",
+            sorted({event.status_label for event in self._events}),
+        )
+        self._apply_filter()
+        if selected is None:
+            # 默认落在最新那条上：打开一个空白的右栏，还得自己先猜哪条该看。
+            self._select_row(self.table.rowCount() - 1)
+        else:
+            self._select_session(selected.session_id)
+
+    @staticmethod
+    def _fill_filter(combo: QComboBox, placeholder: str, values: list[str]) -> None:
+        """按记录里实际出现过的值填下拉，并保住用户已经选的那一项。
+
+        不写死选项列表：这个点位可能从来没有过视频模式的记录，列一个选了就空表的下拉项
+        没有意义。填的过程中关掉信号 —— 重填会连着触发好几次筛选。
+        """
+        current = combo.currentData()
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem(placeholder, "")
+        for value in values:
+            combo.addItem(value, value)
+        index = combo.findData(current)
+        combo.setCurrentIndex(index if index >= 0 else 0)
+        combo.blockSignals(False)
+
+    def _matches(self, event: AlarmEvent) -> bool:
+        mode = self.mode_combo.currentData() or ""
+        if mode and _mode_label(event.operation_mode) != mode:
+            return False
+        status = self.status_combo.currentData() or ""
+        if status and event.status_label != status:
+            return False
+        # 搜索只匹配表格里看得见的列（不含两条截图路径）：搜出来的行必须一眼能看出为什么
+        # 命中 —— 否则搜「12」会命中一堆文件名里带 12 的记录，而表里没有任何 12。
+        # 空格分开的多个词之间是「与」：搜「北侧 12」要求区域和目标 ID 都命中，比只能搜
+        # 一个词的用法更接近「找那条记录」。
+        terms = self.search_edit.text().lower().split()
+        if not terms:
+            return True
+        haystack = " ".join(self._row_values(event)).lower()
+        return all(term in haystack for term in terms)
+
+    @staticmethod
+    def _row_values(event: AlarmEvent) -> list[str]:
+        """表格一行：只放「认出是哪条记录」用得上的列。
+
+        截图路径那两列不要 —— 它们在右栏是看得见的图；要看路径的话，鼠标停在图上有。
+        """
+        row = event.to_row()  # 记录时间…闯入时长在前九列，两条截图路径在后两列
+        return [row[0], _mode_label(event.operation_mode), *row[1:9]]
+
+    def _apply_filter(self, *ignored: object) -> None:
+        del ignored
+        selected = self._selected_event()
+        visible = [event for event in self._events if self._matches(event)]
+        # 重填期间关掉选中信号：搜索框里打字是连着来的，每敲一个字都重画一次右栏（两张图
+        # 要重新解码）会明显发顿。重填完再把选中行按会话 ID 找回来。
+        #
+        # 先清掉选中状态：选中是按行号记的，而重填之后同一行已经是另一条记录了 —— 不清的话
+        # 右栏会显示成「用户没选过的那条」的详情。
+        #
+        # 能复用的单元格就复用：一次筛选是几千行 × 十来列，每次都新建 QTableWidgetItem 的
+        # 话，在两千条记录上单次重填要 200 ms 上下，敲一个字卡一下。注意已有单元格不能再
+        # 走一遍 setItem —— Qt 会当成「这个单元格已经有主了」并打一条警告。
+        self.table.blockSignals(True)
+        self.table.clearSelection()
+        self.table.setRowCount(len(visible))
+        for row, event in enumerate(visible):
+            for column, value in enumerate(self._row_values(event)):
+                item = self.table.item(row, column)
+                if item is None:
+                    item = QTableWidgetItem()
+                    self.table.setItem(row, column, item)
+                item.setText(value)
+                item.setToolTip(value)
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, event)
+        self.table.blockSignals(False)
+        self.count_label.setText(f"显示 {len(visible)} / 共 {len(self._events)} 条")
+        restored = selected is not None and self._select_session(selected.session_id)
+        if not restored:
+            # 原来选的那条被筛掉了（或者本来就没选）：右栏回到提示语，而不是留着上一条
+            # 的详情让人以为它还在表里。
+            self._show_details(self._selected_event())
+
+    def _selected_event(self) -> AlarmEvent | None:
+        items = self.table.selectedItems()
+        if not items:
+            return None
+        item = self.table.item(items[0].row(), 0)
+        event = item.data(Qt.ItemDataRole.UserRole) if item else None
+        return event if isinstance(event, AlarmEvent) else None
+
+    def _select_row(self, row: int) -> None:
+        if row < 0 or row >= self.table.rowCount():
+            return
+        self.table.selectRow(row)
+        self.table.scrollToItem(self.table.item(row, 0))
+
+    def _select_session(self, session_id: str) -> bool:
+        """把选中行放回指定会话；它不在当前筛选结果里时返回 False。"""
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            event = item.data(Qt.ItemDataRole.UserRole) if item else None
+            if isinstance(event, AlarmEvent) and event.session_id == session_id:
+                self._select_row(row)
+                return True
+        return False
+
+    def _on_selection_changed(self) -> None:
+        self._show_details(self._selected_event())
 
 
 class EventPanel(QGroupBox):
@@ -922,23 +1296,17 @@ class EventPanel(QGroupBox):
         layout = QVBoxLayout(self)
         self.table = QTableWidget(0, len(self.HEADERS))
         self._rows_by_session: dict[str, int] = {}
-        self.table.setHorizontalHeaderLabels(self.HEADERS)
-        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setAlternatingRowColors(True)
-        self.table.setStyleSheet(
-            "QTableWidget::item:hover { background-color: transparent; }"
-            "QTableWidget::item:selected { background-color: rgba(1, 174, 231, 128); }"
-        )
-        self.table.verticalHeader().setVisible(False)
-        header = self.table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        _configure_event_table(self.table, self.HEADERS, 6)
         self.table.setMinimumHeight(220)
         self.table.cellDoubleClicked.connect(self._show_details)
         layout.addWidget(self.table)
-        self.clear_btn = QPushButton("清空记录")
-        layout.addWidget(self.clear_btn)
+        # 面板上原来这个位置是「清空记录」。它换成了查看器：报警记录按留存策略是永久保留的
+        # （只清截图），而一屏 200 条、还不带筛选的表，翻旧记录时基本没用。
+        self.view_btn = QPushButton("查看记录")
+        self.view_btn.setToolTip(
+            "打开记录查看器：左边全部记录（可筛选、可搜索），右边选中那条的详情与两张取证图。"
+        )
+        layout.addWidget(self.view_btn)
 
     def _show_details(self, row: int, column: int) -> None:
         item = self.table.item(row, 0)
@@ -953,12 +1321,16 @@ class EventPanel(QGroupBox):
             self.table.insertRow(row)
             self._rows_by_session[event.session_id] = row
         for column, value in enumerate(event.to_row()):
-            item = self.table.item(row, column) or QTableWidgetItem()
+            item = self.table.item(row, column)
+            if item is None:
+                # 同一个单元格不能再 setItem 一次：Qt 会当成「已经有主了」打警告，而这条
+                # 路径每次会话状态变化都会走一遍（进入 / 报警 / 结束各一次）。
+                item = QTableWidgetItem()
+                self.table.setItem(row, column, item)
             item.setText(value)
             item.setToolTip(value)
             if column == 0:
                 item.setData(Qt.ItemDataRole.UserRole, event)
-            self.table.setItem(row, column, item)
         self.table.scrollToBottom()
 
     def clear(self) -> None:
@@ -1167,7 +1539,7 @@ class MainWindow(QMainWindow):
         self.video_widget.zone_changed.connect(self._on_zone_geometry_changed)
         self.video_widget.mapping_changed.connect(self._on_mapping_changed)
         self.video_widget.frame_size_changed.connect(self._on_frame_size_changed)
-        self.event_panel.clear_btn.clicked.connect(self._clear_events)
+        self.event_panel.view_btn.clicked.connect(self._show_event_history)
 
     def _load_event_history(self) -> None:
         self.event_panel.clear()
@@ -1896,20 +2268,16 @@ class MainWindow(QMainWindow):
         self.config.source_size = [width, height]
         self._schedule_config_save()
 
-    def _clear_events(self) -> None:
-        answer = QMessageBox.question(
-            self,
-            "清空报警记录",
-            "确定清空报警记录吗？已保存的截图文件将保留。",
+    def _show_event_history(self) -> None:
+        """打开记录查看器。
+
+        查看器自己读全量记录、也不按运行模式过滤（面板那张表只装当前模式的最近 200 条），
+        所以打开时会重新读一遍文件 —— 检测正在跑的话，刚报的那条警也在里面。
+        """
+        dialog = AlarmHistoryDialog(
+            self.event_store, self.event_store.resolve_screenshot, self
         )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-        try:
-            self.event_store.clear(self.config.operation_mode)
-            self.event_panel.clear()
-        except OSError as error:
-            logger.exception("Unable to clear alarm event history")
-            QMessageBox.warning(self, "清空失败", str(error))
+        dialog.exec()
 
     def _schedule_config_save(self) -> None:
         self._save_timer.start()

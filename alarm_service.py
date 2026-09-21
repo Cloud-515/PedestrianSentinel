@@ -223,6 +223,17 @@ class EventStore:
         with self._lock:
             return self._load_recent_locked(limit, operation_mode)
 
+    def load_all(self) -> list[AlarmEvent]:
+        """读出全部会话，不设条数上限、也不按运行模式过滤。
+
+        「查看记录」弹窗要回答的是「这个点位到底发生过什么」，所以它读全量。而
+        ``load_recent`` 的 200 条上限是留给常驻面板的 —— 那张表每次启动都要填一遍，
+        不能因为记录文件长到几十 MB 就拖慢启动。报警记录是纯文本，量级可以忽略。
+        """
+        with self._lock:
+            events, _ = self._scan_locked()
+            return events
+
     def _load_recent_locked(
         self,
         limit: int,
