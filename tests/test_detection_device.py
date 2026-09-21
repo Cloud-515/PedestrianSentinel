@@ -133,6 +133,7 @@ class DetectionDeviceTests(unittest.TestCase):
             classes=[0],
             verbose=False,
             device="cuda:1",
+            conf=DetectionEngine.DETECTION_CONFIDENCE,
         )
 
     def test_process_can_skip_rendering_for_benchmarking(self) -> None:
@@ -258,6 +259,11 @@ class DetectionDeviceTests(unittest.TestCase):
         second_tracker.update.assert_called_once()
 
     def test_intrusion_session_closes_short_visit_and_creates_new_session_on_reentry(self) -> None:
+        """短暂来访会被结算，重新进入是新会话。
+
+        缺席要超过 SESSION_GAP_TOLERANCE_SECONDS 才算真的离开 —— 否则半身被遮挡、
+        检测断断续续的人会被当成"离开了又进来"，驻留计时被反复清零。
+        """
         model = Mock(return_value=[object()])
         tracker = Mock()
         person = TrackedDetections([10, 10, 30, 50], track_id=4)
@@ -279,7 +285,7 @@ class DetectionDeviceTests(unittest.TestCase):
             _, entered = engine.process(frame, 10.0, "test.mp4")
             _, exited = engine.process(frame, 12.0, "test.mp4")
             _, reentered = engine.process(frame, 20.0, "test.mp4")
-            _, exited_again = engine.process(frame, 21.0, "test.mp4")
+            _, exited_again = engine.process(frame, 22.0, "test.mp4")
 
         self.assertEqual([transition.kind for transition in entered], ["entered"])
         self.assertEqual([transition.kind for transition in exited], ["exited"])
@@ -288,6 +294,82 @@ class DetectionDeviceTests(unittest.TestCase):
         self.assertEqual([transition.kind for transition in reentered], ["entered"])
         self.assertNotEqual(entered[0].event.session_id, reentered[0].event.session_id)
         self.assertEqual([transition.kind for transition in exited_again], ["exited"])
+
+    def test_flickering_detection_does_not_restart_the_dwell_timer(self) -> None:
+        """检测断断续续时，驻留计时不能被清零。
+
+        这是现场报上来的问题：低功耗预设（每 4 帧检测 + INT8）下，半身被遮挡的人检测会
+        时有时无。原来一帧没检到就关闭会话，下一个会话从零开始计时 —— 于是"人一直在
+        区域里，停留时间却一直刷新，一条报警都没有"。
+        """
+        model = Mock(return_value=[object()])
+        tracker = Mock()
+        person = TrackedDetections([10, 10, 30, 50], track_id=6)
+        # 隔一帧出现一次：每次缺席都远小于容忍时间。
+        tracker.update.side_effect = [
+            person, EmptyDetections(), person, EmptyDetections(),
+            person, EmptyDetections(), person,
+        ]
+        zone = ZoneDefinition(
+            name="警戒区",
+            polygon=[[0, 0], [100, 0], [100, 100], [0, 100]],
+            closed=True,
+            dwell_seconds=2.0,
+        )
+        frame = np.zeros((120, 120, 3), dtype=np.uint8)
+
+        with (
+            patch("detection_engine.YOLO", return_value=model),
+            patch.object(DetectionEngine, "_new_tracker", return_value=tracker),
+            patch("detection_engine.sv.Detections.from_ultralytics", return_value=object()),
+        ):
+            engine = DetectionEngine("model.pt", [zone], "cpu")
+            transitions = []
+            for timestamp in (0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0):
+                _, frame_transitions = engine.process(frame, timestamp, "test.mp4")
+                transitions.extend(frame_transitions)
+
+        kinds = [transition.kind for transition in transitions]
+        self.assertEqual(kinds.count("entered"), 1, f"不该反复重开会话: {kinds}")
+        self.assertEqual(
+            [
+                transition.event.alarm_at_seconds
+                for transition in transitions
+                if transition.kind == "alarmed"
+            ],
+            [2.0],
+        )
+
+    def test_session_closes_only_after_the_gap_tolerance(self) -> None:
+        """缺席超过容忍时间才算离开；没超过就一直算他在场。"""
+        model = Mock(return_value=[object()])
+        tracker = Mock()
+        person = TrackedDetections([10, 10, 30, 50], track_id=7)
+        tracker.update.side_effect = [person, EmptyDetections(), EmptyDetections()]
+        zone = ZoneDefinition(
+            name="警戒区",
+            polygon=[[0, 0], [100, 0], [100, 100], [0, 100]],
+            closed=True,
+            dwell_seconds=5.0,
+        )
+        frame = np.zeros((120, 120, 3), dtype=np.uint8)
+
+        with (
+            patch("detection_engine.YOLO", return_value=model),
+            patch.object(DetectionEngine, "_new_tracker", return_value=tracker),
+            patch("detection_engine.sv.Detections.from_ultralytics", return_value=object()),
+        ):
+            engine = DetectionEngine("model.pt", [zone], "cpu")
+            engine.process(frame, 0.0, "test.mp4")
+            # 缺席 1.0 秒：还在容忍时间内，会话留着。
+            _, within_tolerance = engine.process(frame, 1.0, "test.mp4")
+            self.assertEqual([t.kind for t in within_tolerance], [])
+            self.assertEqual(len(engine.active_sessions), 1)
+            # 再缺席到 3.0 秒（距上次见到 3.0 秒 > 1.5）：结算。
+            _, beyond_tolerance = engine.process(frame, 3.0, "test.mp4")
+
+        self.assertEqual([t.kind for t in beyond_tolerance], ["exited"])
+        self.assertEqual(engine.active_sessions, {})
 
     def test_intrusion_session_only_emits_one_alarm_while_target_remains(self) -> None:
         model = Mock(return_value=[object()])
@@ -309,13 +391,13 @@ class DetectionDeviceTests(unittest.TestCase):
         ):
             engine = DetectionEngine("model.pt", [zone], "cpu")
             transitions = []
-            for timestamp in (0.0, 2.0, 5.0, 6.0):
+            for timestamp in (0.0, 2.0, 5.0, 7.5):
                 _, frame_transitions = engine.process(frame, timestamp, "test.mp4")
                 transitions.extend(frame_transitions)
 
         self.assertEqual([transition.kind for transition in transitions], ["entered", "alarmed", "exited"])
         self.assertEqual(transitions[1].event.alarm_at_seconds, 2.0)
-        self.assertEqual(transitions[-1].event.duration_seconds, 6.0)
+        self.assertEqual(transitions[-1].event.duration_seconds, 7.5)
 
     def test_format_elapsed_uses_seconds_and_milliseconds(self) -> None:
         self.assertEqual(DetectionEngine._format_elapsed(0), "0.000s")
@@ -449,7 +531,7 @@ class AlarmCooldownTests(unittest.TestCase):
         frames = [person, person, EmptyDetections(), person, person, EmptyDetections()]
 
         with self._engine(zone, frames) as engine:
-            transitions = self._drive(engine, [0.0, 2.0, 3.0, 4.0, 6.0, 7.0])
+            transitions = self._drive(engine, [0.0, 2.0, 4.0, 5.0, 7.0, 9.0])
 
         self.assertEqual(
             [transition.kind for transition in transitions],
@@ -465,7 +547,7 @@ class AlarmCooldownTests(unittest.TestCase):
         frames = [person, person, EmptyDetections(), person, person]
 
         with self._engine(zone, frames) as engine:
-            transitions = self._drive(engine, [0.0, 2.0, 3.0, 20.0, 22.0])
+            transitions = self._drive(engine, [0.0, 2.0, 5.0, 20.0, 22.0])
 
         self.assertEqual(self._alarm_times(transitions), [2.0, 22.0])
 
@@ -476,7 +558,7 @@ class AlarmCooldownTests(unittest.TestCase):
         frames = [person, person, EmptyDetections(), person, person, person]
 
         with self._engine(zone, frames) as engine:
-            transitions = self._drive(engine, [0.0, 2.0, 3.0, 4.0, 6.0, 12.0])
+            transitions = self._drive(engine, [0.0, 2.0, 4.0, 5.0, 7.0, 12.0])
 
         self.assertEqual(self._alarm_times(transitions), [2.0, 12.0])
 
@@ -499,9 +581,9 @@ class AlarmCooldownTests(unittest.TestCase):
         frames = [person, person, EmptyDetections(), person, person]
 
         with self._engine(zone, frames) as engine:
-            transitions = self._drive(engine, [0.0, 2.0, 3.0, 4.0, 6.0])
+            transitions = self._drive(engine, [0.0, 2.0, 4.0, 5.0, 7.0])
 
-        self.assertEqual(self._alarm_times(transitions), [2.0, 6.0])
+        self.assertEqual(self._alarm_times(transitions), [2.0, 7.0])
 
     def test_reset_tracking_clears_cooldown_history(self) -> None:
         """布撤防切换、换源、循环播放都会 reset —— 时间轴变了，旧的报警时刻不能留。"""

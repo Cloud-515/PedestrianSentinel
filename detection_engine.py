@@ -49,11 +49,25 @@ class DetectionEngine:
         self._last_alarm_at: dict[tuple[str, Hashable], float] = {}
         self._processed_frames = 0
 
+    # 轨迹短暂消失的容忍时间（秒）。半身被遮挡的人在低功耗预设下检测会断断续续，
+    # 一帧没检到就关闭会话的话，下一个会话会重新计时，停留时间永远涨不到阈值 ——
+    # 表现就是"人一直在区域里，却一条报警都没有"。取值参考下面 lost_track_buffer
+    # 对应的时长（60 帧 ≈ 2 秒），略小一点，让"轨迹还活着"与"会话还留着"基本同步。
+    SESSION_GAP_TOLERANCE_SECONDS = 1.5
+    # 检测置信度下限。ultralytics 默认 0.25，而半身被遮挡的人置信度常掉到 0.1~0.2 ——
+    # 那些检测在默认阈值下会被直接丢掉，ByteTrack 也就没有机会用它维持住已有轨迹
+    # （它的第二段关联本来就是专门吃低分检测来扛遮挡的）。放低到这里不会凭空多出新
+    # 轨迹：track_activation_threshold 仍是 0.25，低分检测只能延续已有轨迹。
+    DETECTION_CONFIDENCE = 0.1
+
     @staticmethod
     def _new_tracker() -> ByteTrackTracker:
         return ByteTrackTracker(
             track_activation_threshold=0.25,
-            lost_track_buffer=30,
+            # 60 帧 ≈ 2 秒（按 30fps 折算）。要 ≥ SESSION_GAP_TOLERANCE_SECONDS，
+            # 否则轨迹先被追踪器丢掉、人再出现时拿到新 ID，会话照样会重新计时 ——
+            # 那样"会话容忍"就形同虚设了。
+            lost_track_buffer=60,
             frame_rate=30,
             minimum_consecutive_frames=1,
             minimum_iou_threshold=0.1,
@@ -145,6 +159,7 @@ class DetectionEngine:
                 "classes": [0],
                 "verbose": False,
                 "device": self.device,
+                "conf": self.DETECTION_CONFIDENCE,
             }
             if self.policy.imgsz is not None:
                 inference_kwargs["imgsz"] = self.policy.imgsz
@@ -209,8 +224,15 @@ class DetectionEngine:
             for track_id in ids
         }
         for key in list(self.active_sessions):
-            if key not in active_keys:
-                transitions.append(self._close_session(key, video_time))
+            if key in active_keys:
+                continue
+            session = self.active_sessions[key]
+            # 短暂丢失先留着：一帧没检到就关会话的话，下一个会话会重新计时，停留时间
+            # 永远涨不到阈值。留着的这段时间**不累加驻留**（上面只按看到的帧累加），
+            # 所以不会给一个已经离开的人补一次报警。
+            if video_time - session.last_seen_at_seconds <= self.SESSION_GAP_TOLERANCE_SECONDS:
+                continue
+            transitions.append(self._close_session(key, video_time))
 
         self._prune_alarm_history(video_time)
 
