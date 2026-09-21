@@ -116,6 +116,8 @@ class EventStore:
             "entered_wall_time": event.entered_wall_time,
             "alarmed_wall_time": event.alarmed_wall_time,
             "exited_wall_time": event.exited_wall_time,
+            # 报警那一刻的检测置信度（误报排查用）。
+            "alarm_confidence": event.alarm_confidence,
         }
 
     def _append(self, payload: dict[str, object]) -> None:
@@ -214,6 +216,7 @@ class EventStore:
                 "alarm_screenshot_path": event.alarm_screenshot_path,
                 "screenshot_path": event.screenshot_path,
                 "status": event.status,
+                "alarm_confidence": event.alarm_confidence,
             }
         )
         return event
@@ -376,6 +379,22 @@ class EventStore:
         return [self._recover_clock(events_by_session[session_id]) for session_id in order]
 
     @staticmethod
+    def _optional_float(payload: dict[str, object], key: str) -> float | None:
+        """可选的浮点字段：没记过、或者被手改成读不出来的东西，都当没记。
+
+        报警记录是纯文本，用户能打开也能改。新加的可选字段不该让整条记录读不出来 ——
+        而 ``float("abc")`` 抛的 ValueError 会一路冒出 ``_fold_lines``，把整块报警记录
+        一起废掉。
+        """
+        value = payload.get(key)
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            return float(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
     def _event_from_payload(payload: dict[str, object]) -> AlarmEvent:
         screenshot_path = str(payload.get("screenshot_path", ""))
         return AlarmEvent(
@@ -408,6 +427,7 @@ class EventStore:
             entered_wall_time=str(payload.get("entered_wall_time", "")),
             alarmed_wall_time=str(payload.get("alarmed_wall_time", "")),
             exited_wall_time=str(payload.get("exited_wall_time", "")),
+            alarm_confidence=EventStore._optional_float(payload, "alarm_confidence"),
         )
 
     @classmethod
@@ -442,6 +462,7 @@ class EventStore:
             event.alarm_screenshot_path = str(payload.get("alarm_screenshot_path", ""))
             event.screenshot_path = str(payload.get("screenshot_path", event.alarm_screenshot_path))
             event.status = "alarmed"
+            event.alarm_confidence = cls._optional_float(payload, "alarm_confidence")
         elif action == "closed":
             event.exited_at_seconds = float(payload["exited_at_seconds"])
             event.exited_wall_time = str(payload.get("exited_wall_time", ""))

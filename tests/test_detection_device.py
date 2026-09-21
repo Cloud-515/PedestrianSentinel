@@ -6,6 +6,7 @@ from datetime import datetime
 from unittest.mock import Mock, patch
 
 import numpy as np
+import supervision as sv
 
 from detection_engine import DetectionEngine
 from inference_profiles import InferencePolicy
@@ -211,11 +212,15 @@ class DetectionDeviceTests(unittest.TestCase):
         self.assertEqual(model.call_count, 2)
         self.assertEqual(model.call_args.kwargs["imgsz"], 512)
         self.assertEqual(model.call_args.kwargs["device"], "cpu")
-        self.assertEqual(tracker.update.call_count, 2)
-        self.assertEqual(
-            [call.kwargs["timestamp"] for call in tracker.update.call_args_list],
-            [0.0, 4.0],
-        )
+        # 追踪器**每帧**都要推进：跳过的帧喂一个空检测，让卡尔曼按时间步往前走，
+        # 否则预测框会冻在上一次检测的位置，人走了框还留在原地。
+        self.assertEqual(tracker.update.call_count, 5)
+        fresh = [
+            call.kwargs["timestamp"]
+            for call in tracker.update.call_args_list
+            if not isinstance(call.args[0], sv.Detections)
+        ]
+        self.assertEqual(fresh, [0.0, 4.0], "只有每 4 帧里的那一帧带真实检测")
 
     def test_low_power_mode_keeps_zone_entry_and_emits_dwell_alarm(self) -> None:
         model = Mock(return_value=[object()])
@@ -244,7 +249,8 @@ class DetectionDeviceTests(unittest.TestCase):
                 _, frame_events = engine.process(frame, float(timestamp), "test.mp4")
                 events.extend(frame_events)
 
-        self.assertEqual(tracker.update.call_count, 2)
+        # 每帧都推进追踪器（跳过的帧喂空检测），所以是 5 次而不是 2 次。
+        self.assertEqual(tracker.update.call_count, 5)
         self.assertEqual(engine.entry_times, {("警戒区", 7): 0.0})
         self.assertEqual([transition.kind for transition in events], ["entered", "alarmed"])
         self.assertEqual(events[-1].event.track_id, "7")

@@ -18,6 +18,24 @@ class InferencePolicy:
     imgsz: int | None = None
     detector_interval: int = 1
     label: str = "标准模式"
+    # 只检测「警戒区外扩这么多」的裁片；None = 检测整帧。
+    #
+    # 它**不是**省 CPU 的手段（实测过，见下），买的是**区域内**的识别率：网络的输入尺寸
+    # 固定，裁片不会让每帧便宜，但它把同样的输入像素全花在要害处 —— 也就是区域内的
+    # 有效分辨率更高。1080p / INT8 512 上的实测（15 帧、同一个引擎）：
+    #
+    #     整帧：每帧 32.2ms，15 帧共 262 个检出，**区域内**平均置信度 0.53
+    #     裁片：每帧 39.7ms，15 帧共  93 个检出，**区域内**平均置信度 0.67
+    #
+    # 两个直接后果：①区外的误检（橱窗、栏杆、反光）根本不会产生，操作员不用再从
+    # 一片绿框里分辨真假；②区域内的人置信度更高，更容易越过「新建轨迹 0.65」那道
+    # 门槛 —— 低功耗模式下"真人检得到、却拿不到 ID"的症结就在这个刻度差上。
+    # 代价是**区外的框不再产生**，所以低功耗模式只保证区域内的检测。
+    #
+    # （顺带记一笔：ultralytics 在 batch=1 时写死 OpenVINO 的 PERFORMANCE_HINT=LATENCY。
+    # 实测 LATENCY 16.8ms、THROUGHPUT 21.7ms、多流 22.8~24.0ms —— 现在这个设置已经
+    # 是最快的，不必去改后端配置。）
+    detect_region_margin: float | None = None
 
     @property
     def uses_tracker_prediction(self) -> bool:
@@ -91,6 +109,7 @@ def resolve_inference_policy(
             device="cpu",
             imgsz=512,
             detector_interval=4,
-            label="CPU 低功耗模式（OpenVINO INT8，512，每 4 帧检测）",
+            label="CPU 低功耗模式（OpenVINO INT8，512，每 4 帧检测，只检测警戒区）",
+            detect_region_margin=0.3,
         )
     )

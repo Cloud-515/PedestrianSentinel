@@ -110,7 +110,8 @@ class ZoneRenderingTests(unittest.TestCase):
     def test_person_far_from_the_zone_only_changes_his_own_box(self) -> None:
         """没人靠近区域时不做遮挡 —— 那一步的代价只在真需要时才付。
 
-        于是"远处的人"对这一帧的唯一影响就是他自己的检测框，区域部分逐像素不变。
+        于是"远处的人"对这一帧的影响只限于他自己的框，以及框上那行标签（标签里带
+        置信度，比框本身宽一点）；区域内部逐像素不变。
         """
         without = self.render([self.zone], [])
         box = (20, 20, 80, 90)
@@ -119,10 +120,14 @@ class ZoneRenderingTests(unittest.TestCase):
         difference = np.any(without != with_far_person, axis=2)
         rows, columns = np.nonzero(difference)
         self.assertTrue(len(rows) > 0, "远处那个人的框应当被画出来")
-        # 差异只允许出现在他的框附近（框线有 2px 宽，标签在框上方）。
+        # 这一条才是这个测试真正要守的东西：远处有人时，区域内部一个像素都不该被动。
+        self.assertFalse(
+            difference[120:360, 100:500].any(), "区域内部不该被远处的目标碰到"
+        )
+        # 差异整体留在区域上边界之上（框与框上方的标签都在这儿）。
+        self.assertLess(rows.max(), 120)
+        # 横向只往右扩（框线有 2px 宽、标签从框左上角向右排）。
         self.assertGreaterEqual(columns.min(), box[0] - 2)
-        self.assertLessEqual(columns.max(), box[2] + 2)
-        self.assertLessEqual(rows.min(), box[3] + 2)
 
     def test_alert_state_paints_the_zone_more_strongly(self) -> None:
         quiet = self.render([self.zone], [])

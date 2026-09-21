@@ -570,6 +570,11 @@ class AlarmEvent:
     entered_wall_time: str = ""
     alarmed_wall_time: str = ""
     exited_wall_time: str = ""
+    # 判定报警那一刻，模型对这个框的把握（0~1）。**误报排查的第一手材料**：一条夜里
+    # 的报警，看这个数就知道当时模型有多确定（0.86 和 0.62 是两回事）。它取自报警
+    # 那一帧的真实检出；那一帧若只是预测（低功耗模式下每 4 帧有 3 帧如此），则用该
+    # 轨迹上一次真实检出的置信度。老记录没有这个字段，界面如实说没记。
+    alarm_confidence: float | None = None
 
     def __post_init__(self) -> None:
         if self.alarm_screenshot_path and not self.screenshot_path:
