@@ -1,6 +1,13 @@
+# 运行依赖。安装：pip install -r requirements.txt -c constraints.txt
+# （-c 是可选的版本锁定；不给就会装到当时的最新版，见 constraints.txt 的说明。）
+#
+# 版本由 constraints.txt 钉住，这里只写包名。
 numpy
 opencv-python
-PySide6
+# 只装 Essentials：本程序只用 QtCore/QtGui/QtWidgets，`import PySide6` 照常可用，
+# 而元包 PySide6 会连带装上 PySide6-Addons（Qt3D / Charts / WebEngine 等几百 MB）。
+# 打包版走的也是 Essentials，两边一致才不会出现「源码模式能跑、打包版少模块」。
+PySide6-Essentials
 supervision
 trackers
 ultralytics

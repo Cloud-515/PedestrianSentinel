@@ -29,7 +29,11 @@ def configure_logging(log_file: Path = LOG_FILE) -> None:
             log_file,
             maxBytes=5 * 1024 * 1024,
             backupCount=3,
-            encoding="utf-8",
+            # 带 BOM 的 UTF-8：日志是给人在 Windows 上直接打开看的，而 Windows
+            # PowerShell 5.1 的 Get-Content 默认按 ANSI 解码，无 BOM 的 UTF-8 中文
+            # 会整片变成乱码（排查现场问题时很容易被当成程序在乱写日志）。
+            # 其它读日志的工具和编码探测都能正常处理 BOM。
+            encoding="utf-8-sig",
         )
         setattr(file_handler, "_pp_human_marker", _LOG_HANDLER_MARKER)
         file_handler.setFormatter(formatter)

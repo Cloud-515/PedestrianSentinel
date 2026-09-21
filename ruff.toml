@@ -1,0 +1,47 @@
+# ruff 配置。
+#
+# 为什么是 ruff.toml 而不是 pyproject.toml：这个项目用 PyInstaller 发布、不做 pip
+# 安装，pytest.ini 里已经写明「不和打包工具链产生任何牵连」。ruff 单独一个文件，
+# 与打包链路无关。
+#
+# 规则集刻意收得很窄：只开**能抓真 bug** 的那几类，不做风格改造、也不追 unused-noqa。
+# 刚接入时 `ruff check .` 是全绿的，CI 才有意义；一旦引入需要改几十处的规则集，结果
+# 只会是所有人都学会忽略它。
+#
+# 保留这些规则的理由（都是真抓到过问题的）：
+#   F821 —— main.py 里 _log_startup_banner 用了没导入的 app_paths，每次启动都会
+#           NameError；而自检不跑那条路径，靠跑测试发现不了。
+#   BLE001 —— 裸 except 必须是有意的。注意它对「捕获后记录了异常」的写法不报警
+#           （见下），所以本仓库里那些 `except Exception: logger.exception(...)`
+#           不需要任何标注。
+#   F401 —— 清掉了几个真的没用的导入（如 detection_engine 里的 pathlib）。
+#
+# 不启用 RUF100（unused-noqa）：BLE001 的判定随 ruff 版本变过，开启后会让仓库里
+# 那些「多余的 noqa」反复报错与消失，纯噪音。留着它们也没有害处。
+target-version = "py310"
+
+# 打包中间产物与虚拟环境。发布目录里的东西不是源码。
+# 注意：这一项必须写在下面的表头之前 —— TOML 里表头之后的所有键都属于那张表。
+extend-exclude = [
+    ".venv",
+    ".venv-build",
+    ".venv-openvino",
+    "execode/build",
+    "execode/dist",
+    "artifacts",
+    "benchmarks",
+]
+
+[lint]
+select = [
+    "E4",   # import 相关的 pycodestyle 错误
+    "E7",   # 语句层面的 pycodestyle 错误（如多个语句挤一行）
+    "E9",   # 语法层面的错误
+    "F",    # pyflakes：未定义名、未使用导入/变量等
+    "BLE",  # 裸 except
+]
+
+# tools/ 下的脚本是独立运行的：它们必须先 sys.path.insert(0, 项目根) 才能 import
+# 项目模块，所以那里的导入注定不在文件顶部。
+[lint.per-file-ignores]
+"tools/*.py" = ["E402"]

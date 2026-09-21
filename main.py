@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
+import re
 import sys
 import traceback
 from collections.abc import Callable
@@ -263,6 +265,130 @@ def _deep_probe_audio(record: Callable[[str, object], None]) -> None:
     record("告警音播放", "ok（PlaySound 同步播完未报错）")
 
 
+def _probe_assets(
+    record: Callable[[str, object], None],
+    failures: list[str],
+) -> None:
+    """按清单校验发布资源（权重、告警音）。
+
+    低功耗的 OpenVINO 模型一直有 sha256 校验，而这两个文件没有：被换掉、拷坏、解压
+    截断，程序都照样加载，只是「检测不出人」或「报警没声音」—— 都不报错，只让人以为
+    程序坏了。这里补上，让「我换了个权重」和「权重被悄悄改坏」都必须被看见。
+
+    资源在说明里是允许用户替换的，替换后需要重新生成清单
+    （``tools\\write_asset_manifest.py``），否则这里会失败 —— 那是刻意的。
+    """
+    import hashlib
+
+    import app_paths
+
+    manifest_path = app_paths.resource("assets/asset_manifest.json", "asset_manifest.json")
+    if not manifest_path.is_file():
+        failures.append(f"缺少资源清单: {manifest_path}（用 tools\\write_asset_manifest.py 生成）")
+        record("资源清单", f"FAIL 不存在 {manifest_path}")
+        return
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        entries = manifest["assets"]
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        failures.append(f"资源清单无法解析: {error!r}")
+        record("资源清单", f"FAIL {error!r}")
+        return
+
+    for entry in entries:
+        name = str(entry.get("name", "?"))
+        path = app_paths.resource(*[str(item) for item in entry.get("candidates", [name])])
+        if not path.is_file():
+            failures.append(f"发布资源缺失: {name}（期望位置 {path}）")
+            record(f"资源 {name}", f"FAIL 不存在 {path}")
+            continue
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        expected = str(entry.get("sha256", ""))
+        size = path.stat().st_size
+        if digest != expected:
+            failures.append(
+                f"发布资源与清单不一致: {name}（{path}）"
+                "。确认替换无误后运行 tools\\write_asset_manifest.py 重新生成清单"
+            )
+            record(f"资源 {name}", f"FAIL 哈希不符 {digest[:16]}…")
+            continue
+        record(f"资源 {name}", f"ok | {size} 字节 | sha256 {digest[:16]}…")
+
+
+def _probe_version(
+    record: Callable[[str, object], None],
+    failures: list[str],
+) -> None:
+    """比对运行期版本号与 exe 版本资源。
+
+    ``app_version.VERSION`` 与 ``execode/version_info.txt`` 是两份东西（后者只在打包
+    时被 PyInstaller 读走），所以必须有一处比对，否则「exe 属性写着 1.0.0、日志里写着
+    1.1.0」这种岔子只有交付之后才会被发现。
+    """
+    import app_paths
+    import app_version
+
+    record("版本", app_version.VERSION)
+
+    if app_paths.IS_FROZEN:
+        packaged = _packaged_version()
+        if packaged is None:
+            record("exe 版本资源", "无法读取（跳过比对）")
+            return
+        record("exe 版本资源", packaged)
+        if packaged != app_version.VERSION:
+            failures.append(
+                f"版本号不一致: exe 里是 {packaged}，代码里是 {app_version.VERSION}"
+            )
+        return
+
+    version_file = Path(__file__).resolve().parent / "execode" / "version_info.txt"
+    if not version_file.is_file():
+        record("version_info.txt", "缺失（源码模式下跳过比对）")
+        return
+    match = re.search(r"filevers=\(([^)]*)\)", version_file.read_text(encoding="utf-8"))
+    if match is None:
+        record("version_info.txt", "FAIL 找不到 filevers")
+        failures.append(f"{version_file} 里找不到 filevers")
+        return
+    parts = [item.strip() for item in match.group(1).split(",")]
+    declared = ".".join(parts[:3])
+    record("version_info.txt", declared)
+    if declared != app_version.VERSION:
+        failures.append(
+            f"版本号不一致: version_info.txt 里是 {declared}，"
+            f"app_version.VERSION 是 {app_version.VERSION}"
+        )
+
+
+def _packaged_version() -> str | None:
+    """读 exe 自己的版本资源（FileVersion）。读不到就返回 None，不判失败。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except ImportError:
+        return None
+    try:
+        path = sys.executable
+        size = ctypes.windll.version.GetFileVersionInfoSizeW(path, None)  # type: ignore[attr-defined]
+        if not size:
+            return None
+        buffer = ctypes.create_string_buffer(size)
+        if not ctypes.windll.version.GetFileVersionInfoW(path, 0, size, buffer):  # type: ignore[attr-defined]
+            return None
+        value = ctypes.c_void_p()
+        length = wintypes.UINT()
+        if not ctypes.windll.version.VerQueryValueW(  # type: ignore[attr-defined]
+            buffer, "\\", ctypes.byref(value), ctypes.byref(length)
+        ):
+            return None
+        fixed = ctypes.cast(value, ctypes.POINTER(ctypes.c_uint32 * 4)).contents
+        return f"{fixed[0]}.{fixed[1]}.{fixed[2]}"
+    except Exception:  # noqa: BLE001 - 读不到版本资源不该让自检失败
+        logger.exception("读取 exe 版本资源失败")
+        return None
+
+
 def _run_selftest(argv: list[str]) -> int:
     """不建窗口地自检一遍依赖与资源路径，供打包后的构建脚本验收。
 
@@ -384,6 +510,8 @@ def _run_selftest(argv: list[str]) -> int:
         return cache_dir
 
     step("import main_window", _probe_main_window)
+    step("版本比对", lambda: _probe_version(record, failures))
+    step("发布资源", lambda: _probe_assets(record, failures))
     step("alarm wav", _probe_alarm_wav)
     model_path = step("yolo11n.pt", _probe_model)
     step("openvino int8 dir", _probe_low_power_dir)
@@ -447,6 +575,25 @@ def _run_selftest(argv: list[str]) -> int:
     return 1 if failures else 0
 
 
+def _log_startup_banner() -> None:
+    """把「哪一版、跑在哪、数据写到哪」记进日志。
+
+    现场支持的第一个问题永远是这两句：你装的是哪一版、配置在哪。以前日志里只有
+    「Loading model: …」，版本号只存在于 exe 的属性对话框里，界面和日志都看不到。
+    """
+    import app_paths
+    import app_version
+
+    logger.info(
+        "行人警戒区域监控 v%s 启动 | frozen=%s | exe=%s | 程序目录=%s | 数据目录=%s",
+        app_version.VERSION,
+        app_paths.IS_FROZEN,
+        sys.executable,
+        app_paths.APP_DIR,
+        app_paths.data_dir(),
+    )
+
+
 def main() -> int:
     configure_logging()
     _install_excepthook()
@@ -456,6 +603,8 @@ def main() -> int:
 
     if "--selftest" in sys.argv[1:]:
         return _run_selftest(sys.argv[1:])
+
+    _log_startup_banner()
 
     try:
         from PySide6.QtWidgets import QApplication

@@ -33,7 +33,6 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSlider,
     QSpinBox,
-    QStyledItemDelegate,
     QSplitter,
     QStackedWidget,
     QTableWidget,
@@ -53,13 +52,30 @@ from models import (
     DEFAULT_RETENTION_MB,
     MAX_RETENTION_DAYS,
     MAX_RETENTION_MB,
+    NOTIFICATION_FORMAT_GENERIC,
+    NOTIFICATION_FORMAT_TEXT_BOT,
     AlarmEvent,
     AppConfig,
     ZoneDefinition,
     ZoneProfile,
 )
+from notifications import (
+    NotificationDispatcher,
+    NotificationResult,
+    NotificationSettings,
+    build_job,
+    synthetic_event,
+)
 from profile_store import ProfileStore
 from retention import RetentionPolicy, directory_usage, format_size, prune_screenshots
+from settings_binding import (
+    FieldBinding,
+    SettingsBinder,
+    checkbox_field,
+    combo_field,
+    line_edit_field,
+    spinbox_field,
+)
 from source_history import add_history_entry
 from video_source import VideoSourceSpec
 from video_widget import VideoWidget
@@ -247,6 +263,8 @@ class SettingsPanel(QGroupBox):
     cpu_low_power_changed = Signal(bool)
     retention_changed = Signal(int, int)
     prune_requested = Signal()
+    notification_changed = Signal()
+    notification_test_requested = Signal()
 
     def __init__(self) -> None:
         super().__init__("设置")
@@ -262,11 +280,101 @@ class SettingsPanel(QGroupBox):
         layout.addWidget(self.monitor_radio)
         layout.addWidget(self.cpu_low_power_cb)
         layout.addWidget(self._build_retention_box())
+        layout.addWidget(self._build_notification_box())
         layout.addStretch()
         self.back_btn = QPushButton("返回主页")
         layout.addWidget(self.back_btn)
         self.video_radio.toggled.connect(self._emit_mode)
         self.cpu_low_power_cb.toggled.connect(self.cpu_low_power_changed)
+
+    def field_bindings(self) -> list[FieldBinding]:
+        """本面板里那些「纯粹的设置项」的绑定表。
+
+        仅限没有副作用的控件；模式单选、推理设备、播放控件各有自己的逻辑，不在此列
+        （理由见 settings_binding 模块的说明）。
+        """
+        return [
+            checkbox_field("cpu_low_power_preset", self.cpu_low_power_cb),
+            spinbox_field("screenshot_retention_days", self.retention_days_spin),
+            spinbox_field("screenshot_retention_mb", self.retention_mb_spin),
+            checkbox_field("notification_enabled", self.notification_enabled_cb),
+            line_edit_field("notification_url", self.notification_url_edit),
+            combo_field("notification_format", self.notification_format_combo),
+            checkbox_field(
+                "notification_include_screenshot", self.notification_screenshot_cb
+            ),
+        ]
+
+    def _build_notification_box(self) -> QGroupBox:
+        box = QGroupBox("远程通知")
+        box.setToolTip(
+            "报警时向下面的地址 POST 一条 JSON。默认关闭。\n"
+            "发出的内容包括区域名称、目标 ID、时间与视频源；勾选「附带取证截图」后\n"
+            "还会把那一帧的画面（base64）一并发出，请注意接收方能看到什么。"
+        )
+        layout = QVBoxLayout(box)
+
+        self.notification_enabled_cb = QCheckBox("报警时发送远程通知")
+        layout.addWidget(self.notification_enabled_cb)
+
+        url_row = QHBoxLayout()
+        url_row.addWidget(QLabel("地址:"))
+        self.notification_url_edit = QLineEdit()
+        self.notification_url_edit.setPlaceholderText("https://…（群机器人地址或你自己的接口）")
+        url_row.addWidget(self.notification_url_edit, 1)
+        layout.addLayout(url_row)
+
+        format_row = QHBoxLayout()
+        format_row.addWidget(QLabel("格式:"))
+        self.notification_format_combo = QComboBox()
+        for value, label in (
+            (NOTIFICATION_FORMAT_GENERIC, "通用 JSON"),
+            (NOTIFICATION_FORMAT_TEXT_BOT, "企业微信 / 钉钉文本"),
+        ):
+            self.notification_format_combo.addItem(label, value)
+        self.notification_format_combo.setToolTip(
+            "通用 JSON：本程序自己的字段（text/event/screenshot_base64）。\n"
+            "企业微信 / 钉钉文本：{\"msgtype\":\"text\",\"text\":{\"content\":…}}，"
+            "这种机器人只收文本，附不了图。"
+        )
+        format_row.addWidget(self.notification_format_combo, 1)
+        layout.addLayout(format_row)
+
+        self.notification_screenshot_cb = QCheckBox("附带取证截图（base64，≤1 MB）")
+        layout.addWidget(self.notification_screenshot_cb)
+
+        self.notification_status_label = QLabel("未配置")
+        self.notification_status_label.setStyleSheet("color: #7A8A99; font-size: 11px;")
+        self.notification_status_label.setWordWrap(True)
+        layout.addWidget(self.notification_status_label)
+
+        self.notification_test_btn = QPushButton("发送测试")
+        self.notification_test_btn.setToolTip("立刻按当前设置发一条测试通知，不写报警记录。")
+        self.notification_test_btn.clicked.connect(self.notification_test_requested)
+        layout.addWidget(self.notification_test_btn)
+
+        self.notification_enabled_cb.toggled.connect(self._emit_notification)
+        self.notification_url_edit.textChanged.connect(self._emit_notification)
+        self.notification_format_combo.currentIndexChanged.connect(self._emit_notification)
+        self.notification_screenshot_cb.toggled.connect(self._emit_notification)
+        return box
+
+    def _emit_notification(self, value: object = None) -> None:
+        del value
+        self.notification_changed.emit()
+
+    def set_notification_status(self, text: str, *, ok: bool | None = None) -> None:
+        color = {True: "#4CAF50", False: "#E53935", None: "#7A8A99"}[ok]
+        self.notification_status_label.setStyleSheet(f"color: {color}; font-size: 11px;")
+        self.notification_status_label.setText(text)
+
+    def set_notification_controls_enabled(self, enabled: bool) -> None:
+        # 地址与格式在运行中也能改：改完下一条报警就用新设置，不必停下检测。
+        self.notification_enabled_cb.setEnabled(enabled)
+        self.notification_url_edit.setEnabled(enabled)
+        self.notification_format_combo.setEnabled(enabled)
+        self.notification_screenshot_cb.setEnabled(enabled)
+        self.notification_test_btn.setEnabled(enabled)
 
     def _build_retention_box(self) -> QGroupBox:
         box = QGroupBox("取证留存")
@@ -731,6 +839,9 @@ class EventPanel(QGroupBox):
 
 
 class MainWindow(QMainWindow):
+    # 通知结果是从发送线程回调回来的，必须走信号排队到 GUI 线程再碰控件。
+    notification_result = Signal(bool, str)
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("行人警戒区域监控")
@@ -765,10 +876,15 @@ class MainWindow(QMainWindow):
         self.playback_panel = PlaybackPanel()
         self.event_panel = EventPanel()
 
+        self._settings_binder = SettingsBinder(self.settings_panel.field_bindings())
+        self.notification_dispatcher = NotificationDispatcher()
+        self.notification_result.connect(self._on_notification_result)
+
         self._build_layout()
         self._load_controls()
         self._connect_signals()
         self._load_event_history()
+        self._log_effective_settings()
         self._refresh_storage_usage()
         self._retention_timer.start()
         # 启动时先让窗口画出来再扫目录：目录很大时这一步不该拖慢启动。放在事件循环
@@ -860,12 +976,9 @@ class MainWindow(QMainWindow):
             self.source_panel.set_status(
                 f"检测到 {len(device_options) - 1} 个可用 GPU"
             )
-        self.settings_panel.set_cpu_low_power(self.config.cpu_low_power_preset)
+        self._settings_binder.load(self.config)
         self._update_cpu_low_power_availability()
-        self.settings_panel.set_retention(
-            self.config.screenshot_retention_days,
-            self.config.screenshot_retention_mb,
-        )
+        self._refresh_notification_status()
         self.playback_panel.loop_cb.setChecked(self.config.loop_playback)
         speed_value = max(1, min(16, round(self.config.playback_speed / 0.25)))
         self.playback_panel.speed_slider.setValue(speed_value)
@@ -888,9 +1001,11 @@ class MainWindow(QMainWindow):
             lambda: self.sidebar_pages.setCurrentIndex(0)
         )
         self.settings_panel.mode_changed.connect(self._apply_operation_mode)
-        self.settings_panel.cpu_low_power_changed.connect(self._on_cpu_low_power_changed)
-        self.settings_panel.retention_changed.connect(self._on_retention_changed)
+        self.settings_panel.cpu_low_power_changed.connect(self._on_setting_changed)
+        self.settings_panel.retention_changed.connect(self._on_setting_changed)
+        self.settings_panel.notification_changed.connect(self._on_setting_changed)
         self.settings_panel.prune_requested.connect(self._prune_now)
+        self.settings_panel.notification_test_requested.connect(self._send_test_notification)
         self.zone_panel.profile_new_btn.clicked.connect(self._new_profile)
         self.zone_panel.profile_save_btn.clicked.connect(self._save_profile)
         self.zone_panel.profile_save_as_btn.clicked.connect(self._save_profile_as)
@@ -976,7 +1091,8 @@ class MainWindow(QMainWindow):
         dialog.setText(message)
         save_button = dialog.addButton("保存并继续", QMessageBox.ButtonRole.AcceptRole)
         discard_button = dialog.addButton("放弃修改", QMessageBox.ButtonRole.DestructiveRole)
-        cancel_button = dialog.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        # 「取消」按钮只需要出现在对话框里；它不是保存/放弃之外的那种选择，所以不接引用。
+        dialog.addButton("取消", QMessageBox.ButtonRole.RejectRole)
         dialog.exec()
         clicked = dialog.clickedButton()
         if clicked is save_button:
@@ -1238,14 +1354,108 @@ class MainWindow(QMainWindow):
         )
         self._schedule_config_save()
 
-    def _on_cpu_low_power_changed(self, enabled: bool) -> None:
-        self.config.cpu_low_power_preset = enabled
+    def _on_setting_changed(self, *ignored: object) -> None:
+        """设置页里任何一项变了：同步进内存配置，再走防抖落盘。
+
+        一次性同步整组而不是逐字段处理，是因为绑定表就是这一组 —— 逐字段又要回到
+        「加一个设置改五处」的老路，而那正是绑定表要消掉的东西。
+        """
+        del ignored
+        self._settings_binder.store(self.config)
+        # 通知状态栏是「当前配置能不能发出去」的实时指示，改完就刷新。
+        self._refresh_notification_status()
         self._schedule_config_save()
 
-    def _on_retention_changed(self, days: int, megabytes: int) -> None:
-        self.config.screenshot_retention_days = days
-        self.config.screenshot_retention_mb = megabytes
-        self._schedule_config_save()
+    def _log_effective_settings(self) -> None:
+        """把这次真正生效的设置记进日志。
+
+        排查现场问题时，「他到底配了什么」和「他装的是哪一版」一样重要，而这两件事
+        以前都只能靠问。这里记的是内存里生效的那份配置，不是文件内容 —— 配置读坏而
+        回落默认值的情况也就能一眼看出来。
+        """
+        logger.info(
+            "生效设置: 模式=%s 视频源=%s 设备=%s 低功耗=%s 模型=%s "
+            "留存=%s天/%sMB 远程通知=%s 配置可信=%s",
+            self.config.operation_mode,
+            self.source_panel.get_source(),
+            self.source_panel.selected_device(),
+            self.config.cpu_low_power_preset,
+            self.config.model_path,
+            self.config.screenshot_retention_days,
+            self.config.screenshot_retention_mb,
+            (
+                f"已启用 → {self.config.notification_url} "
+                f"({self.config.notification_format})"
+                if self.config.notification_enabled
+                else "关闭"
+            ),
+            getattr(self, "_config_trusted", False),
+        )
+
+    def _notification_settings(self) -> NotificationSettings:
+        return NotificationSettings(
+            enabled=self.config.notification_enabled,
+            url=self.config.notification_url,
+            payload_format=self.config.notification_format,
+            include_screenshot=self.config.notification_include_screenshot,
+        )
+
+    def _has_usable_notification(self) -> bool:
+        return self._notification_settings().usable
+
+    def _refresh_notification_status(self) -> None:
+        """没在发送时，通知状态栏显示当前配置是否可用。"""
+        settings = self._notification_settings()
+        if not settings.enabled:
+            self.settings_panel.set_notification_status("已关闭（不会发出任何数据）")
+        elif not settings.usable:
+            self.settings_panel.set_notification_status(
+                "已启用，但地址为空或不是 http(s) 地址 —— 报警时发不出去",
+                ok=False,
+            )
+        else:
+            detail = "附带截图" if settings.include_screenshot else "不带截图"
+            self.settings_panel.set_notification_status(
+                f"已启用 → {settings.url}（{detail}）", ok=True
+            )
+
+    def _notify_alarm(self, event: AlarmEvent) -> None:
+        settings = self._notification_settings()
+        job = build_job(event, settings)
+        if job is None:
+            if settings.enabled:
+                # 「开了但发不出去」必须说出来。这是最危险的一种失败：报警响了、记录
+                # 写了，操作员以为通知也发了，实际上什么都没出去。
+                logger.warning(
+                    "报警通知未发出：通知已启用但地址不可用（%r）", settings.url
+                )
+                self.source_panel.set_status(
+                    "警报（远程通知未发出：请检查通知地址）"
+                )
+                self._refresh_notification_status()
+            return
+        self.notification_dispatcher.notify(job, on_result=self._on_notification_result_async)
+
+    def _on_notification_result_async(self, result: NotificationResult) -> None:
+        """在发送线程里被调用：只允许发信号，不能碰控件。"""
+        self.notification_result.emit(result.ok, result.message)
+
+    def _on_notification_result(self, ok: bool, message: str) -> None:
+        self.source_panel.set_status(f"远程通知：{message}")
+        self.settings_panel.set_notification_status(message, ok=ok)
+
+    def _send_test_notification(self) -> None:
+        settings = self._notification_settings()
+        if not settings.usable:
+            self._refresh_notification_status()
+            self.source_panel.set_status("远程通知：请先启用并填写 http(s) 地址")
+            return
+        # 测试通知只在本机内存里造一条假事件，不写 events\、不发声、不进表格。
+        job = build_job(synthetic_event(), settings)
+        if job is None:
+            return
+        self.settings_panel.set_notification_status("正在发送测试通知…")
+        self.notification_dispatcher.notify(job, on_result=self._on_notification_result_async)
 
     def _retention_policy(self) -> RetentionPolicy:
         return RetentionPolicy(
@@ -1481,6 +1691,9 @@ class MainWindow(QMainWindow):
         self.source_panel.set_status(
             f"警报：目标 {event.track_id} 进入区域“{event.zone_name}”"
         )
+        # 通知不看 _alarm_overlay_enabled（那只是界面上的红条），也不按运行模式过滤：
+        # 闯入就是闯入，撤防时压根不会有事件走到这里。
+        self._notify_alarm(event)
 
     def _toggle_pause(self) -> None:
         if self.worker is None or not self.worker.isRunning() or not self._is_file_mode():
@@ -1542,11 +1755,8 @@ class MainWindow(QMainWindow):
         self.config.loop_playback = self.playback_panel.loop_cb.isChecked()
         self.config.playback_speed = self.playback_panel.speed()
         self.config.inference_device = self.source_panel.selected_device()
-        self.config.cpu_low_power_preset = self.settings_panel.cpu_low_power_cb.isChecked()
-        (
-            self.config.screenshot_retention_days,
-            self.config.screenshot_retention_mb,
-        ) = self.settings_panel.retention()
+        # 设置页那一组按绑定表整组回写（低功耗、留存、远程通知都在表里）。
+        self._settings_binder.store(self.config)
         self.config.zones = self.zones
         self.config.display_to_original_scale = self.video_widget.coordinate_mapping()
         try:
@@ -1556,6 +1766,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: object) -> None:
         self._save_timer.stop()
+        self._retention_timer.stop()
         self._save_config()
         if self.worker is not None and self.worker.isRunning():
             self.worker.stop()
@@ -1567,4 +1778,6 @@ class MainWindow(QMainWindow):
                 )
                 event.ignore()
                 return
+        # 给已经入队的通知一点时间发完；发不完的那几条只影响通知，本地记录与截图都在。
+        self.notification_dispatcher.close()
         event.accept()

@@ -27,6 +27,7 @@ from PySide6.QtWidgets import QApplication
 
 import main_window
 from main_window import MainWindow
+from models import AlarmEvent
 
 
 class FakeWorker(QObject):
@@ -203,6 +204,138 @@ class MainWindowRetentionTests(unittest.TestCase):
         text = self.window.settings_panel.storage_label.text()
         self.assertIn("已存 2 张", text)
         self.assertIn("3 KB", text)
+
+
+class RecordingDispatcher:
+    """替掉真正的发送器：只记录被交出去的作业，不碰网络。"""
+
+    def __init__(self) -> None:
+        self.jobs: list[object] = []
+        self.callbacks: list[object] = []
+        self.closed = False
+
+    def notify(self, job: object, on_result: object = None) -> bool:
+        self.jobs.append(job)
+        self.callbacks.append(on_result)
+        return True
+
+    def close(self, timeout: float = 2.0) -> None:
+        self.closed = True
+
+
+class MainWindowNotificationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.base = Path(temporary.name)
+        for name, path in (
+            ("CONFIG_PATH", self.base / "config.json"),
+            ("EVENTS_DIR", self.base / "events"),
+            ("PROFILES_DIR", self.base / "profiles"),
+        ):
+            patcher = patch.object(main_window, name, path)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.window = MainWindow()
+        self.dispatcher = RecordingDispatcher()
+        self.window.notification_dispatcher = self.dispatcher
+
+    def _enable(self, url: str = "https://example.com/hook", **extra: object) -> None:
+        panel = self.window.settings_panel
+        panel.notification_url_edit.setText(url)
+        for name, value in extra.items():
+            getattr(panel, name).setChecked(value)
+        panel.notification_enabled_cb.setChecked(True)
+
+    def _alarm(self) -> AlarmEvent:
+        return AlarmEvent(
+            source="rtsp://camera/live",
+            zone_name="北侧入口",
+            track_id="12",
+            entered_at_seconds=1.0,
+            alarm_at_seconds=3.0,
+            wall_time="2026-09-21 10:00:00",
+            operation_mode="monitor",
+        )
+
+    def test_settings_round_trip_through_the_config_file(self) -> None:
+        self._enable(url="https://example.com/hook", notification_screenshot_cb=True)
+        self.window.settings_panel.notification_format_combo.setCurrentIndex(
+            self.window.settings_panel.notification_format_combo.findData("text_bot")
+        )
+
+        self.window._save_config()
+
+        saved = json.loads((self.base / "config.json").read_text(encoding="utf-8"))
+        self.assertTrue(saved["notification_enabled"])
+        self.assertEqual(saved["notification_url"], "https://example.com/hook")
+        self.assertEqual(saved["notification_format"], "text_bot")
+        self.assertTrue(saved["notification_include_screenshot"])
+
+        reopened = MainWindow()
+        panel = reopened.settings_panel
+        self.assertTrue(panel.notification_enabled_cb.isChecked())
+        self.assertEqual(panel.notification_url_edit.text(), "https://example.com/hook")
+        self.assertEqual(panel.notification_format_combo.currentData(), "text_bot")
+        self.assertTrue(panel.notification_screenshot_cb.isChecked())
+
+    def test_alarm_is_dispatched_when_enabled(self) -> None:
+        self._enable()
+
+        self.window._on_alarm_event(self._alarm())
+
+        self.assertEqual(len(self.dispatcher.jobs), 1)
+        job = self.dispatcher.jobs[0]
+        self.assertEqual(job.url, "https://example.com/hook")
+        self.assertIn("北侧入口", job.body.decode("utf-8"))
+
+    def test_no_notification_when_disabled(self) -> None:
+        self.window._on_alarm_event(self._alarm())
+
+        self.assertEqual(self.dispatcher.jobs, [])
+
+    def test_enabled_but_url_missing_does_not_dispatch(self) -> None:
+        self.window.settings_panel.notification_enabled_cb.setChecked(True)
+
+        self.window._on_alarm_event(self._alarm())
+
+        self.assertEqual(self.dispatcher.jobs, [])
+        self.assertIn(
+            "地址为空", self.window.settings_panel.notification_status_label.text()
+        )
+
+    def test_test_button_dispatches_a_marked_test_notification(self) -> None:
+        self._enable()
+
+        self.window._send_test_notification()
+
+        self.assertEqual(len(self.dispatcher.jobs), 1)
+        body = json.loads(self.dispatcher.jobs[0].body)
+        self.assertIn("测试", body["text"])
+        # 测试通知不能写进报警记录，也不该在表格里冒出来。
+        self.assertEqual(self.window.event_panel.table.rowCount(), 0)
+
+    def test_test_button_without_a_usable_url_explains_instead_of_sending(self) -> None:
+        self.window._send_test_notification()
+
+        self.assertEqual(self.dispatcher.jobs, [])
+        self.assertIn("请先启用", self.window.source_panel.status_label.text())
+
+    def test_result_is_shown_in_the_settings_panel(self) -> None:
+        self.window._on_notification_result(False, "通知发送失败：连接失败")
+
+        label = self.window.settings_panel.notification_status_label
+        self.assertIn("连接失败", label.text())
+        self.assertIn("连接失败", self.window.source_panel.status_label.text())
+
+    def test_closing_the_window_closes_the_dispatcher(self) -> None:
+        self.window.close()
+
+        self.assertTrue(self.dispatcher.closed)
 
 
 if __name__ == "__main__":

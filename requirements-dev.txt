@@ -3,3 +3,12 @@
 #
 # pytest 需要 >= 7：pytest.ini 里的 pythonpath 选项是 7.0 引入的。
 pytest>=7.0
+
+# tools/benchmark_cpu_profiles.py 用它读进程 CPU 占用与线程数。
+# 以前这份清单里没有它，而《低功耗部署.md》又叫用户装完 requirements-low-power
+# 就直接跑那个脚本 —— 结果是 ModuleNotFoundError，一上手就卡住。
+psutil>=5.9
+
+# 静态检查（CI 与 run_tests.ps1 都用它）。钉住版本：ruff 新增规则会让 CI 在毫无
+# 代码改动的情况下变红，升级应当是件有意识的事。
+ruff==0.16.8

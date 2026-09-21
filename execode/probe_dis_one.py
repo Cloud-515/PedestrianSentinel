@@ -39,7 +39,7 @@ def main(paths: list[str]) -> int:
             continue
         try:
             count = sum(1 for _ in iterate_instructions(code))
-        except Exception:
+        except Exception:  # noqa: BLE001 - 探针要计数失败，不能因为异常中断整轮扫描
             print(f"  FAIL    {path.name}")
             print("    " + traceback.format_exc().strip().splitlines()[-1])
             failures += 1

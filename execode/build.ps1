@@ -156,20 +156,29 @@ if ($Setup) {
 
     Invoke-Pip install --upgrade pip wheel
 
+    # 依赖清单与版本锁定：requirements.txt 说「要什么」，constraints.txt 说「要哪个
+    # 版本」。以前这里是手写一串包名、完全绕开 requirements，于是同一个 v1.1.0 在半年
+    # 后重建会装上那时的 ultralytics/supervision —— 装出来的包和验收过的不是一回事。
+    $RequirementsFile = Join-Path $ProjectRoot "requirements.txt"
+    $ConstraintsFile = Join-Path $ProjectRoot "constraints.txt"
+    if (-not (Test-Path -LiteralPath $RequirementsFile)) { throw "找不到 $RequirementsFile" }
+    if (-not (Test-Path -LiteralPath $ConstraintsFile)) { throw "找不到 $ConstraintsFile" }
+
     # 关键一步：CPU 版 torch。默认 PyPI 装的是 +cu121，torch\lib 里 4.7 GB 全是
     # 本程序用不到的 CUDA DLL。这个索引同时也托管 torch 自己的依赖，可单独使用。
     Write-Host "   [1/4] torch CPU 版（几百 MB，慢）" -ForegroundColor DarkGray
-    Invoke-Pip install torch==2.5.1 torchvision==0.20.1 `
+    Invoke-Pip install torch torchvision `
+        -c $ConstraintsFile `
         --index-url https://download.pytorch.org/whl/cpu
 
-    # 只要 Essentials：PySide6 元包会连带装 PySide6_Addons
-    #（Qt3D / Charts / WebEngine / DataVisualization，几百 MB），本程序只用
-    # QtCore/QtGui/QtWidgets。装 Essentials 后 `import PySide6` 照常可用。
-    Write-Host "   [2/4] PySide6_Essentials" -ForegroundColor DarkGray
-    Invoke-Pip install PySide6_Essentials==6.11.1
+    # 这一步就把推理依赖、界面与工具链都装齐（requirements.txt 里写的是
+    # PySide6-Essentials 而不是元包，元包会连带几百 MB 的 Addons）。openvino 与
+    # pyinstaller 单独装：它们只在这条打包链路里需要，不是程序运行依赖。
+    Write-Host "   [2/4] 运行依赖（requirements.txt + constraints.txt）" -ForegroundColor DarkGray
+    Invoke-Pip install -r $RequirementsFile -c $ConstraintsFile
 
-    Write-Host "   [3/4] 推理与打包依赖" -ForegroundColor DarkGray
-    Invoke-Pip install numpy supervision trackers ultralytics openvino==2024.6.0 pyinstaller
+    Write-Host "   [3/4] 推理后端与打包工具" -ForegroundColor DarkGray
+    Invoke-Pip install openvino pyinstaller -c $ConstraintsFile
 
     # ultralytics 的元数据按名字要求 opencv-python，所以 headless 只能事后替换：
     # 先卸掉带 GUI 的版本，再用 --no-deps 装 headless（否则 pip 会把它解析回来）。
@@ -178,7 +187,7 @@ if ($Setup) {
     # 来和 PySide6 抢。
     Write-Host "   [4/4] 换用 opencv-python-headless" -ForegroundColor DarkGray
     & $VenvPython -m pip uninstall -y opencv-python opencv-contrib-python
-    Invoke-Pip install --no-deps opencv-python-headless
+    Invoke-Pip install --no-deps opencv-python-headless -c $ConstraintsFile
 
     Write-Host "   虚拟环境就绪" -ForegroundColor Green
 }
@@ -193,6 +202,14 @@ if (-not (Test-Path -LiteralPath $SpecFile)) {
 # 包名里的版本号。放在这儿一并挡掉，别等五分钟。
 if (-not (Test-Path -LiteralPath $VersionFile)) {
     throw "找不到版本资源文件 $VersionFile（spec 与 package.ps1 都需要它）"
+}
+# 资源清单与实际的权重/告警音对不上时，自检会在最后一步判失败 —— 那时候 PyInstaller
+# 已经跑完五分钟了。而且替换过资源的人会看到一句「哈希不符」，不如在这里就说明白。
+# --check 只比对、不写文件。
+Write-Step "校验资源哈希清单"
+& $VenvPython (Join-Path $ProjectRoot "tools\write_asset_manifest.py") --check
+if ($LASTEXITCODE -ne 0) {
+    throw "资源清单与实际资源不一致。替换过 yolo11n.pt / warming_converted.wav 的话，请先运行 tools\write_asset_manifest.py 重新生成清单。"
 }
 
 # --- 2. 清理 --------------------------------------------------------------------
@@ -221,6 +238,9 @@ $Payload = @(
     @{ Src = Join-Path $ProjectRoot "yolo11n.pt";                        Dst = $ModelsDir; Label = "models\yolo11n.pt" }
     @{ Src = Join-Path $ProjectRoot "models\yolo11n_int8_openvino_model"; Dst = $ModelsDir; Label = "models\yolo11n_int8_openvino_model\" }
     @{ Src = Join-Path $ProjectRoot "warming_converted.wav";             Dst = $AssetsDir; Label = "assets\warming_converted.wav" }
+    # 资源哈希清单要跟着走：自检（--selftest）在打包版里也要能核对权重与告警音有没有
+    # 被换掉或拷坏 —— 这两种故障都不会报错，只会「检测不出人」或「报警没声音」。
+    @{ Src = Join-Path $ProjectRoot "asset_manifest.json";               Dst = $AssetsDir; Label = "assets\asset_manifest.json" }
 )
 foreach ($item in $Payload) {
     if (Test-Path -LiteralPath $item.Src) {

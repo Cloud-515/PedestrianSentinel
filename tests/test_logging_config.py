@@ -33,7 +33,13 @@ class LoggingConfigTests(unittest.TestCase):
                 handler.flush()
 
             self.assertTrue(log_file.exists())
-            self.assertEqual(log_file.read_text(encoding="utf-8").count("系统启动"), 1)
+            # 带 BOM 写：Windows 上默认打开日志的工具（记事本、PowerShell 5.1 的
+            # Get-Content）才不会把中文显示成乱码。
+            self.assertTrue(log_file.read_bytes().startswith(b"\xef\xbb\xbf"))
+            text = log_file.read_text(encoding="utf-8-sig")
+            self.assertEqual(text.count("系统启动"), 1)
+            # 用 utf-8 读也能读到内容（只是首行多一个 BOM 字符），不该整片乱码。
+            self.assertIn("系统启动", log_file.read_text(encoding="utf-8"))
             file_handlers = [
                 handler
                 for handler in logging.getLogger().handlers

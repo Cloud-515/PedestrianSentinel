@@ -29,6 +29,12 @@ DEFAULT_RETENTION_MB = 2048
 MAX_RETENTION_DAYS = 3650
 MAX_RETENTION_MB = 102400  # 100 GB
 
+# 远程通知的请求体形状。常量放在这里是因为它们属于配置 schema（要写进 config.json
+# 并被校验），notifications.py 再从这里取。
+NOTIFICATION_FORMAT_GENERIC = "generic"
+NOTIFICATION_FORMAT_TEXT_BOT = "text_bot"
+NOTIFICATION_FORMATS = (NOTIFICATION_FORMAT_GENERIC, NOTIFICATION_FORMAT_TEXT_BOT)
+
 _COLOR_PATTERN = re.compile(r"^#[0-9A-Fa-f]{6}$")
 
 # 界面上显示的中文状态。JSONL 里的 status 字段仍然写英文（机器读的那一份），
@@ -115,6 +121,21 @@ def _coerce_int(value: object, default: int, *, key: str) -> int:
     except (TypeError, ValueError, OverflowError):
         _warn_field(key, value, default)
         return default
+
+
+def _coerce_choice(value: object, default: str, allowed: tuple[str, ...], *, key: str) -> str:
+    """枚举型字段：只认白名单里的值。
+
+    不认识的值一律回落默认——保留原值反而更危险，下游会按「不是我认识的那一种」
+    走到没想过的分支上去。
+    """
+    if value is None:
+        return default
+    text = value if isinstance(value, str) else str(value)
+    if text in allowed:
+        return text
+    _warn_field(key, value, default)
+    return default
 
 
 def _coerce_color(value: object) -> str:
@@ -293,6 +314,11 @@ class AppConfig:
     # 取证截图留存：0 表示那条规则不生效，两条都为 0 就是从不自动清理。
     screenshot_retention_days: int = DEFAULT_RETENTION_DAYS
     screenshot_retention_mb: int = DEFAULT_RETENTION_MB
+    # 远程通知。默认关闭：往外部地址发数据必须由用户显式打开。
+    notification_enabled: bool = False
+    notification_url: str = ""
+    notification_format: str = NOTIFICATION_FORMAT_GENERIC
+    notification_include_screenshot: bool = False
     version: int = CONFIG_VERSION
 
     @classmethod
@@ -370,6 +396,22 @@ class AppConfig:
                 0,
                 MAX_RETENTION_MB,
             ),
+            notification_enabled=_coerce_bool(
+                data.get("notification_enabled"), False, key="notification_enabled"
+            ),
+            # 地址允许为空（就等于没配），所以用 optional：空字符串不是坏数据。
+            notification_url=_coerce_optional_str(data.get("notification_url")).strip(),
+            notification_format=_coerce_choice(
+                data.get("notification_format"),
+                NOTIFICATION_FORMAT_GENERIC,
+                NOTIFICATION_FORMATS,
+                key="notification_format",
+            ),
+            notification_include_screenshot=_coerce_bool(
+                data.get("notification_include_screenshot"),
+                False,
+                key="notification_include_screenshot",
+            ),
             # 读进来的就是当前结构了（迁移在上面就地做掉），所以版本号按当前值写，
             # 而不是照抄文件里的旧值。
             version=CONFIG_VERSION,
@@ -397,6 +439,10 @@ class AppConfig:
             "display_to_original_scale": self.display_to_original_scale,
             "screenshot_retention_days": self.screenshot_retention_days,
             "screenshot_retention_mb": self.screenshot_retention_mb,
+            "notification_enabled": self.notification_enabled,
+            "notification_url": self.notification_url,
+            "notification_format": self.notification_format,
+            "notification_include_screenshot": self.notification_include_screenshot,
             "zones": [zone.to_dict() for zone in self.zones],
         }
 

@@ -12,7 +12,9 @@ models/yolo/semantic/train.py 顶层 `import matplotlib.pyplot`，被 spec 排�
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
+import json
 import sys
 import tempfile
 import types
@@ -21,6 +23,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import app_paths
+import app_version
 import main
 
 # 自检会 import 的重型模块。测试里一律替成假货，跑得快，也和真环境解耦。
@@ -100,7 +103,11 @@ def _healthy_modules(root: Path) -> dict[str, object]:
 
     model_dir = root / "models" / "yolo11n_int8_openvino_model"
     model_dir.mkdir(parents=True, exist_ok=True)
-    (root / "models" / "yolo11n.pt").write_bytes(b"weights")
+    weights = root / "models" / "yolo11n.pt"
+    weights.write_bytes(b"weights")
+
+    # 资源清单要和这两个假文件对得上，否则「一切正常」的假环境自己就不健康了。
+    write_manifest(root, {"yolo11n.pt": weights, "warming_converted.wav": wav})
 
     inference_profiles = types.ModuleType("inference_profiles")
     inference_profiles.LOW_POWER_MODEL_DIR = model_dir  # type: ignore[attr-defined]
@@ -111,6 +118,29 @@ def _healthy_modules(root: Path) -> dict[str, object]:
     modules["compute_devices"] = compute_devices
 
     return modules
+
+
+def write_manifest(root: Path, assets: dict[str, Path], *, digest: str | None = None) -> Path:
+    """按给定资源写出清单。``digest`` 给定时用它当哈希（用来造出「对不上」的情况）。"""
+    entries = []
+    for name, path in assets.items():
+        candidates = (
+            [f"models/{name}", name] if name.endswith(".pt") else [f"assets/{name}", name]
+        )
+        entries.append(
+            {
+                "name": name,
+                "candidates": candidates,
+                "bytes": path.stat().st_size,
+                "sha256": digest or hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+        )
+    manifest = root / "asset_manifest.json"
+    manifest.write_text(
+        json.dumps({"version": 1, "assets": entries}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return manifest
 
 
 def _add_policy_resolution(
@@ -186,6 +216,52 @@ class FailingProbeTests(SelfTestBase):
         self.assertEqual(exit_code, 1)
         self.assertIn("RESULT: FAIL", report)
         self.assertTrue(self.report_path.is_file())
+
+    def test_asset_hash_mismatch_is_a_failure_with_a_fix_hint(self) -> None:
+        """资源被换掉或拷坏时，低功耗模型之外的这两个文件以前是没人管的。"""
+        modules = _healthy_modules(self.root)
+        write_manifest(
+            self.root,
+            {
+                "yolo11n.pt": self.root / "models" / "yolo11n.pt",
+                "warming_converted.wav": self.root / "assets" / "warming_converted.wav",
+            },
+            digest="0" * 64,
+        )
+
+        exit_code, report = self.run_selftest(modules)
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("与清单不一致", report)
+        self.assertIn("write_asset_manifest.py", report)
+
+    def test_missing_manifest_is_a_failure(self) -> None:
+        modules = _healthy_modules(self.root)
+        (self.root / "asset_manifest.json").unlink()
+
+        exit_code, report = self.run_selftest(modules)
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("缺少资源清单", report)
+
+    def test_version_drift_between_code_and_version_info_is_a_failure(self) -> None:
+        """「exe 属性写着 1.0.0、日志里写着 1.1.0」正是双份版本号最容易出的岔子。"""
+        modules = _healthy_modules(self.root)
+
+        with patch.object(app_version, "VERSION", "9.9.9"):
+            exit_code, report = self.run_selftest(modules)
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("版本号不一致", report)
+
+    def test_healthy_version_matches_the_packaging_resource(self) -> None:
+        """app_version.VERSION 与 execode/version_info.txt 必须一致，这里钉住它。"""
+        modules = _healthy_modules(self.root)
+
+        exit_code, report = self.run_selftest(modules)
+
+        self.assertEqual(exit_code, 0, report)
+        self.assertIn(app_version.VERSION, report)
 
     def test_missing_resources_are_reported_as_failures(self) -> None:
         modules = _healthy_modules(self.root)
@@ -359,6 +435,28 @@ class DeepSelfTestTests(SelfTestBase):
         self.assertIn("告警音", report)
         # 没声卡的机器上照样要把推理验完，否则一台机器只能得出半个结论。
         self.assertEqual(len(policy_probe.call_args_list), 2)
+
+
+class StartupBannerTests(unittest.TestCase):
+    """启动横幅：现场支持的第一句话就是「你装的是哪一版、配置在哪」。
+
+    它同时钉住一个真发生过的 bug：横幅里用了 app_paths 却没在函数内导入（导入写在
+    调用方 main() 里），于是每次启动都会 NameError —— 而自检不走这条路径，跑测试
+    也发现不了，是 ruff 的 F821 抓出来的。
+    """
+
+    def test_banner_logs_version_and_paths(self) -> None:
+        with self.assertLogs("main", level="INFO") as captured:
+            main._log_startup_banner()
+
+        text = "\n".join(captured.output)
+        self.assertIn(app_version.VERSION, text)
+        self.assertIn(str(app_paths.APP_DIR), text)
+
+    def test_banner_does_not_raise_in_source_mode(self) -> None:
+        """不校验日志内容，只要求它能跑完：NameError 会在这里现形。"""
+        with self.assertLogs("main", level="INFO"):
+            main._log_startup_banner()
 
 
 if __name__ == "__main__":

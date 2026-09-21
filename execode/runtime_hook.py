@@ -30,8 +30,8 @@ def _apply_frozen_environment() -> None:
             config_dir = app_paths.data("ultralytics")
             config_dir.mkdir(parents=True, exist_ok=True)
             os.environ["YOLO_CONFIG_DIR"] = str(config_dir)
-        except Exception:
-            # 拿不到可写目录就让 ultralytics 用它自己的默认位置，不影响功能。
+        except Exception:  # noqa: BLE001 - 拿不到可写目录就退回 ultralytics 的默认位置
+            # 钩子在解释器启动最早期执行，这里绝不能抛：抛出去程序连界面都起不来。
             pass
 
     # matplotlib 是被 ultralytics 硬拖进来的（models/yolo/semantic/train.py 顶层

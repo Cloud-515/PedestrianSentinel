@@ -36,7 +36,7 @@ def probe(path: Path) -> str | None:
     try:
         for _ in iterate_instructions(code):
             pass
-    except Exception:
+    except Exception:  # noqa: BLE001 - 探针就是要抓住任何失败并原样报出来
         return "dis 失败:\n" + traceback.format_exc()
     return None
 

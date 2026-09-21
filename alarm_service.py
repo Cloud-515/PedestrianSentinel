@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 import threading
+from collections.abc import Iterable
 from pathlib import Path
 from uuid import uuid4
 
@@ -13,6 +16,11 @@ import app_paths
 from models import AlarmEvent
 
 logger = logging.getLogger(__name__)
+
+# 倒读时用来识别「这一行开启了一条新会话」的结构标记，见 EventStore._starts_session。
+_OPENED_MARKER = re.compile(r'"action"\s*:\s*"opened"')
+_SCHEMA_MARKER = re.compile(r'"schema_version"\s*:')
+_LEGACY_MARKER = re.compile(r'"entered_at_seconds"\s*:')
 
 
 class AlarmPlayer:
@@ -51,6 +59,10 @@ class AlarmPlayer:
 
 
 class EventStore:
+    # 从尾部倒读时的块大小。一次会话在 JSONL 里大约 600 字节，200 条也就 120 KB，
+    # 两三次读取就够；块再大就浪费在「读了却不看」的字节上。
+    READ_CHUNK_BYTES = 64 * 1024
+
     def __init__(self, root: str | Path = "events") -> None:
         self.root = Path(root)
         self.screenshot_dir = self.root / "screenshots"
@@ -136,39 +148,118 @@ class EventStore:
         operation_mode: str | None = None,
     ) -> list[AlarmEvent]:
         with self._lock:
-            events = self._read_events_locked()
-        if operation_mode is not None:
-            events = [event for event in events if event.operation_mode == operation_mode]
-        return events[-limit:]
+            return self._load_recent_locked(limit, operation_mode)
 
-    def _read_events_locked(self) -> list[AlarmEvent]:
-        """读出全部会话。**调用方必须已经持有 self._lock。**
+    def _load_recent_locked(
+        self,
+        limit: int,
+        operation_mode: str | None,
+    ) -> list[AlarmEvent]:
+        """**调用方必须已经持有 self._lock。**"""
+        if operation_mode is None:
+            events, _ = self._scan_locked(limit)
+            return events[-limit:]
+        # 按模式过滤时，尾部那一屏里可能没几条是这个模式的，所以逐级加大预算往回
+        # 读，读到文件开头为止。这样既不用每次全量扫，也不会因为只看了尾巴而少给
+        # 用户几条记录。
+        budget = max(limit, 1)
+        while True:
+            events, read_everything = self._scan_locked(budget)
+            matching = [event for event in events if event.operation_mode == operation_mode]
+            if len(matching) >= limit or read_everything:
+                return matching[-limit:]
+            budget *= 4
 
-        折叠成一份会话列表要扫完整个文件，所以它只能有一个入口：``load_recent``
-        读它之前拿锁，``clear`` 读改写全程拿锁 —— 否则两者之间就会开出一个窗口，
-        把检测线程刚好追加的那条报警吃掉。
+    def _scan_locked(
+        self,
+        minimum_sessions: int | None = None,
+    ) -> tuple[list[AlarmEvent], bool]:
+        """扫出会话列表，返回 (会话, 是否读了整份文件)。
+
+        **调用方必须已经持有 self._lock。**
+
+        ``minimum_sessions`` 给了就从文件尾部倒着读，攒够这么多个会话起点就停：
+        报警记录是永久保留的，一台有人流量的点位一年能写几十 MB，而界面一次只看
+        得着最后 200 条。给 None 则整份读完（清理要重写整个文件，必须读全）。
         """
         if not self.log_path.exists():
-            return []
+            return [], True
+        if minimum_sessions is None:
+            with self.log_path.open("r", encoding="utf-8") as event_file:
+                return self._fold_lines(event_file), True
+        lines, read_everything = self._tail_lines(minimum_sessions)
+        return self._fold_lines(lines), read_everything
+
+    def _tail_lines(self, minimum_sessions: int) -> tuple[list[str], bool]:
+        """从文件尾部倒着读，返回 (按文件顺序排列的行, 是否读到了文件开头)。
+
+        按字节块倒读而不是「读全量再切片」：调用方要的是最后几百条，而文件可能有
+        几十 MB。用二进制模式读、按 ``\\n`` 切、把首段残行留到下一块拼接 —— 这样
+        跨块的多字节字符（中文区域名很常见）也只在拼完整之后才解码，不会被从中间
+        截断成乱码。
+        """
+        chunk_size = max(1, int(self.READ_CHUNK_BYTES))
+        collected: list[str] = []  # 倒序累积
+        sessions_seen = 0
+        with self.log_path.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            position = stream.tell()
+            pending = b""
+            while position > 0 and sessions_seen <= minimum_sessions:
+                size = min(chunk_size, position)
+                position -= size
+                stream.seek(position)
+                block = stream.read(size) + pending
+                pieces = block.split(b"\n")
+                # pieces[0] 是本块开头那半行，它的前半截在更靠前的块里，留给下一轮
+                # 拼；其余都是完整行，从后往前收。
+                pending = pieces[0]
+                for raw in reversed(pieces[1:]):
+                    line = raw.decode("utf-8", errors="replace")
+                    collected.append(line)
+                    if self._starts_session(line):
+                        sessions_seen += 1
+            if pending:
+                collected.append(pending.decode("utf-8", errors="replace"))
+        collected.reverse()
+        return collected, position == 0
+
+    @staticmethod
+    def _starts_session(line: str) -> bool:
+        """这一行是否开启了一个新会话。
+
+        会话是 opened → alarmed → closed 三行追加出来的（legacy 记录则是自成一行的
+        一条完整会话），所以「新会话」＝「opened 那一行」。
+
+        这里刻意用结构标记而不是 ``json.loads``：倒读时每收一行都要判断一次，而
+        真正需要解析的只有窗口里那几百行 —— 用标记判断能省掉一半解析。标记写了
+        ``\\s*`` 以容忍手工重排过的空白，但仍要求引号与冒号，避免把区域名里恰好
+        出现「opened」这种字样误判成会话起点（误判会让窗口提前收窄）。
+        """
+        if _OPENED_MARKER.search(line):
+            return True
+        return not _SCHEMA_MARKER.search(line) and bool(_LEGACY_MARKER.search(line))
+
+    def _fold_lines(self, lines: Iterable[str]) -> list[AlarmEvent]:
+        """把逐行记录折叠成一份会话列表（保留首次出现的顺序）。"""
         events_by_session: dict[str, AlarmEvent] = {}
         order: list[str] = []
-        with self.log_path.open("r", encoding="utf-8") as event_file:
-            for line in event_file:
-                try:
-                    payload = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                # 这个文件是纯文本，被手工编辑过就会出现非对象的行；撞上它不该让
-                # 整个报警记录打不开。
-                if not isinstance(payload, dict):
-                    continue
-                if payload.get("schema_version") == 2:
-                    self._apply_v2_payload(payload, events_by_session, order)
-                    continue
-                event = self._event_from_payload(payload)
-                events_by_session[event.session_id] = event
-                if event.session_id not in order:
-                    order.append(event.session_id)
+        for line in lines:
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            # 这个文件是纯文本，被手工编辑过就会出现非对象的行；撞上它不该让
+            # 整个报警记录打不开。
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("schema_version") == 2:
+                self._apply_v2_payload(payload, events_by_session, order)
+                continue
+            event = self._event_from_payload(payload)
+            events_by_session[event.session_id] = event
+            if event.session_id not in order:
+                order.append(event.session_id)
         return [events_by_session[session_id] for session_id in order]
 
     @staticmethod
@@ -244,10 +335,9 @@ class EventStore:
             # 「清空记录」按钮在检测运行中是可以点的 —— 中间松开锁的话，那条刚写
             # 下的报警会连同别的记录一起被这份重写覆盖掉，日志里查不到、截图却还在。
             # 这里也不再限制条数：为了清一个模式而丢掉另一个模式的更早记录，没有道理。
+            events, _ = self._scan_locked()
             retained = [
-                event
-                for event in self._read_events_locked()
-                if event.operation_mode != operation_mode
+                event for event in events if event.operation_mode != operation_mode
             ]
             self.log_path.write_text(
                 "".join(

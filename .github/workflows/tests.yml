@@ -1,0 +1,49 @@
+# 测试与静态检查。
+#
+# 这个项目原先只有手工跑测试：改动是否破坏了什么，全靠记得去跑一遍。CI 的价值不是
+# 「更工程化」，而是把两件容易被跳过的事固定下来 —— 每次改动都跑测试，以及每次都用
+# constraints.txt 里钉住的版本去装依赖（本地环境早就装好了，只有干净环境才验得出
+# 依赖清单能不能用）。
+#
+# 注意这里**不装** requirements-low-power.txt：测试用假的 openvino 模块（见
+# tests/test_inference_profiles.py），真装一个几百 MB 的运行时没有意义。
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # 同一分支连续推送时取消上一次还没跑完的任务。
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: windows-latest
+    env:
+      # 界面测试在无显示环境下跑（部分测试文件也自行设置了，这里兜一层）。
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+
+      - name: 安装依赖（按 constraints.txt 钉住的版本）
+        run: |
+          python -m pip install --upgrade pip
+          # torch 走 CPU 索引：默认 PyPI 的 +cu121 版本要多下 2 GB 多的 CUDA 库，
+          # 而测试与打包用的都是 CPU 版（与 execode/build.ps1 一致）。
+          python -m pip install torch torchvision -c constraints.txt --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r requirements.txt -r requirements-dev.txt -c constraints.txt
+
+      - name: 静态检查
+        run: python -m ruff check .
+
+      - name: 跑测试
+        run: python -m pytest -q

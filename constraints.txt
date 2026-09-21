@@ -1,0 +1,43 @@
+# 依赖版本锁定。v1.1.0 这个包就是用这一组版本构建并验收的。
+#
+# 为什么要有它：requirements*.txt 里只写了包名，于是「半年后重建同一个版本」会装上
+# 那时的 ultralytics/supervision，装出来的包和验收过的那个不是一回事 —— 而这个项目
+# 自己就吃过亏：《主要技术.md》里记着 ByteTrack 的 API 将在未来 Supervision 版本移除。
+#
+# 用法（build.ps1 已经这么调）：
+#     pip install -r requirements.txt -c constraints.txt
+#     pip install -r requirements-low-power.txt -c constraints.txt
+#
+# 注意：`-c` 只约束**被请求的**包，不会主动安装这里列出的东西。所以这份清单可以同时
+# 列出源码运行用的 opencv-python 与打包用的 opencv-python-headless。
+#
+# 升级依赖时改这里，并重新跑一遍测试与 `--selftest --deep` 再发版。
+
+# 推理与图像
+numpy==2.1.3
+ultralytics==8.4.123
+supervision==0.30.0
+trackers==2.6.0
+scipy==1.15.3
+
+# 打包版用 headless（build.ps1 会把 opencv-python 换掉），源码运行用带 GUI 的版本。
+# 两者同版本发布，所以这里一起钉住。
+opencv-python==5.0.0.93
+opencv-python-headless==5.0.0.93
+
+# 界面。源码运行装的是 PySide6 元包（requirements.txt 里写的就是它），打包版只装
+# Essentials（元包会连带几百 MB 的 Addons，本程序用不到）—— 两者版本必须一致，
+# 否则同一个代码在源码模式与打包版上跑的是不同的 Qt。
+PySide6==6.11.1
+PySide6_Essentials==6.11.1
+
+# 推理后端（CPU 低功耗预设）
+openvino==2024.6.0
+
+# 打包
+pyinstaller==6.22.2
+
+# torch 由 build.ps1 从 CPU 索引安装（默认 PyPI 的 +cu121 会白白多带 4.7 GB CUDA
+# DLL），所以这里写不带本地版本号的 2.5.1 —— 带 +cpu 后缀的写法在 PyPI 上匹配不到。
+torch==2.5.1
+torchvision==0.20.1

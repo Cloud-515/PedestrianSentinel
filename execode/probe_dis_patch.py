@@ -44,7 +44,7 @@ def scan(paths: list[Path]) -> tuple[int, int]:
         try:
             code = compile(path.read_bytes(), str(path), "exec")
             count = sum(1 for _ in iterate_instructions(code))
-        except Exception:
+        except Exception:  # noqa: BLE001 - 探针要计数失败，不能因为异常中断整轮扫描
             bad += 1
             print(f"    FAIL {path.name}: {traceback.format_exc().strip().splitlines()[-1]}")
         else:
@@ -70,7 +70,7 @@ def count_extended_arg_before_noarg(paths: list[Path]) -> int:
     for path in paths:
         try:
             walk(compile(path.read_bytes(), str(path), "exec"))
-        except Exception:
+        except Exception:  # noqa: BLE001 - 只统计能遍历的模块数，坏的跳过即可
             pass
     return total
 

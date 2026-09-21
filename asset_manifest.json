@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "assets": [
+    {
+      "name": "yolo11n.pt",
+      "candidates": [
+        "models/yolo11n.pt",
+        "yolo11n.pt"
+      ],
+      "bytes": 5613764,
+      "sha256": "0ebbc80d4a7680d14987a577cd21342b65ecfd94632bd9a8da63ae6417644ee1"
+    },
+    {
+      "name": "warming_converted.wav",
+      "candidates": [
+        "assets/warming_converted.wav",
+        "warming_converted.wav"
+      ],
+      "bytes": 244302,
+      "sha256": "90ad7bfc0412d003a42921438a8e79001bc80f2196075ad8708ecaa2db5fc328"
+    }
+  ]
+}

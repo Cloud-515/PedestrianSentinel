@@ -10,7 +10,7 @@ from PySide6.QtCore import QThread, Signal
 from alarm_service import AlarmPlayer, EventStore
 from detection_engine import DetectionEngine
 from inference_profiles import InferencePolicy
-from models import AlarmEvent, SessionTransition, ZoneDefinition
+from models import SessionTransition, ZoneDefinition
 from video_source import VideoSource, VideoSourceSpec
 
 logger = logging.getLogger(__name__)
