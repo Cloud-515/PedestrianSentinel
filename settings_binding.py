@@ -14,10 +14,13 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from PySide6.QtWidgets import QCheckBox, QComboBox, QLineEdit, QSpinBox, QWidget
+
+logger = logging.getLogger(__name__)
 
 
 def _silently(widget: QWidget, action: Callable[[], None]) -> None:
@@ -78,6 +81,16 @@ def combo_field(name: str, widget: QComboBox) -> FieldBinding:
 
     def write(value: object) -> None:
         index = widget.findData(value)
+        if index < 0:
+            # 配置里的值不在列表里。控件只能落到第 0 项，而 ``store`` 随后会把第 0 项
+            # 写回配置 —— 等于「打开设置页看了一眼，值就被改了」。这种静默改写要留痕：
+            # 枚举型字段在 models 那边本就该用 _coerce_choice 挡住列表外的值。
+            logger.warning(
+                "配置字段 %s 的值 %r 不在下拉框的选项里，控件已落到第一项 %r",
+                name,
+                value,
+                widget.itemData(0),
+            )
         _silently(widget, lambda: widget.setCurrentIndex(max(0, index)))
 
     return FieldBinding(name=name, read=read, write=write)
