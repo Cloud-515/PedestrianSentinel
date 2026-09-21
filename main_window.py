@@ -178,8 +178,18 @@ class SourcePanel(QGroupBox):
         layout.addLayout(btn_row)
 
         # 状态标签
+        # 状态栏里的文字会长得离谱（"检测运行中：CPU 低功耗模式（OpenVINO INT8，512，
+        # 每 4 帧检测），推理设备: cpu"），而不换行的 QLabel 的最小宽度就是整行文字的
+        # 宽度 —— 一条状态就能把整个右侧面板撑宽，超出视口的部分全被裁掉（"删除"按钮、
+        # 配置组状态、颜色值都会被切掉一截）。所以这里必须换行，并且告诉布局"我的宽度
+        # 不影响你"：面板窄了就让文字多折几行，而不是把面板撑宽。
         self.status_label = QLabel("就绪")
         self.status_label.setStyleSheet("color: #AAB4BE; font-size: 11px;")
+        self.status_label.setWordWrap(True)
+        self.status_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
         layout.addWidget(self.status_label)
 
     def _browse_file(self) -> None:
@@ -236,6 +246,9 @@ class SourcePanel(QGroupBox):
 
     def set_status(self, text: str) -> None:
         self.status_label.setText(text)
+        # 文字换行之后可能折成好几行，也可能因为面板窄而被截得看不全；完整内容挂到
+        # 悬停提示上，保证任何情况下都读得到。
+        self.status_label.setToolTip(text)
 
     def set_running(self, running: bool) -> None:
         self.open_btn.setEnabled(not running)
@@ -837,7 +850,10 @@ class AlarmDetailDialog(QDialog):
             ("报警取证", event.alarm_screenshot_path or "无"),
         ]
         for label, value in details:
-            layout.addWidget(QLabel(f"{label}: {value}"))
+            row = QLabel(f"{label}: {value}")
+            # 视频源与截图路径可以很长；不换行的话它们会把弹窗撑宽，右侧被裁掉。
+            row.setWordWrap(True)
+            layout.addWidget(row)
         hint = QLabel("提示：双击截图可用系统默认程序打开原图")
         hint.setStyleSheet("color: #7A8A99; font-size: 11px;")
         layout.addWidget(hint)
