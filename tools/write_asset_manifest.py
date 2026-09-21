@@ -1,4 +1,4 @@
-"""生成发布资源的哈希清单 ``asset_manifest.json``。
+"""生成发布资源的哈希清单 ``asset_manifest.json``（源码树里用）。
 
 为什么要它：低功耗的 OpenVINO 模型早就有 ``model_manifest.json`` 逐文件校验 sha256，
 而 ``yolo11n.pt`` 和 ``warming_converted.wav`` 什么都没有 —— 它们被换掉、拷坏、或者
@@ -10,58 +10,29 @@
 会以「资源与清单不一致」判失败 —— 那正是它的用途：让「我换了个权重」和「权重被
 悄悄改坏了」这两件事都必须被看见。
 
+生成逻辑本身在 ``asset_manifest.py`` 里，与打包版的
+``行人警戒区域监控.exe --write-asset-manifest`` 共用同一份 —— 现场没有 Python 环境，
+``tools/`` 也不随发布包一起发，所以那件事必须由 exe 自己能做。
+
 用法::
 
     python tools\\write_asset_manifest.py
+    python tools\\write_asset_manifest.py --check    # 只校验，不写
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
-import json
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+import asset_manifest  # noqa: E402 - 必须先把它所在的项目根加进 sys.path
+
+# 源码树里清单就放在项目根（打包版跟着资源放在 assets\ 下）。
 MANIFEST_PATH = ROOT / "asset_manifest.json"
-
-# 清单里的每一项：逻辑名、源码树里的位置、以及在发布目录里的候选相对路径
-# （分组式 models\ / assets\ 优先，扁平式直接放根部作为兼容回退 —— 与运行期
-# app_paths.resource() 的查找顺序一致）。
-ASSETS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
-    ("yolo11n.pt", "yolo11n.pt", ("models/yolo11n.pt", "yolo11n.pt")),
-    (
-        "warming_converted.wav",
-        "warming_converted.wav",
-        ("assets/warming_converted.wav", "warming_converted.wav"),
-    ),
-)
-
-
-def sha256_of(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def build_manifest() -> dict:
-    entries = []
-    for name, source, candidates in ASSETS:
-        path = ROOT / source
-        if not path.is_file():
-            raise SystemExit(f"缺少发布资源 {path}，无法生成清单")
-        entries.append(
-            {
-                "name": name,
-                "candidates": list(candidates),
-                "bytes": path.stat().st_size,
-                "sha256": sha256_of(path),
-            }
-        )
-    return {"version": 1, "assets": entries}
 
 
 def main() -> int:
@@ -73,23 +44,29 @@ def main() -> int:
     )
     arguments = parser.parse_args()
 
-    manifest = build_manifest()
-    text = json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
+    try:
+        if arguments.check:
+            expected = asset_manifest.manifest_text()
+            if not MANIFEST_PATH.is_file():
+                print(f"缺少清单 {MANIFEST_PATH}，请先运行本脚本生成", file=sys.stderr)
+                return 1
+            if MANIFEST_PATH.read_text(encoding="utf-8") != expected:
+                print("清单与资源不一致，请重新生成（资源被替换或损坏）", file=sys.stderr)
+                return 1
+            print("清单与资源一致")
+            return 0
 
-    if arguments.check:
-        if not MANIFEST_PATH.is_file():
-            print(f"缺少清单 {MANIFEST_PATH}，请先运行本脚本生成", file=sys.stderr)
-            return 1
-        if MANIFEST_PATH.read_text(encoding="utf-8") != text:
-            print("清单与资源不一致，请重新生成（资源被替换或损坏）", file=sys.stderr)
-            return 1
-        print("清单与资源一致")
-        return 0
+        target, manifest = asset_manifest.write_manifest(MANIFEST_PATH)
+    except FileNotFoundError as error:
+        print(f"生成清单失败：{error}", file=sys.stderr)
+        return 1
+    except OSError as error:
+        print(f"写入清单失败：{error}", file=sys.stderr)
+        return 1
 
-    MANIFEST_PATH.write_text(text, encoding="utf-8")
-    for entry in manifest["assets"]:
-        print(f"{entry['name']:<24} {entry['bytes']:>10} 字节  {entry['sha256'][:16]}…")
-    print(f"已写入 {MANIFEST_PATH}")
+    for line in asset_manifest.describe(manifest):
+        print(line)
+    print(f"已写入 {target}")
     return 0
 
 

@@ -268,6 +268,7 @@ $Readme = @'
       yolo11n_int8_openvino_model\  「CPU 低功耗模式」专用，缺失则该模式不可用
     assets\
       warming_converted.wav         告警提示音，可替换为任意 16bit PCM WAV
+      asset_manifest.json           上面两个文件的哈希清单，供自检核对
     events\      闯入取证：alarm_events.jsonl 与 screenshots\
     profiles\    警戒区配置组
     logs\        运行日志 app.log，反馈问题时请一并提供
@@ -279,6 +280,11 @@ $Readme = @'
        %LOCALAPPDATA%\行人警戒区域监控\，日志里会有一行对应提示。
     4. 诊断用自检（不开窗口，结果写 logs\selftest.log）：
            行人警戒区域监控.exe --selftest
+    5. 替换过 models\ 或 assets\ 里的文件之后，请重新生成哈希清单，否则自检会
+       以「资源与清单不一致」报错：
+           行人警戒区域监控.exe --write-asset-manifest
+    6. 「取证留存」里的自动清理默认是关闭的，需要时在设置页勾选并确认保留天数；
+       报警记录本身不会被清理。
 '@
 # UTF-8 带 BOM：让双击用记事本打开时也能正确识别中文。
 [System.IO.File]::WriteAllText(

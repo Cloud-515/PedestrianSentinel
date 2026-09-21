@@ -260,8 +260,23 @@ class MainWindowRetentionTests(unittest.TestCase):
 
         self._enable_retention(days=7, megabytes=512)
 
+        # 统计走 250 ms 防抖，所以这里先确认它被安排了，再直接触发那一次刷新。
+        self.assertTrue(self.window._usage_timer.isActive())
+        self.window._usage_timer.timeout.emit()
+
         self.assertIn("保留 7 天", label.text())
         self.assertIn("512 MB", label.text())
+
+    def test_other_settings_do_not_scan_the_screenshot_directory(self) -> None:
+        """在通知地址框里打字不该触发目录遍历 —— 目录大了会卡。"""
+        panel = self.window.settings_panel
+        panel.notification_url_edit.setText("https://example.com/hook")
+
+        self.assertFalse(self.window._usage_timer.isActive())
+
+        panel.retention_enabled_cb.setChecked(True)
+
+        self.assertTrue(self.window._usage_timer.isActive())
 
 
 class RecordingDispatcher:
@@ -309,7 +324,7 @@ class MainWindowNotificationTests(unittest.TestCase):
             getattr(panel, name).setChecked(value)
         panel.notification_enabled_cb.setChecked(True)
 
-    def _alarm(self) -> AlarmEvent:
+    def _alarm(self, operation_mode: str = "monitor") -> AlarmEvent:
         return AlarmEvent(
             source="rtsp://camera/live",
             zone_name="北侧入口",
@@ -317,7 +332,7 @@ class MainWindowNotificationTests(unittest.TestCase):
             entered_at_seconds=1.0,
             alarm_at_seconds=3.0,
             wall_time="2026-09-21 10:00:00",
-            operation_mode="monitor",
+            operation_mode=operation_mode,
         )
 
     def test_settings_round_trip_through_the_config_file(self) -> None:
@@ -389,6 +404,39 @@ class MainWindowNotificationTests(unittest.TestCase):
         label = self.window.settings_panel.notification_status_label
         self.assertIn("连接失败", label.text())
         self.assertIn("连接失败", self.window.source_panel.status_label.text())
+
+    def test_video_mode_alarms_do_not_notify_by_default(self) -> None:
+        """拿一段视频试跑时，里面的报警不该往群里刷屏。"""
+        self._enable()
+
+        self.window._on_alarm_event(self._alarm(operation_mode="video"))
+
+        self.assertEqual(self.dispatcher.jobs, [])
+
+    def test_monitor_mode_alarms_still_notify(self) -> None:
+        self._enable()
+
+        self.window._on_alarm_event(self._alarm(operation_mode="monitor"))
+
+        self.assertEqual(len(self.dispatcher.jobs), 1)
+
+    def test_video_mode_can_be_opted_in_for_demos(self) -> None:
+        self._enable(notification_video_cb=True)
+
+        self.window._on_alarm_event(self._alarm(operation_mode="video"))
+
+        self.assertEqual(len(self.dispatcher.jobs), 1)
+
+    def test_video_mode_switch_round_trips_and_shows_in_the_status(self) -> None:
+        self._enable()
+        self.assertIn("视频模式不发", self.window.settings_panel.notification_status_label.text())
+
+        self.window.settings_panel.notification_video_cb.setChecked(True)
+        self.window._save_config()
+
+        saved = json.loads((self.base / "config.json").read_text(encoding="utf-8"))
+        self.assertTrue(saved["notification_in_video_mode"])
+        self.assertNotIn("视频模式不发", self.window.settings_panel.notification_status_label.text())
 
     def test_closing_the_window_closes_the_dispatcher(self) -> None:
         self.window.close()

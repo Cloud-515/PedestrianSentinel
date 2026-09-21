@@ -304,6 +304,7 @@ class SettingsPanel(QGroupBox):
             checkbox_field(
                 "notification_include_screenshot", self.notification_screenshot_cb
             ),
+            checkbox_field("notification_in_video_mode", self.notification_video_cb),
         ]
 
     def _build_notification_box(self) -> QGroupBox:
@@ -344,6 +345,13 @@ class SettingsPanel(QGroupBox):
         self.notification_screenshot_cb = QCheckBox("附带取证截图（base64，≤1 MB）")
         layout.addWidget(self.notification_screenshot_cb)
 
+        self.notification_video_cb = QCheckBox("视频模式（测试播放）也发送")
+        self.notification_video_cb.setToolTip(
+            "默认不勾选：拿一段视频试跑时，里面的报警不该往群里刷屏。\n"
+            "勾选后视频模式里的报警也会发出，适合现场演示完整链路。"
+        )
+        layout.addWidget(self.notification_video_cb)
+
         self.notification_status_label = QLabel("未配置")
         self.notification_status_label.setStyleSheet("color: #7A8A99; font-size: 11px;")
         self.notification_status_label.setWordWrap(True)
@@ -358,6 +366,7 @@ class SettingsPanel(QGroupBox):
         self.notification_url_edit.textChanged.connect(self._emit_notification)
         self.notification_format_combo.currentIndexChanged.connect(self._emit_notification)
         self.notification_screenshot_cb.toggled.connect(self._emit_notification)
+        self.notification_video_cb.toggled.connect(self._emit_notification)
         return box
 
     def _emit_notification(self, value: object = None) -> None:
@@ -909,6 +918,14 @@ class MainWindow(QMainWindow):
         self._retention_timer.setInterval(60 * 60 * 1000)
         self._retention_timer.timeout.connect(self._run_retention)
 
+        # 占用统计要遍历截图目录，所以不能挂在「任何设置变了」上：在通知地址框里每敲
+        # 一个字符都扫一遍，等到目录里几万张图时打字会明显卡顿。防抖到 250 ms，
+        # 连点数值框也只扫一次。
+        self._usage_timer = QTimer(self)
+        self._usage_timer.setSingleShot(True)
+        self._usage_timer.setInterval(250)
+        self._usage_timer.timeout.connect(self._refresh_storage_usage)
+
         self.video_widget = VideoWidget()
         self.source_panel = SourcePanel()
         self.settings_panel = SettingsPanel()
@@ -1042,7 +1059,7 @@ class MainWindow(QMainWindow):
         )
         self.settings_panel.mode_changed.connect(self._apply_operation_mode)
         self.settings_panel.cpu_low_power_changed.connect(self._on_setting_changed)
-        self.settings_panel.retention_changed.connect(self._on_setting_changed)
+        self.settings_panel.retention_changed.connect(self._on_retention_changed)
         self.settings_panel.notification_changed.connect(self._on_setting_changed)
         self.settings_panel.prune_requested.connect(self._prune_now)
         self.settings_panel.notification_test_requested.connect(self._send_test_notification)
@@ -1402,10 +1419,19 @@ class MainWindow(QMainWindow):
         """
         del ignored
         self._settings_binder.store(self.config)
-        # 通知状态栏与留存占用都是「当前配置生效成什么样」的实时指示，改完就刷新。
+        # 通知状态栏是「当前配置能不能发出去」的实时指示，改完就刷新（它不碰磁盘）。
         self._refresh_notification_status()
-        self._refresh_storage_usage()
         self._schedule_config_save()
+
+    def _on_retention_changed(self, *ignored: object) -> None:
+        """留存设置变了：同步配置，并重新统计占用。
+
+        占用统计要遍历截图目录，所以只在这两个留存控件变化时才安排 —— 别的设置项
+        变化（比如在地址框里打字）不该触发目录扫描。
+        """
+        del ignored
+        self._on_setting_changed()
+        self._usage_timer.start()
 
     def _log_effective_settings(self) -> None:
         """把这次真正生效的设置记进日志。
@@ -1456,12 +1482,20 @@ class MainWindow(QMainWindow):
             )
         else:
             detail = "附带截图" if settings.include_screenshot else "不带截图"
+            if not self.config.notification_in_video_mode:
+                detail += "；视频模式不发"
             self.settings_panel.set_notification_status(
                 f"已启用 → {settings.url}（{detail}）", ok=True
             )
 
     def _notify_alarm(self, event: AlarmEvent) -> None:
         settings = self._notification_settings()
+        if event.operation_mode == "video" and not self.config.notification_in_video_mode:
+            # 视频模式（测试播放）的报警默认不发通知：拿一段视频试跑一遍，群机器人就会
+            # 被刷一串「闯入报警」。本地蜂鸣被刷无所谓，往外部广播不一样。判据用事件
+            # 自己的运行模式，而不是当前配置的模式 —— 报警来自哪个视频源，它自己最清楚。
+            logger.info("视频模式（测试播放）的报警未发送远程通知（可在设置页打开）")
+            return
         job = build_job(event, settings)
         if job is None:
             if settings.enabled:

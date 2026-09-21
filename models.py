@@ -345,6 +345,9 @@ class AppConfig:
     notification_url: str = ""
     notification_format: str = NOTIFICATION_FORMAT_GENERIC
     notification_include_screenshot: bool = False
+    # 视频模式（测试播放）里的报警要不要也发通知。**默认不发**：拿一段视频试一遍，
+    # 群机器人就会被刷一串「闯入报警」，而本地蜂鸣被刷是无所谓的 —— 往外部广播不一样。
+    notification_in_video_mode: bool = False
     version: int = CONFIG_VERSION
 
     @classmethod
@@ -439,6 +442,11 @@ class AppConfig:
                 False,
                 key="notification_include_screenshot",
             ),
+            notification_in_video_mode=_coerce_bool(
+                data.get("notification_in_video_mode"),
+                False,
+                key="notification_in_video_mode",
+            ),
             # 读进来的就是当前结构了（迁移在上面就地做掉），所以版本号按当前值写，
             # 而不是照抄文件里的旧值。
             version=CONFIG_VERSION,
@@ -471,6 +479,7 @@ class AppConfig:
             "notification_url": self.notification_url,
             "notification_format": self.notification_format,
             "notification_include_screenshot": self.notification_include_screenshot,
+            "notification_in_video_mode": self.notification_in_video_mode,
             "zones": [zone.to_dict() for zone in self.zones],
         }
 

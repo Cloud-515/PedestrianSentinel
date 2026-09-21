@@ -24,6 +24,7 @@ from unittest.mock import patch
 
 import app_paths
 import app_version
+import asset_manifest
 import main
 
 # 自检会 import 的重型模块。测试里一律替成假货，跑得快，也和真环境解耦。
@@ -233,7 +234,8 @@ class FailingProbeTests(SelfTestBase):
 
         self.assertEqual(exit_code, 1)
         self.assertIn("与清单不一致", report)
-        self.assertIn("write_asset_manifest.py", report)
+        # 修复建议必须是现场能执行的那条：打包版没有 Python，tools\ 也不随包发布。
+        self.assertIn("--write-asset-manifest", report)
 
     def test_missing_manifest_is_a_failure(self) -> None:
         modules = _healthy_modules(self.root)
@@ -294,6 +296,83 @@ class FailingProbeTests(SelfTestBase):
 
         self.assertEqual(exit_code, 0)
         self.assertIn("RESULT: PASS", report)
+
+
+class WriteAssetManifestTests(unittest.TestCase):
+    """``--write-asset-manifest``：现场替换资源后重新生成清单的那条路。
+
+    它必须由 exe 自己能做 —— 说明书里写明权重与告警音可以替换，而打包版没有 Python
+    环境、tools\\ 也不随包发布，否则自检给出的修复建议是用户执行不了的。
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        app_paths.data_dir.cache_clear()
+        self.addCleanup(app_paths.data_dir.cache_clear)
+        patcher = patch.object(app_paths, "APP_DIR", self.root)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        (self.root / "models").mkdir(parents=True)
+        (self.root / "assets").mkdir(parents=True)
+        (self.root / "models" / "yolo11n.pt").write_bytes(b"weights")
+        (self.root / "assets" / "warming_converted.wav").write_bytes(b"RIFF")
+        # 清单放在 assets\ 下（打包版的布局），这样才验得出「重新生成时覆盖的是
+        # 程序实际在用的那一份」，而不是在旁边新写一份、让旧的继续生效。
+        self.manifest = self.root / "assets" / "asset_manifest.json"
+        asset_manifest.write_manifest(self.manifest)
+
+    def test_regenerates_the_manifest_after_an_asset_is_replaced(self) -> None:
+        (self.root / "models" / "yolo11n.pt").write_bytes(b"my-own-weights")
+        checks, failures = asset_manifest.verify_manifest()
+        self.assertTrue(failures, "替换后应当先判失败")
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            exit_code = main._write_asset_manifest()
+
+        self.assertEqual(exit_code, 0)
+        checks, failures = asset_manifest.verify_manifest()
+        self.assertEqual(failures, [])
+        self.assertTrue(all(check.ok for check in checks))
+
+    def test_reports_a_missing_asset_instead_of_writing_a_half_manifest(self) -> None:
+        (self.root / "models" / "yolo11n.pt").unlink()
+
+        with contextlib.redirect_stderr(io.StringIO()) as stderr:
+            exit_code = main._write_asset_manifest()
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("yolo11n.pt", stderr.getvalue())
+
+    def test_writes_back_to_the_manifest_the_program_actually_reads(self) -> None:
+        """清单在 assets\\ 下时，重新生成必须覆盖那一份。
+
+        写到旁边会留下一份旧清单，而查找顺序仍然会先读到旧的 —— 于是「重新生成过了」
+        和「自检还是失败」同时成立。
+        """
+        (self.root / "models" / "yolo11n.pt").write_bytes(b"new-weights")
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            main._write_asset_manifest()
+
+        checks, failures = asset_manifest.verify_manifest()
+        self.assertEqual(failures, [])
+        # 写的是校验时实际读的那一份（assets\ 下），不是旁边新写一份。
+        self.assertTrue(self.manifest.is_file())
+        self.assertEqual(asset_manifest.manifest_path(), self.manifest)
+        self.assertTrue(all(check.ok for check in checks))
+
+    def test_flag_is_handled_before_any_gui_starts(self) -> None:
+        """现场跑这条命令时不该弹出窗口、也不该去 import PySide6。"""
+        with (
+            patch.object(sys, "argv", ["main.py", "--write-asset-manifest"]),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            exit_code = main.main()
+
+        self.assertEqual(exit_code, 0)
 
 
 class DeepSelfTestTests(SelfTestBase):

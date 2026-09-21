@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
@@ -275,44 +274,38 @@ def _probe_assets(
     截断，程序都照样加载，只是「检测不出人」或「报警没声音」—— 都不报错，只让人以为
     程序坏了。这里补上，让「我换了个权重」和「权重被悄悄改坏」都必须被看见。
 
-    资源在说明里是允许用户替换的，替换后需要重新生成清单
-    （``tools\\write_asset_manifest.py``），否则这里会失败 —— 那是刻意的。
+    资源在说明里是允许用户替换的，替换后要重新生成清单
+    （打包版：``--write-asset-manifest``；源码树：``tools\\write_asset_manifest.py``），
+    否则这里会失败 —— 那是刻意的。
     """
-    import hashlib
+    import asset_manifest
 
-    import app_paths
+    checks, problems = asset_manifest.verify_manifest()
+    for check in checks:
+        record(f"资源 {check.name}", check.detail)
+    failures.extend(problems)
 
-    manifest_path = app_paths.resource("assets/asset_manifest.json", "asset_manifest.json")
-    if not manifest_path.is_file():
-        failures.append(f"缺少资源清单: {manifest_path}（用 tools\\write_asset_manifest.py 生成）")
-        record("资源清单", f"FAIL 不存在 {manifest_path}")
-        return
+
+def _write_asset_manifest() -> int:
+    """按当前资源重新生成清单，供现场替换过权重/告警音之后使用。
+
+    打包版没有 Python 环境，``tools/`` 也不随发布包一起发，所以这件事必须由 exe 自己
+    能做 —— 否则说明书让人「替换资源」，自检却给一个用户执行不了的修复建议。
+    """
+    import asset_manifest
+
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        entries = manifest["assets"]
-    except (OSError, ValueError, KeyError, TypeError) as error:
-        failures.append(f"资源清单无法解析: {error!r}")
-        record("资源清单", f"FAIL {error!r}")
-        return
-
-    for entry in entries:
-        name = str(entry.get("name", "?"))
-        path = app_paths.resource(*[str(item) for item in entry.get("candidates", [name])])
-        if not path.is_file():
-            failures.append(f"发布资源缺失: {name}（期望位置 {path}）")
-            record(f"资源 {name}", f"FAIL 不存在 {path}")
-            continue
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        expected = str(entry.get("sha256", ""))
-        size = path.stat().st_size
-        if digest != expected:
-            failures.append(
-                f"发布资源与清单不一致: {name}（{path}）"
-                "。确认替换无误后运行 tools\\write_asset_manifest.py 重新生成清单"
-            )
-            record(f"资源 {name}", f"FAIL 哈希不符 {digest[:16]}…")
-            continue
-        record(f"资源 {name}", f"ok | {size} 字节 | sha256 {digest[:16]}…")
+        target, manifest = asset_manifest.write_manifest()
+    except FileNotFoundError as error:
+        print(f"生成资源清单失败：{error}", file=sys.stderr)
+        return 1
+    except OSError as error:
+        print(f"写入资源清单失败：{error}", file=sys.stderr)
+        return 1
+    for line in asset_manifest.describe(manifest):
+        print(line)
+    print(f"已写入 {target}")
+    return 0
 
 
 def _probe_version(
@@ -603,6 +596,10 @@ def main() -> int:
 
     if "--selftest" in sys.argv[1:]:
         return _run_selftest(sys.argv[1:])
+    if "--write-asset-manifest" in sys.argv[1:]:
+        # 现场替换过权重或告警音之后用它重新生成清单（打包版没有 Python，
+        # tools\ 也不随包发布，所以这件事必须由 exe 自己做）。
+        return _write_asset_manifest()
 
     _log_startup_banner()
 
