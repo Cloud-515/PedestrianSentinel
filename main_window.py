@@ -8,7 +8,13 @@ from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 from PySide6.QtCore import QSize, Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QPixmap, QResizeEvent
+from PySide6.QtGui import (
+    QColor,
+    QDesktopServices,
+    QKeyEvent,
+    QPixmap,
+    QResizeEvent,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -851,6 +857,10 @@ class PreviewImageLabel(QLabel):
     # 预览的高度上限。取证图基本是 16:9，按宽度缩放后本来也高不到哪去；这条是给竖屏
     # 画面留的，否则一张 1080×1920 的图会占掉好几屏高度。
     PREVIEW_MAX_HEIGHT = 300
+    # 预览的下限。低于这个尺寸就看不清"目标手里拿的什么、边界压在哪"，所以它是常量下限，
+    # 而不是由当前这张图算出来的。
+    MIN_WIDTH = 330
+    MIN_HEIGHT = 240
 
     def __init__(
         self,
@@ -862,17 +872,38 @@ class PreviewImageLabel(QLabel):
         self._path = path
         self._source = QPixmap(pixmap) if pixmap is not None else QPixmap()
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setMinimumSize(330, 240)
+        self.setMinimumSize(self.MIN_WIDTH, self.MIN_HEIGHT)
         # 宽度上告诉布局「我不影响你」：预览的宽度跟着详情栏走，而不是反过来由图片尺寸
         # 决定栏宽 —— QLabel 有 pixmap 时最小宽度就是图片宽度，弹窗会因此再也拖不窄。
-        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        # 高度上则按原图宽高比给布局一个**纯函数**（见 heightForWidth）：高度如果只由
+        # 「当前这张 pixmap 多大」决定，布局算出的内容高度就会依赖上一轮缩放的结果 ——
+        # 缩放窗口时 QScrollArea 的滚动条于是反复开关，而它的 updateScrollBars 是同步
+        # 回调，会一路递归到栈溢出（实测转储里同一条链重复了 453 层）。
+        policy = QSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        policy.setHeightForWidth(True)
+        self.setSizePolicy(policy)
         self.setToolTip(f"双击用系统默认程序打开原图：\n{path}")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._rescale()
 
+    def heightForWidth(self, width: int) -> int:
+        """宽度 → 高度：只由原图宽高比决定，与当前这张 pixmap 无关。
+
+        这样布局问多少次都是同一个答案，缩放时不会出现"这一轮算出的高度和上一轮不一样"
+        的死循环。上限给竖屏画面留着，下限是看清取证细节的最小尺寸。
+        """
+        if self._source.isNull() or self._source.width() <= 0 or width <= 0:
+            return self.MIN_HEIGHT
+        ratio = self._source.height() / self._source.width()
+        return max(self.MIN_HEIGHT, min(self.PREVIEW_MAX_HEIGHT, round(width * ratio)))
+
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
-        self._rescale()
+        # 只有宽度变了才重新缩放：详情栏是纵向滚动的，高度变化很频繁，而高度变化对
+        # 「按宽度缩放」这件事没有影响 —— 重算一遍白花时间，还会让每条尺寸变化都走一遍
+        # setPixmap → 布局失效的链路。
+        if event.size().width() != event.oldSize().width():
+            self._rescale()
 
     def _rescale(self) -> None:
         if self._source.isNull() or self.width() <= 0:
@@ -1142,6 +1173,11 @@ class AlarmHistoryDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("查看报警记录")
+        # 默认的 QDialog 只有关闭按钮：记录一多、列一宽、右边还要摆两张取证图，只能靠拖
+        # 边框一格一格放大，而拖不到整屏。补上最小化/最大化，再加上 F11 全屏（见
+        # keyPressEvent 与 fullscreen_btn）。
+        self.setWindowFlag(Qt.WindowType.WindowMinimizeButtonHint, True)
+        self.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
         # 和主窗口一样大：左边要放下十来列记录、右边要放下两张取证图，小弹窗里两边都只能
         # 看到一半，翻记录就得一直拖滚动条。
         self.resize(parent.size() if parent is not None else QSize(1100, 720))
@@ -1149,6 +1185,8 @@ class AlarmHistoryDialog(QDialog):
         self._resolver = resolver
         self._events: list[AlarmEvent] = []
         self._saved_widths = dict(column_widths or {})
+        # 从全屏还原时回到"进全屏之前是不是最大化"，而不是一律回到普通尺寸。
+        self._maximized_before_fullscreen = False
 
         layout = QVBoxLayout(self)
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -1194,6 +1232,12 @@ class AlarmHistoryDialog(QDialog):
         )
         self.refresh_btn.clicked.connect(self.reload)
         filters.addWidget(self.refresh_btn)
+        self.fullscreen_btn = QPushButton("全屏")
+        self.fullscreen_btn.setToolTip(
+            "整屏查看记录（F11 切换；全屏时按 Esc 先退出全屏，再按一次才关窗）。"
+        )
+        self.fullscreen_btn.clicked.connect(self.toggle_fullscreen)
+        filters.addWidget(self.fullscreen_btn)
         layout.addLayout(filters)
 
         self.table = QTableWidget(0, len(self.HEADERS))
@@ -1240,12 +1284,51 @@ class AlarmHistoryDialog(QDialog):
             for column, name in enumerate(self.HEADERS)
         }
 
+    # -- 窗口本身 -----------------------------------------------------------
+
+    def toggle_fullscreen(self) -> None:
+        """全屏 / 还原。
+
+        翻记录时经常要同时看很多列、右边还要摆两张取证图，把窗口摊满整屏比一格一格拖
+        边框快得多。还原时回到「进全屏之前是不是最大化」，而不是一律回到普通尺寸。
+        """
+        if self.isFullScreen():
+            if self._maximized_before_fullscreen:
+                self.showMaximized()
+            else:
+                self.showNormal()
+        else:
+            self._maximized_before_fullscreen = self.isMaximized()
+            self.showFullScreen()
+        self._sync_fullscreen_button()
+
+    def _sync_fullscreen_button(self) -> None:
+        self.fullscreen_btn.setText("还原" if self.isFullScreen() else "全屏")
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.key() == Qt.Key.Key_F11:
+            self.toggle_fullscreen()
+            return
+        if event.key() == Qt.Key.Key_Escape and self.isFullScreen():
+            # 全屏下 Esc 先退出全屏。直接关掉整个查看器会让人以为刚筛出来的记录丢了。
+            self.toggle_fullscreen()
+            return
+        super().keyPressEvent(event)
+
     # -- 右栏 ---------------------------------------------------------------
 
     def _build_detail_side(self) -> QWidget:
         """右栏整体可滚动：详情十来行加两张图，本来就比一屏高。"""
         self.details_scroll = QScrollArea()
         self.details_scroll.setWidgetResizable(True)
+        # 竖滚动条常驻。默认是「需要时才出现」，而它一出现就把视口宽度削掉十几像素，
+        # 内容跟着重新折行、高度又变 —— QScrollArea 的 updateScrollBars 是**同步**回调
+        # （内容控件收到 Resize 就再算一次），尺寸在这两个状态之间来回摆时会一路递归到
+        # 栈溢出。让视口宽度恒定，这条回路就不存在了；代价是内容不高时右边也留着一条
+        # 滚动条的宽度。
+        self.details_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOn
+        )
         self.details_content = QWidget()
         self.details_layout = QVBoxLayout(self.details_content)
         self.details_scroll.setWidget(self.details_content)

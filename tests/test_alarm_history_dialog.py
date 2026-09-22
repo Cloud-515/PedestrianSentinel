@@ -7,7 +7,9 @@
   从上到下排开；
 * 双击交出去的必须是**原图文件的真实路径**（不是预览、不是相对路径），图片不可用时
   则不给双击入口；
-* 面板上那个位置原来是「清空记录」，现在是打开查看器的按钮。
+* 面板上那个位置原来是「清空记录」，现在是打开查看器的按钮；
+* 查看器要能放大到整屏（最大化/最小化按钮 + F11 全屏），并且缩放它不能把程序拖崩：
+  预览的高度必须是宽度的纯函数、右栏视口宽度必须恒定（见这两条测试的说明）。
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import numpy as np
 from PySide6 import QtCore
 from PySide6.QtCore import QPoint, Qt
+from PySide6.QtGui import QPixmap
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -664,6 +667,124 @@ class AlarmHistoryDialogTests(unittest.TestCase):
         self.assertTrue(
             splitter.widget(1).isAncestorOf(dialog.details_content), "右栏是详情"
         )
+
+    # -- 放大到整屏 ---------------------------------------------------------
+
+    def test_the_viewer_window_can_be_maximized(self) -> None:
+        """记录一多就得放大看：默认的 QDialog 只有关闭按钮，只能拖边框一格一格放大。"""
+        dialog = self.dialog()
+
+        flags = dialog.windowFlags()
+        self.assertTrue(
+            flags & Qt.WindowType.WindowMaximizeButtonHint, "要有最大化按钮"
+        )
+        self.assertTrue(
+            flags & Qt.WindowType.WindowMinimizeButtonHint, "要有最小化按钮"
+        )
+
+    def test_the_fullscreen_button_toggles_the_window(self) -> None:
+        dialog = self.dialog()
+        dialog.resize(900, 700)
+        dialog.show()
+        self.addCleanup(dialog.close)
+        self.app.processEvents()
+
+        dialog.fullscreen_btn.click()
+        self.app.processEvents()
+        self.assertTrue(dialog.isFullScreen())
+        self.assertEqual(dialog.fullscreen_btn.text(), "还原", "按钮要变成「还原」")
+
+        dialog.fullscreen_btn.click()
+        self.app.processEvents()
+        self.assertFalse(dialog.isFullScreen())
+        self.assertEqual(dialog.fullscreen_btn.text(), "全屏")
+
+    def test_f11_toggles_fullscreen_and_escape_leaves_it_first(self) -> None:
+        """全屏下按 Esc 先退出全屏：一按就关掉整个查看器，会让人以为刚筛出的记录丢了。"""
+        dialog = self.dialog()
+        dialog.resize(900, 700)
+        dialog.show()
+        self.addCleanup(dialog.close)
+        self.app.processEvents()
+
+        QTest.keyClick(dialog, Qt.Key.Key_F11)
+        self.app.processEvents()
+        self.assertTrue(dialog.isFullScreen())
+
+        QTest.keyClick(dialog, Qt.Key.Key_Escape)
+        self.app.processEvents()
+        self.assertFalse(dialog.isFullScreen())
+        self.assertTrue(dialog.isVisible(), "第一次 Esc 不该关窗")
+
+        # 退出全屏之后，Esc 恢复它本来的意思：关窗。
+        QTest.keyClick(dialog, Qt.Key.Key_Escape)
+        self.app.processEvents()
+        self.assertFalse(dialog.isVisible())
+
+    def test_fullscreen_restores_the_maximized_state_it_started_from(self) -> None:
+        dialog = self.dialog()
+        dialog.showMaximized()
+        self.addCleanup(dialog.close)
+        self.app.processEvents()
+
+        dialog.toggle_fullscreen()
+        self.app.processEvents()
+        self.assertTrue(dialog.isFullScreen())
+
+        dialog.toggle_fullscreen()
+        self.app.processEvents()
+        self.assertFalse(dialog.isFullScreen())
+        self.assertTrue(dialog.isMaximized(), "原来是最大化就回最大化，不是回普通尺寸")
+
+    def test_the_details_pane_reserves_room_for_the_scrollbar(self) -> None:
+        """右栏竖滚动条常驻。
+
+        默认的「需要时才出现」会在出现时把视口宽度削掉十几像素，内容跟着重新折行、高度
+        又变；而 QScrollArea::updateScrollBars 是同步回调（内容控件一收到 Resize 就再算
+        一次），尺寸在两个状态之间来回摆时会一路递归到栈溢出 —— 实机崩溃转储里同一条
+        调用链重复了 453 层。视口宽度恒定，这条回路就不存在了。
+        """
+        dialog = self.dialog()
+
+        self.assertEqual(
+            dialog.details_scroll.verticalScrollBarPolicy(),
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOn,
+        )
+
+    def test_the_preview_height_is_a_pure_function_of_the_width(self) -> None:
+        """预览高度只由原图宽高比决定，与「当前这张 pixmap 多大」无关。
+
+        原来是「当前 pixmap 多大就多高」，于是布局算出的内容高度依赖上一轮缩放的结果，
+        滚动条就会反复开关（同上一条测试的栈溢出回路）。这里把同一个宽度问两遍，中间
+        夹一次真正的缩放，答案必须一样。
+        """
+        preview = PreviewImageLabel("shot.jpg", QPixmap(160, 90))
+        self.addCleanup(preview.deleteLater)
+
+        self.assertTrue(preview.sizePolicy().hasHeightForWidth())
+        self.assertEqual(preview.heightForWidth(320), 240, "低于下限时按下限")
+        self.assertEqual(preview.heightForWidth(500), 281, "16:9 按比例")
+        self.assertEqual(preview.heightForWidth(1000), 300, "高于上限时按上限")
+
+        preview.resize(500, 900)  # 触发一次真实的重新缩放
+        self.app.processEvents()
+
+        self.assertEqual(preview.heightForWidth(500), 281, "缩放之后同一个宽度还是同一个高度")
+
+    def test_the_preview_height_does_not_depend_on_where_it_was_resized_from(self) -> None:
+        """两条不同的缩放路径走到同一个宽度，高度必须一致 —— 否则就是滞回，会震荡。"""
+        preview = PreviewImageLabel("shot.jpg", QPixmap(160, 90))
+        self.addCleanup(preview.deleteLater)
+        other = PreviewImageLabel("shot.jpg", QPixmap(160, 90))
+        self.addCleanup(other.deleteLater)
+
+        preview.resize(900, 400)
+        preview.resize(600, 400)
+        other.resize(300, 400)
+        other.resize(600, 400)
+        self.app.processEvents()
+
+        self.assertEqual(preview.heightForWidth(600), other.heightForWidth(600))
 
 
 class EventPanelTests(unittest.TestCase):
