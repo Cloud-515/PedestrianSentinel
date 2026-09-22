@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import logging
 from collections.abc import Callable
 from datetime import datetime, timedelta
@@ -987,6 +988,54 @@ def _detail_rows(event: AlarmEvent) -> list[tuple[str, str]]:
     ]
 
 
+# 详情的三种文字层次：字段名（灰，让眼睛能跳过）、值（正常文字色）、没记到的（灰）。
+# 报警那两行的值有内容时用报警红：排查时最先看的就是「报没报、多确定」，让它跳出来。
+DETAIL_MUTED = "#7A8A99"
+DETAIL_ALARM = "#C62828"
+DETAIL_ALARM_FIELDS = ("报警时间", "报警置信度")
+# 详情正文字号。界面默认字号（约 12px）在这里偏小：右栏是要一行行读的，弹窗也共用。
+DETAIL_FONT_SIZE = 15
+DETAIL_HINT_SIZE = 12
+
+
+def _detail_row_html(label: str, value: str) -> str:
+    """一行详情的富文本：字段名灰、值主色，报警那两行有内容时报警红加粗。
+
+    值里的 ``&``、``<`` 要转义 —— 视频源与路径里出现它们是常事。
+    """
+    escaped_label = html.escape(label)
+    escaped_value = html.escape(value)
+    if value.startswith("未记录") or value.startswith("未触发"):
+        # 「没记到」既不是报警也不是结论，别用报警红，免得看着像"报了警"。
+        value_html = f'<span style="color: {DETAIL_MUTED};">{escaped_value}</span>'
+    elif label in DETAIL_ALARM_FIELDS:
+        value_html = (
+            f'<span style="color: {DETAIL_ALARM}; font-weight: bold;">{escaped_value}</span>'
+        )
+    else:
+        value_html = escaped_value
+    return (
+        f'<span style="color: {DETAIL_MUTED};">{escaped_label}</span>: {value_html}'
+    )
+
+
+def _detail_label(label: str, value: str) -> QLabel:
+    """详情里的一行。两个弹窗共用，字号与配色才不会各写一套。"""
+    row = QLabel(_detail_row_html(label, value))
+    row.setTextFormat(Qt.TextFormat.RichText)
+    # 视频源与截图路径可以很长；不换行的话它们会把右栏（弹窗）撑宽，别的行跟着被裁掉。
+    row.setWordWrap(True)
+    row.setStyleSheet(f"font-size: {DETAIL_FONT_SIZE}px;")
+    return row
+
+
+def _detail_hint(text: str) -> QLabel:
+    """详情里的提示与图注：比正文小一号的灰字，跟要读的字段分开。"""
+    hint = QLabel(text)
+    hint.setStyleSheet(f"color: {DETAIL_MUTED}; font-size: {DETAIL_HINT_SIZE}px;")
+    return hint
+
+
 def _screenshot_entries(event: AlarmEvent) -> list[tuple[str, str]]:
     """要显示的两张取证图：(标题, 记录里的路径)，顺序就是从上到下的顺序。
 
@@ -1073,13 +1122,8 @@ class AlarmDetailDialog(QDialog):
             ("报警取证", event.alarm_screenshot_path or "无"),
         ]
         for label, value in details:
-            row = QLabel(f"{label}: {value}")
-            # 视频源与截图路径可以很长；不换行的话它们会把弹窗撑宽，右侧被裁掉。
-            row.setWordWrap(True)
-            layout.addWidget(row)
-        hint = QLabel("提示：双击截图可用系统默认程序打开原图")
-        hint.setStyleSheet("color: #7A8A99; font-size: 11px;")
-        layout.addWidget(hint)
+            layout.addWidget(_detail_label(label, value))
+        layout.addWidget(_detail_hint("提示：双击截图可用系统默认程序打开原图"))
         screenshots = QHBoxLayout()
         for title, screenshot_path in _screenshot_entries(event):
             screenshots.addWidget(
@@ -1533,25 +1577,20 @@ class AlarmHistoryDialog(QDialog):
     def _show_details(self, event: AlarmEvent | None) -> None:
         self._clear_details()
         if event is None:
-            hint = QLabel("在左侧选一条记录，这里显示它的详情与两张取证图。")
+            hint = _detail_hint("在左侧选一条记录，这里显示它的详情与两张取证图。")
             hint.setWordWrap(True)
             self.details_layout.addWidget(hint)
             self.details_layout.addStretch()
             return
         for label, value in _detail_rows(event):
-            row = QLabel(f"{label}: {value}")
-            # 视频源可以很长；不换行的话它会把右栏撑宽，别的行跟着一起被裁掉。
-            row.setWordWrap(True)
-            self.details_layout.addWidget(row)
-        hint = QLabel("提示：双击截图可用系统默认程序打开原图")
-        hint.setStyleSheet("color: #7A8A99; font-size: 11px;")
-        self.details_layout.addWidget(hint)
+            self.details_layout.addWidget(_detail_label(label, value))
+        self.details_layout.addWidget(
+            _detail_hint("提示：双击截图可用系统默认程序打开原图")
+        )
         # 两张取证图从上到下排（进入在前、报警在后）。右栏是竖的，并排摆每张只剩半栏宽，
         # 而取证图里要看清的是人和区域边界。
         for title, path in _screenshot_entries(event):
-            heading = QLabel(title)
-            heading.setStyleSheet("color: #7A8A99; font-size: 11px;")
-            self.details_layout.addWidget(heading)
+            self.details_layout.addWidget(_detail_hint(title))
             self.details_layout.addWidget(
                 _screenshot_widget(title, path, event, self._resolver, self)
             )

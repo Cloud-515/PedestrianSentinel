@@ -14,7 +14,9 @@
 
 from __future__ import annotations
 
+import html
 import os
+import re
 import tempfile
 import unittest
 from datetime import datetime, timedelta
@@ -65,6 +67,7 @@ class AlarmHistoryDialogTests(unittest.TestCase):
         alarm: bool = True,
         wall_time: str | None = None,
         source: str = "rtsp://camera/live",
+        confidence: float | None = None,
     ) -> AlarmEvent:
         """真写一条记录（含两张取证截图），跟检测线程落盘的那条路径一致。"""
         event = AlarmEvent(
@@ -77,6 +80,7 @@ class AlarmHistoryDialogTests(unittest.TestCase):
             operation_mode=mode,
             exited_at_seconds=6.0,
             duration_seconds=5.0,
+            alarm_confidence=confidence,
         )
         self.store.open_session(event, self.frame)
         if alarm:
@@ -103,10 +107,23 @@ class AlarmHistoryDialogTests(unittest.TestCase):
 
     def detail_text(self, dialog: AlarmHistoryDialog) -> str:
         return "\n".join(
-            widget.text()
+            self.plain(widget.text())
             for widget in self.detail_widgets(dialog)
             if isinstance(widget, QLabel)
         )
+
+    @staticmethod
+    def plain(text: str) -> str:
+        """详情行是富文本（字段名与值分色），断言文字时先把标记去掉。"""
+        return html.unescape(re.sub(r"<[^>]+>", "", text))
+
+    def detail_row(self, dialog: AlarmHistoryDialog, label: str) -> QLabel:
+        """取某一行详情（按字段名找）。"""
+        prefix = f"{label}:"
+        for widget in self.detail_widgets(dialog):
+            if isinstance(widget, QLabel) and self.plain(widget.text()).startswith(prefix):
+                return widget
+        raise AssertionError(f"详情里没有「{label}」这一行")
 
     def detail_sequence(self, dialog: AlarmHistoryDialog) -> list[str]:
         """右栏里控件的顺序：文字控件给它的文字，预览图给它打开的原图路径。"""
@@ -894,6 +911,67 @@ class AlarmHistoryDialogTests(unittest.TestCase):
 
         self.assertIn("截图文件缺失", self.detail_text(dialog))
         self.assertEqual(len(dialog.findChildren(PreviewImageLabel)), 1)
+
+    # -- 详情的字号与配色 ---------------------------------------------------
+
+    def test_the_details_use_a_larger_font_than_the_hints(self) -> None:
+        """右栏是一行行读的，正文要比界面默认（约 12px）大一档；提示与图注反而要小。"""
+        self.record(zone="北侧入口")
+        dialog = self.dialog()
+
+        row = self.detail_row(dialog, "警戒区域")
+        hint = next(
+            widget
+            for widget in self.detail_widgets(dialog)
+            if isinstance(widget, QLabel) and widget.text().startswith("提示")
+        )
+
+        self.assertIn(f"font-size: {main_window.DETAIL_FONT_SIZE}px", row.styleSheet())
+        self.assertIn(f"font-size: {main_window.DETAIL_HINT_SIZE}px", hint.styleSheet())
+        self.assertLess(main_window.DETAIL_HINT_SIZE, main_window.DETAIL_FONT_SIZE)
+
+    def test_the_field_name_is_grey_and_the_value_is_not(self) -> None:
+        """字段名用灰的、值用正常色：十来行挨在一起，靠颜色才扫得动。"""
+        self.record(zone="北侧入口")
+        dialog = self.dialog()
+
+        row = self.detail_row(dialog, "警戒区域")
+
+        self.assertEqual(row.textFormat(), Qt.TextFormat.RichText)
+        self.assertIn(main_window.DETAIL_MUTED, row.text(), "字段名要灰")
+        self.assertIn(": 北侧入口", self.plain(row.text()))
+        self.assertNotIn(main_window.DETAIL_ALARM, row.text(), "普通行的值不该是报警红")
+
+    def test_the_alarm_rows_stand_out(self) -> None:
+        """报警时间与置信度是排查时最先看的两个数，用报警红加粗。"""
+        self.record(zone="北侧入口", confidence=0.83)
+        dialog = self.dialog()
+
+        for label in main_window.DETAIL_ALARM_FIELDS:
+            with self.subTest(label=label):
+                row = self.detail_row(dialog, label)
+                self.assertIn(main_window.DETAIL_ALARM, row.text(), f"{label} 该跳出来")
+                self.assertIn("font-weight: bold", row.text())
+
+    def test_a_value_that_was_never_recorded_is_not_painted_alarm_red(self) -> None:
+        """「未记录」既不是报警也不是结论，涂成报警红会让人以为报了警。"""
+        self.record(zone="只是路过的", alarm=False)
+        dialog = self.dialog()
+
+        row = self.detail_row(dialog, "报警时间")
+
+        self.assertIn(main_window.DETAIL_MUTED, row.text())
+        self.assertNotIn(main_window.DETAIL_ALARM, row.text())
+
+    def test_an_ampersand_in_a_path_does_not_eat_the_row(self) -> None:
+        """值里的 & 与 < 要转义：不转义的话富文本会把后面的内容吃掉。"""
+        self.record(zone="北侧入口", source="rtsp://cam/live?a=1&b=2")
+        dialog = self.dialog()
+
+        row = self.detail_row(dialog, "视频源")
+
+        self.assertIn("&amp;", row.text())
+        self.assertIn("rtsp://cam/live?a=1&b=2", self.plain(row.text()))
 
     # -- 窗口本身 -----------------------------------------------------------
 
