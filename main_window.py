@@ -1162,6 +1162,15 @@ class AlarmHistoryDialog(QDialog):
         ("最近 7 天", "week"),
         ("最近 30 天", "month"),
     )
+    # 表格末尾多一个空的「占位列」（不在 HEADERS 里，也不进 config）。列宽之和小于表宽时，
+    # 右边会剩一块**没有 item 的空白**：隔行底色在那里断掉，看着像表没画完。占位列把它填
+    # 掉，真实列的宽度一个不动。
+    FILLER_COLUMN = len(HEADERS)
+    # 铺满时优先补宽的长文本列：(列名, 宽度上限)。时刻、时长这类列本来就够宽，不参与。
+    WIDENABLE_COLUMNS = (("视频源", 360), ("区域", 200), ("状态", 140))
+    # 真实列的下限。表头的最小列宽被设成 0（见 _build_list_side），下限改由这里把守：
+    # 列被拖成 0 宽就看不见也抓不回来了。
+    MIN_COLUMN_WIDTH = 24
 
     def __init__(
         self,
@@ -1187,6 +1196,15 @@ class AlarmHistoryDialog(QDialog):
         self._saved_widths = dict(column_widths or {})
         # 从全屏还原时回到"进全屏之前是不是最大化"，而不是一律回到普通尺寸。
         self._maximized_before_fullscreen = False
+        # 用户拖出来的列宽（列名 → 像素），是**存盘与铺满的唯一基准**：显示宽度里可能还含着
+        # 「铺满时补出来的」那部分，把那个存进 config，下次在小窗口打开就全是横向滚动条。
+        self._user_widths: dict[str, int] = {}
+        # 用户自己拖过的列：铺满时不再自动给它补宽 —— 拖窄了又自己变宽，等于跟用户抢。
+        self._user_sized: set[str] = set()
+        # 各长文本列内容要多宽（读记录时量一次，见 _measure_content_widths）。
+        self._content_widths: dict[str, int] = {}
+        # 我们自己调 resizeSection 时置位，免得被当成「用户拖的」记进 _user_widths。
+        self._fitting = False
 
         layout = QVBoxLayout(self)
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -1240,21 +1258,36 @@ class AlarmHistoryDialog(QDialog):
         filters.addWidget(self.fullscreen_btn)
         layout.addLayout(filters)
 
-        self.table = QTableWidget(0, len(self.HEADERS))
-        _configure_event_table(self.table, self.HEADERS)
+        self.table = QTableWidget(0, len(self.HEADERS) + 1)
+        _configure_event_table(self.table, [*self.HEADERS, ""])
         header = self.table.horizontalHeader()
         # 列宽交给用户拖：要看的是「谁、什么时候、哪个区域」，不同点位关心的列不一样，
         # 按内容铺一遍只是第一次打开的起点。
         #
         # 最后一列**不**吸收剩余宽度（setStretchLastSection 默认就是关的，这里写出来是
         # 因为开过一次）：开着它的话，拖中间任何一条边界时最后一列都会跟着补偿，看上去
-        # 就是「拖一个动两个」。宽度之和小于表宽时右边会空出一条，那是拖窄的自然结果，
-        # 拖回去就没了。
+        # 就是「拖一个动两个」。
+        #
+        # 空出来的那块由末尾的**占位列**（不在 HEADERS 里）填：它没有内容，宽度等于
+        # 「表宽 − 各列之和」，所以拖动真实列时它悄悄补偿也不会被看见，而那片"没上底色"
+        # 的空白没有了。见 _fit_columns。
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         header.setStretchLastSection(False)
+        # 表头的最小列宽默认是十几像素（按字体算），而占位列经常需要比它更窄：剩下的空白
+        # 只有几像素时，占位列被顶到十几像素就会让列宽之和超过表宽，冒出一条本不该有的
+        # 横向滚动条。设成 0，真实列的下限改由 MIN_COLUMN_WIDTH 把守。
+        header.setMinimumSectionSize(0)
+        header.sectionResized.connect(self._on_section_resized)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setMinimumHeight(220)
+        # 按内容铺一遍时只看前 100 行：两千多条记录时它会逐行问 delegate，实测这一项在
+        # 常驻面板上就要 1.6 秒（见 EventPanel.load_events）。列宽本来就只是起点。
+        header.setResizeContentsPrecision(100)
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
+        # 表宽变了（放大窗口、拖分隔条、竖滚动条出现）就重新铺一遍。挂 geometriesChanged
+        # 而不是在表格的 Resize 事件里做：表格收到 Resize 时视口与表头都还没跟着变，那时
+        # 读到的宽度是旧的（实测 638 vs 736），铺出来就是错的。
+        header.geometriesChanged.connect(self._fit_columns)
         self._restore_column_widths()
         layout.addWidget(self.table, 1)
 
@@ -1265,22 +1298,131 @@ class AlarmHistoryDialog(QDialog):
     def _restore_column_widths(self) -> None:
         """把上次拖过的列宽放回去；一条都没有时先按内容铺一遍。
 
-        按列名找，不按下标：以后加一列，按下标存的那份会整体错位。
+        按列名找，不按下标：以后加一列，按下标存的那份会整体错位。放回去的是**用户宽度**
+        （_user_widths），当前显示宽度由 _fit_columns 按表宽再算一遍。
         """
         header = self.table.horizontalHeader()
         if not self._saved_widths:
             self.table.resizeColumnsToContents()
+            for column, name in enumerate(self.HEADERS):
+                self._user_widths[name] = max(
+                    header.sectionSize(column), self.MIN_COLUMN_WIDTH
+                )
             return
-        for column, name in enumerate(self.HEADERS):
-            width = self._saved_widths.get(name)
-            # 只存了一部分时（比如以后加了新列），没存过的那列按内容铺。
-            header.resizeSection(column, width or header.sectionSizeHint(column))
+        # 恢复也会触发 sectionResized：不挡住的话每一列都会被记成「用户拖过」，铺满时
+        # 就再也不会给被截断的列补宽了（见 _on_section_resized）。
+        self._fitting = True
+        try:
+            for column, name in enumerate(self.HEADERS):
+                # 只存了一部分时（比如以后加了新列），没存过的那列按内容铺；配置里被手改
+                # 成 0 或负数的也在这里兜回下限。
+                width = self._saved_widths.get(name) or header.sectionSizeHint(column)
+                width = max(width, self.MIN_COLUMN_WIDTH)
+                self._user_widths[name] = width
+                header.resizeSection(column, width)
+        finally:
+            self._fitting = False
+
+    # -- 列宽铺满 -----------------------------------------------------------
+
+    def _measure_content_widths(self) -> None:
+        """量一遍各长文本列「内容要多宽」，供铺满时补宽。
+
+        用 QFontMetrics 直接量文字，不走 sizeHintForColumn：后者要过 delegate，两千多条
+        记录上每次缩放都算一遍太慢（实测：量六千多次文字宽度只要 9 ms）。只在读记录时算
+        一次，筛选变化不重算 —— 否则搜索框里每敲一个字都要多花一次，而且列宽会跟着搜索
+        词跳。
+        """
+        metrics = self.table.fontMetrics()
+        header = self.table.horizontalHeader()
+        columns = {
+            name: self.HEADERS.index(name) for name, _cap in self.WIDENABLE_COLUMNS
+        }
+        widest = dict.fromkeys(columns, 0)
+        for event in self._events:
+            row = self._row_values(event)
+            for name, column in columns.items():
+                width = metrics.horizontalAdvance(row[column])
+                if width > widest[name]:
+                    widest[name] = width
+        self._content_widths = {}
+        for name, _cap in self.WIDENABLE_COLUMNS:
+            column = columns[name]
+            # 表头自身的宽度里已经含了样式给的左右内边距，把内容比表头多出来的部分加上，
+            # 再留 8 px 余量：单元格的内边距与表头不一定完全一样，宁可宽一点也不截断。
+            padding = header.sectionSizeHint(column) - metrics.horizontalAdvance(name) + 8
+            self._content_widths[name] = max(0, padding) + widest[name]
+
+    def _fit_columns(self) -> None:
+        """按表宽把列铺满：先给内容被截断的列补宽，剩下的交给末尾的占位列。
+
+        每次都从**用户宽度**算起，不在上一次的结果上叠加 —— 否则窗口来回缩放会把补出来
+        的宽度越滚越大。只由视口尺寸变化触发；拖动单条边界走 _on_section_resized，那条
+        路只动占位列，免得用户在拖一列时看到另一列跟着变。
+        """
+        header = self.table.horizontalHeader()
+        viewport = self.table.viewport().width()
+        if viewport <= 0 or not self._user_widths:
+            return
+        widths = dict(self._user_widths)
+        slack = viewport - sum(widths.values())
+        if slack > 0:
+            for name, cap in self.WIDENABLE_COLUMNS:
+                if name in self._user_sized:
+                    continue
+                need = min(self._content_widths.get(name, 0), cap)
+                grow = min(slack, max(0, need - widths[name]))
+                widths[name] += grow
+                slack -= grow
+                if slack <= 0:
+                    slack = 0
+                    break
+        self._fitting = True
+        try:
+            for column, name in enumerate(self.HEADERS):
+                if header.sectionSize(column) != widths[name]:
+                    header.resizeSection(column, widths[name])
+            header.resizeSection(self.FILLER_COLUMN, max(0, slack))
+        finally:
+            self._fitting = False
+
+    def _on_section_resized(self, column: int, old: int, new: int) -> None:
+        """用户拖动某条边界之后。
+
+        只把差额还给占位列：其它真实列跟着动，就又成了「拖一个动两个」。占位列是空的，
+        它变宽变窄看不见。
+        """
+        if self._fitting or column == self.FILLER_COLUMN:
+            return
+        header = self.table.horizontalHeader()
+        name = self.HEADERS[column]
+        # 拖成 0 宽的列看不见也抓不回来（表头最小列宽已被设成 0），这里兜住下限。
+        new = max(new, self.MIN_COLUMN_WIDTH)
+        if new != header.sectionSize(column):
+            self._fitting = True
+            try:
+                header.resizeSection(column, new)
+            finally:
+                self._fitting = False
+        self._user_widths[name] = new
+        # 用户自己定过这一列，铺满时不再自动放宽它 —— 拖窄了又自己变宽，等于跟用户抢。
+        self._user_sized.add(name)
+        filler = max(0, header.sectionSize(self.FILLER_COLUMN) - (new - old))
+        self._fitting = True
+        try:
+            header.resizeSection(self.FILLER_COLUMN, filler)
+        finally:
+            self._fitting = False
 
     def column_widths(self) -> dict[str, int]:
-        """当前列宽（列名 → 像素）。关窗时由主窗口写进 config.json。"""
+        """用户拖出来的列宽（列名 → 像素）。关窗时由主窗口写进 config.json。
+
+        返回的是**用户的**宽度，不是当前显示宽度：铺满与补宽出来的那部分不该被记成
+        「用户拖成这样的」，否则在放大的窗口里关一次窗，下次在小窗口打开就全是横向滚动条。
+        """
         header = self.table.horizontalHeader()
         return {
-            name: header.sectionSize(column)
+            name: self._user_widths.get(name, header.sectionSize(column))
             for column, name in enumerate(self.HEADERS)
         }
 
@@ -1387,6 +1529,8 @@ class AlarmHistoryDialog(QDialog):
             logger.exception("Unable to load alarm event history")
             QMessageBox.warning(self, "读取报警记录失败", str(error))
             self._events = []
+        # 长文本列要多少宽度在这里量一次（供铺满时补宽），筛选与缩放都不再重算。
+        self._measure_content_widths()
         self._fill_filter(
             self.mode_combo,
             "全部模式",
@@ -1486,6 +1630,11 @@ class AlarmHistoryDialog(QDialog):
                 item.setToolTip(value)
                 if column == 0:
                     item.setData(Qt.ItemDataRole.UserRole, event)
+            # 占位列也要有 item：Qt 只给有 item 的格子画行底色，没有 item 的那片就是纯白
+            # —— 空白区看着像"表没画完"，原因就在这里（实测同一行：真实列内 #f7f7f7、
+            # 空白区 #ffffff，条纹在那里断掉）。
+            if self.table.item(row, self.FILLER_COLUMN) is None:
+                self.table.setItem(row, self.FILLER_COLUMN, QTableWidgetItem())
         self.table.blockSignals(False)
         self.count_label.setText(f"显示 {len(visible)} / 共 {len(self._events)} 条")
         restored = selected is not None and self._select_session(selected.session_id)

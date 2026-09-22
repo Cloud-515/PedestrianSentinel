@@ -321,8 +321,18 @@ class AlarmHistoryDialogTests(unittest.TestCase):
 
     @staticmethod
     def section_sizes(dialog: AlarmHistoryDialog) -> list[int]:
+        """真实记录列的宽度，**不含**末尾那个空的占位列。
+
+        占位列（`AlarmHistoryDialog.FILLER_COLUMN`）会跟着拖动补偿差额，但它没有表头
+        文字也没有内容，用户看不见它动 —— 所以"拖一条边界只动一列"这条契约说的是记录列。
+        """
         header = dialog.table.horizontalHeader()
-        return [header.sectionSize(c) for c in range(dialog.table.columnCount())]
+        return [header.sectionSize(c) for c in range(len(AlarmHistoryDialog.HEADERS))]
+
+    @staticmethod
+    def filler_width(dialog: AlarmHistoryDialog) -> int:
+        header = dialog.table.horizontalHeader()
+        return header.sectionSize(AlarmHistoryDialog.FILLER_COLUMN)
 
     @staticmethod
     def drag_boundary(dialog: AlarmHistoryDialog, column: int, delta: int) -> None:
@@ -360,6 +370,231 @@ class AlarmHistoryDialogTests(unittest.TestCase):
         )
         self.assertEqual(dialog.column_widths()["闯入时长"], 180)
         self.assertEqual(set(dialog.column_widths()), set(AlarmHistoryDialog.HEADERS))
+
+    # -- 铺满：末尾的占位列 ------------------------------------------------
+
+    def test_the_blank_area_right_of_the_last_column_is_filled(self) -> None:
+        """放大窗口后，列宽之和会小于表宽，右边剩一块空白 —— 末尾的占位列把它填掉。"""
+        dialog = self.dialog()
+        dialog.resize(1920, 900)
+        dialog.show()
+        self.addCleanup(dialog.close)
+        self.app.processEvents()
+
+        table = dialog.table
+        real = sum(self.section_sizes(dialog))
+
+        self.assertGreater(real, 0)
+        self.assertLess(real, table.viewport().width(), "这条测的是「列不够长」的情形")
+        self.assertEqual(
+            self.filler_width(dialog),
+            table.viewport().width() - real,
+            "占位列的宽度应该正好是「表宽 − 各列之和」",
+        )
+
+    def test_the_row_stripes_reach_the_right_edge(self) -> None:
+        """占位列里必须有 item，否则那片空白连行底色都没有。
+
+        这正是它「看起来像表没画完」的原因：Qt 只给有 item 的格子画行底色，实测同一行里
+        真实列内是 #f7f7f7 而空白区是 #ffffff，隔行条纹在那里断掉。这里比像素：隔行两行
+        在占位列里的颜色必须**不同** —— 相同就说明那里根本没上底色。
+
+        不去和真实列内的像素比：测试环境没有中文字体，文字会渲染成黑色方块，采到字上
+        就是黑的。
+        """
+        for index in range(3):
+            self.record(zone=f"区域{index}", track=str(index))
+        dialog = self.dialog()
+        dialog.resize(1600, 700)
+        dialog.show()
+        self.addCleanup(dialog.close)
+        self.app.processEvents()
+
+        table = dialog.table
+        table.scrollToTop()
+        self.app.processEvents()
+        header = table.horizontalHeader()
+        filler = AlarmHistoryDialog.FILLER_COLUMN
+        filler_left = header.sectionViewportPosition(filler)
+        self.assertGreater(header.sectionSize(filler), 40, "窗口够宽时才谈得上空白")
+        self.assertIsNotNone(table.item(1, filler), "占位列的格子里没有 item")
+
+        image = table.viewport().grab().toImage()
+        x = filler_left + 20
+        even = image.pixelColor(x, table.rowViewportPosition(0) + table.rowHeight(0) // 2)
+        odd = image.pixelColor(x, table.rowViewportPosition(1) + table.rowHeight(1) // 2)
+
+        self.assertNotEqual(
+            even.name(), odd.name(), "占位列里没有隔行底色 —— 那片空白又回来了"
+        )
+
+    def test_the_filler_column_takes_the_slack_and_gives_it_back(self) -> None:
+        """占位列的宽度就是"表宽 − 各列之和"：拖动时它吃掉差额（用户看不见它动）。"""
+        dialog = self.dialog()
+        dialog.resize(1600, 700)
+        dialog.show()
+        self.addCleanup(dialog.close)
+        self.app.processEvents()
+
+        before_filler = self.filler_width(dialog)
+        self.assertGreater(before_filler, 60, "这条要有足够的空白才测得出来")
+        before = self.section_sizes(dialog)
+
+        self.drag_boundary(dialog, 2, 60)  # 把「视频源」拖宽 60
+
+        after = self.section_sizes(dialog)
+        changed = [
+            index for index, (old, new) in enumerate(zip(before, after)) if old != new
+        ]
+        self.assertEqual(changed, [2], f"拖第 2 条边界时动了这些记录列：{changed}")
+        self.assertEqual(self.filler_width(dialog), before_filler - 60)
+
+    def test_the_filler_column_is_not_a_record_column(self) -> None:
+        """占位列不进 HEADERS、不进 config：存盘的那份仍然是十个记录列。"""
+        dialog = self.dialog()
+
+        self.assertEqual(
+            dialog.table.columnCount(), len(AlarmHistoryDialog.HEADERS) + 1
+        )
+        self.assertEqual(
+            dialog.table.horizontalHeaderItem(AlarmHistoryDialog.FILLER_COLUMN).text(),
+            "",
+        )
+        self.assertEqual(set(dialog.column_widths()), set(AlarmHistoryDialog.HEADERS))
+
+    def test_filling_widens_a_truncated_column_before_the_filler(self) -> None:
+        """空白优先给"内容被截断"的列：视频源要能显示全，剩下的才给占位列。"""
+        self.record(zone="北侧入口")
+        dialog = AlarmHistoryDialog(
+            self.store,
+            self.store.resolve_screenshot,
+            None,
+            # 故意给一个很窄的视频源列（现场拖窄过就是这种状态）
+            column_widths={"视频源": 60},
+        )
+        self.addCleanup(dialog.deleteLater)
+        dialog.resize(1920, 900)
+        dialog.show()
+        self.addCleanup(dialog.close)
+        self.app.processEvents()
+
+        column = AlarmHistoryDialog.HEADERS.index("视频源")
+        widened = dialog.table.columnWidth(column)
+        cap = dict(AlarmHistoryDialog.WIDENABLE_COLUMNS)["视频源"]
+
+        self.assertGreater(widened, 60, "被截断的列应该被补宽")
+        self.assertLessEqual(widened, cap, "补宽有上限")
+        self.assertGreater(
+            dialog._content_widths["视频源"], 60, "这条记录的视频源确实比 60 px 宽"
+        )
+
+    def test_the_widened_width_is_not_saved_as_a_user_width(self) -> None:
+        """补宽出来的那部分不能记成"用户拖成这样"。
+
+        否则在放大的窗口里关一次窗，下次在小窗口打开时列宽之和就超过表宽，全是横向滚动条。
+        """
+        self.record(zone="北侧入口")
+        saved = {"视频源": 60}
+        dialog = AlarmHistoryDialog(
+            self.store, self.store.resolve_screenshot, None, column_widths=saved
+        )
+        self.addCleanup(dialog.deleteLater)
+        dialog.resize(1920, 900)
+        dialog.show()
+        self.addCleanup(dialog.close)
+        self.app.processEvents()
+
+        self.assertGreater(dialog.table.columnWidth(2), 60, "显示宽度被补宽了")
+        self.assertEqual(dialog.column_widths()["视频源"], 60, "存盘的仍是用户宽度")
+
+    def test_a_column_the_user_narrowed_is_not_widened_back(self) -> None:
+        """用户拖窄过的列不再自动补宽 —— 拖窄了又自己变宽，等于跟用户抢。"""
+        self.record(zone="北侧入口")
+        dialog = self.dialog()
+        dialog.resize(1920, 900)
+        dialog.show()
+        self.addCleanup(dialog.close)
+        self.app.processEvents()
+
+        column = AlarmHistoryDialog.HEADERS.index("视频源")
+        self.drag_boundary(dialog, column, -30)  # 用户把它拖窄
+        narrowed = dialog.table.columnWidth(column)
+
+        # 再改变一次窗口尺寸（会重跑一遍铺满）
+        dialog.resize(1900, 900)
+        self.app.processEvents()
+
+        self.assertEqual(
+            dialog.table.columnWidth(column), narrowed, "用户拖窄过的列又被自动放宽了"
+        )
+        self.assertEqual(dialog.column_widths()["视频源"], narrowed)
+
+    def test_a_narrow_window_keeps_scrolling_instead_of_filling(self) -> None:
+        """表装不下时占位列收到 0 宽，横向滚动范围仍然正好等于溢出的像素。"""
+        dialog = self.dialog()
+        dialog.resize(900, 700)
+        dialog.show()
+        self.addCleanup(dialog.close)
+        self.app.processEvents()
+
+        table = dialog.table
+        for column in range(len(AlarmHistoryDialog.HEADERS)):
+            table.setColumnWidth(column, 150)
+        self.app.processEvents()
+
+        header = table.horizontalHeader()
+        self.assertEqual(self.filler_width(dialog), 0, "装不下时占位列不该占宽度")
+        self.assertEqual(
+            table.horizontalScrollBar().maximum(),
+            header.length() - table.viewport().width(),
+        )
+
+    def test_the_filler_never_pushes_the_columns_past_the_table_width(self) -> None:
+        """扫一遍宽度：列宽之和没超过表宽时，占位列必须正好等于剩下的空白。
+
+        表头的最小列宽默认是十几像素（按字体算）。不把它设成 0，占位列就会被顶到十几
+        像素 —— 空白只剩几像素时列宽之和反而超过表宽，冒出一条本不该有的横向滚动条。
+        """
+        dialog = self.dialog()
+        dialog.resize(900, 700)
+        dialog.show()
+        self.addCleanup(dialog.close)
+        self.app.processEvents()
+
+        table = dialog.table
+        for width in range(900, 1600, 7):
+            dialog.resize(width, 700)
+            self.app.processEvents()
+            slack = table.viewport().width() - sum(self.section_sizes(dialog))
+            with self.subTest(width=width, slack=slack):
+                if slack < 0:
+                    continue
+                self.assertEqual(self.filler_width(dialog), slack)
+                self.assertEqual(
+                    table.horizontalScrollBar().maximum(), 0, "不该出现横向滚动条"
+                )
+
+    def test_a_column_cannot_be_dragged_to_nothing(self) -> None:
+        """列被拖成 0 宽就看不见也抓不回来了。
+
+        表头最小列宽被设成 0（为了让占位列能收窄到几像素），所以这条下限由代码把守。
+        """
+        dialog = self.dialog()
+        dialog.resize(1200, 700)
+        dialog.show()
+        self.addCleanup(dialog.close)
+        self.app.processEvents()
+
+        self.drag_boundary(dialog, 2, -500)
+
+        self.assertGreaterEqual(
+            dialog.table.columnWidth(2),
+            AlarmHistoryDialog.MIN_COLUMN_WIDTH,
+            "列被拖没了",
+        )
+        self.assertGreaterEqual(
+            dialog.column_widths()["视频源"], AlarmHistoryDialog.MIN_COLUMN_WIDTH
+        )
 
     # -- 三个时刻的显示 -----------------------------------------------------
 
