@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
 import re
 import threading
+import time
+import wave
 from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
@@ -36,6 +39,38 @@ def _clock_now() -> str:
 
 
 class AlarmPlayer:
+    # 播放前先补一段静音。为什么需要它：空闲一段时间的音频设备（HDMI/DP 显示器、
+    # 蓝牙、USB 音箱，笔记本的智能功放也一样）会被系统挂起，唤醒它要几百毫秒，而
+    # **这段时间里的音频是直接丢掉的**——听感就是"报警音从半中间开始，开头一两个
+    # 词没了"。告警音本身只有 80 ms 的前导（实测 warming_converted.wav），来不及
+    # 等设备醒过来，所以把静音补在播放的这一侧，而不是改那个允许用户替换的音频文件。
+    #
+    # 0.6 秒是折中：一次报警晚 0.6 秒响完全无所谓，而少了第一个词，听的人会以为
+    # 报警音坏了。补出来的静音是数字零，不占额外 CPU，也不影响录音/回放的其它环节。
+    LEAD_IN_SECONDS = 0.6
+
+    # 播放期间来的报警**不再直接丢掉**，而是记下来等这一遍播完再补响一次。
+    #
+    # 为什么不能丢：多个目标在同一两秒里陆续报警时（实测现场节拍：0 秒、+2.1 秒、
+    # +2.3 秒各一次），告警音有 3.4 秒长，于是第 2、3 个目标的语音**完全没有声音** ——
+    # 现场看到的就是"多个目标在区域时语音播放故障/中断"。
+    # 为什么也不能反过来一有报警就重头播：那会变成唱片跳针，第一个词反复响、整句永远
+    # 听不完。所以是"这一遍播完再补"，而不是打断。
+    #
+    # 只补响**还新鲜**的报警（补放几秒前的事没有意义），并且连播有上限（人不停闯进来
+    # 时警报会一直响，但要有头）。两个数都按"够用就好"取：3 秒大致是一次成组闯入的
+    # 时长，3 遍 = 约 10 秒。
+    QUEUE_STALE_SECONDS = 3.0
+    MAX_CONSECUTIVE_PLAYS = 3
+    # 播完之后再多等一下（秒）。PlaySound 的收尾与设备缓冲之间有一点误差，而"提前一点
+    # 点开始下一遍"正是要避免的事（见 _emit）。
+    PLAY_END_MARGIN = 0.2
+    # 播放抛异常时（PlaySound 播不出来会抛 RuntimeError，例如端点正被别的程序占着、
+    # 或者设备刚被切走）隔这么久重试一次。
+    RETRY_DELAY_SECONDS = 0.3
+    # 开检测时先放这么久的静音把音频端点叫醒（听不见）。
+    WARM_UP_SECONDS = 0.25
+
     def __init__(self, warning_audio_path: str | Path | None = None) -> None:
         self.warning_audio_path = (
             Path(warning_audio_path)
@@ -47,27 +82,208 @@ class AlarmPlayer:
         )
         self._lock = threading.Lock()
         self._is_playing = False
+        # 播放期间来过报警的时刻（None = 没有要补响的）。
+        self._pending_since: float | None = None
+        # 这一串连续补响已经播了几遍（播完且没有待补的报警时归零）。
+        self._consecutive_plays = 0
+        # 补过静音的 WAV 镜像（含文件头）。读一次就缓存：报警时磁盘往往正忙着写取证
+        # 截图，从内存播放既没有这段磁盘延迟，也不给「读文件失败」留机会。
+        self._padded: bytes | None = None
+        self._padded_ready = False
+        # 实际要放的时长（含前导静音）；读不出文件时是 None，那就只能信 PlaySound。
+        self._duration_seconds: float | None = None
 
     def trigger(self) -> None:
         with self._lock:
             if self._is_playing:
+                # 正在响：不打断、不丢，等这一遍播完再补一遍（见 _play）。
+                self._pending_since = time.monotonic()
+                logger.info("告警音正在播放，本次报警排队等待补响")
                 return
             self._is_playing = True
         threading.Thread(target=self._play, daemon=True).start()
 
     def _play(self) -> None:
+        """播一遍；播放期间来过的报警还新鲜的话，紧接着再播一遍。
+
+        连续播的上限与新鲜度见 ``QUEUE_STALE_SECONDS`` / ``MAX_CONSECUTIVE_PLAYS``。
+        日志要能回答现场那句"语音没响/响了一半"：每一遍都记一条「播放完成：用时 X 秒」，
+        两种"不再补响"（过时、到上限）也各自记一条。
+        """
         try:
             import winsound
+        except ImportError as error:
+            logger.warning("无法播放告警音: %s", error)
+            self._finish()
+            return
 
+        try:
+            while True:
+                self._emit(winsound)
+                with self._lock:
+                    plays = self._consecutive_plays
+                    pending = self._pending_since
+                    self._pending_since = None
+                if pending is None:
+                    break
+                age = time.monotonic() - pending
+                if age > self.QUEUE_STALE_SECONDS:
+                    logger.info("告警音不再补响：排队的那次报警已经过了 %.1f 秒", age)
+                    break
+                if plays + 1 >= self.MAX_CONSECUTIVE_PLAYS:
+                    logger.info("告警音不再补响：已经连播 %d 遍", plays + 1)
+                    break
+                with self._lock:
+                    self._consecutive_plays = plays + 1
+        except (OSError, RuntimeError) as error:
+            logger.warning("无法播放告警音: %s", error)
+        finally:
+            self._finish()
+
+    def _finish(self) -> None:
+        with self._lock:
+            self._is_playing = False
+            self._pending_since = None
+            self._consecutive_plays = 0
+
+    def warm_up(self) -> None:
+        """放一段听不见的静音，把音频端点先叫醒。**开检测时调一次**。
+
+        为什么需要：空闲的音频设备（HDMI/DP 显示器、蓝牙、USB 音箱、笔记本的智能功放）
+        要几百毫秒才能出声，而第一次报警往往就在开检测之后几秒内 —— 现场报的原话是
+        "推自行车那个一开始就闯入了，但是只有横幅没有语音提示"，日志里那次播放**没有
+        任何失败记录**（winsound 播不出来是会抛异常的），也就是说声音交给了系统、但
+        没有被听见：输在了设备这一层，不是程序没播。
+
+        放的是数字静音（不吵人），失败只记一条日志 —— 热身失败不该影响任何功能。
+        """
+        try:
+            import winsound
+        except ImportError as error:
+            logger.warning("告警音热身失败: %s", error)
+            return
+        with self._lock:
+            if self._is_playing:
+                return
+            self._is_playing = True
+        try:
             winsound.PlaySound(
-                str(self.warning_audio_path),
-                winsound.SND_FILENAME | winsound.SND_NODEFAULT,
+                self._silence_wave(self.WARM_UP_SECONDS),
+                winsound.SND_MEMORY | winsound.SND_NODEFAULT,
             )
-        except (ImportError, OSError, RuntimeError) as error:
-            logger.warning("Unable to play alarm: %s", error)
+        except (OSError, RuntimeError) as error:
+            logger.warning("告警音热身失败: %s", error)
         finally:
             with self._lock:
                 self._is_playing = False
+
+    def _silence_wave(self, seconds: float) -> bytes:
+        """一段纯静音的 WAV 镜像，格式与告警音一致（端点按同一个格式打开）。"""
+        channels, width, rate = 1, 2, 44100
+        if self.warning_audio_path.is_file():
+            try:
+                with wave.open(str(self.warning_audio_path), "rb") as clip:
+                    parameters = clip.getparams()
+                channels, width, rate = (
+                    parameters.nchannels,
+                    parameters.sampwidth,
+                    parameters.framerate,
+                )
+            except (OSError, EOFError, wave.Error):
+                pass
+        target = io.BytesIO()
+        with wave.open(target, "wb") as silence:
+            silence.setnchannels(channels)
+            silence.setsampwidth(width)
+            silence.setframerate(rate)
+            silence.writeframes(b"\x00" * int(rate * seconds) * channels * width)
+        return target.getvalue()
+
+    def _emit(self, winsound: object) -> None:
+        """真正播一遍，并且**以音频时长为准**等到它真的放完。
+
+        为什么不能只信 PlaySound 的返回：实测它大约每 5 次里有 1 次提前 1~2 秒返回
+        （`SND_MEMORY` 与 `SND_FILENAME` 都一样，所以这不是本次改动引入的），而那时
+        声音还在响。信了它，下一个报警就会立刻开新的一遍 —— Windows 会把还在响的那
+        一遍掐掉，现场听到的就是"多个目标报警时语音故障/中断"。所以这里按「播放起点 +
+        音频时长」兜底：PlaySound 早退也不放行。
+
+        读不出时长（文件是压缩 WAV 之类）就只能信 PlaySound 的返回，这是保底路径。
+
+        播放抛异常时重试一次：PlaySound 播不出来会抛 RuntimeError（端点被占、设备刚
+        被切走这类瞬时情况），一次重试常常就好了 —— 而"没声音"是这里最不能接受的结局。
+        """
+        started = time.monotonic()
+        buffer = self._padded_wave()
+        for attempt in range(2):
+            try:
+                if buffer is None:
+                    # 读不出来（文件缺失、不是合法 WAV）就交给 PlaySound 自己处理：
+                    # 按路径播放可能仍然可行，失败也只记一条 warning。
+                    winsound.PlaySound(  # type: ignore[attr-defined]
+                        str(self.warning_audio_path),
+                        winsound.SND_FILENAME | winsound.SND_NODEFAULT,  # type: ignore[attr-defined]
+                    )
+                else:
+                    winsound.PlaySound(  # type: ignore[attr-defined]
+                        buffer, winsound.SND_MEMORY | winsound.SND_NODEFAULT  # type: ignore[attr-defined]
+                    )
+            except (OSError, RuntimeError) as error:
+                if attempt == 0:
+                    logger.warning(
+                        "告警音播放失败(%s)，%.1f 秒后重试一次",
+                        error,
+                        self.RETRY_DELAY_SECONDS,
+                    )
+                    time.sleep(self.RETRY_DELAY_SECONDS)
+                    continue
+                raise
+            break
+        duration = self._duration_seconds
+        logger.info(
+            "告警音播放完成：用时 %.2f 秒%s",
+            time.monotonic() - started,
+            f"（音频 {duration:.2f} 秒）" if duration is not None else "",
+        )
+        if duration is None:
+            return
+        remaining = duration + self.PLAY_END_MARGIN - (time.monotonic() - started)
+        if remaining > 0:
+            time.sleep(remaining)
+
+    def _padded_wave(self) -> bytes | None:
+        """告警音的 WAV 镜像，前面补上 ``LEAD_IN_SECONDS`` 的静音；读不出来返回 None。
+
+        只支持 PCM WAV（本程序自带的就是），其余情况返回 None 让调用方按路径播放。
+        """
+        if self._padded_ready:
+            return self._padded
+        self._padded_ready = True
+        try:
+            with wave.open(str(self.warning_audio_path), "rb") as clip:
+                parameters = clip.getparams()
+                frames = clip.readframes(parameters.nframes)
+            silence = b"\x00" * (
+                int(parameters.framerate * self.LEAD_IN_SECONDS)
+                * parameters.nchannels
+                * parameters.sampwidth
+            )
+            target = io.BytesIO()
+            with wave.open(target, "wb") as padded:
+                padded.setparams(parameters)
+                padded.writeframes(silence + frames)
+            self._padded = target.getvalue()
+            self._duration_seconds = (
+                self.LEAD_IN_SECONDS + parameters.nframes / parameters.framerate
+            )
+        except (OSError, EOFError, wave.Error) as error:
+            logger.warning(
+                "告警音无法预处理(%s)，改为直接按路径播放: %s",
+                self.warning_audio_path,
+                error,
+            )
+            self._padded = None
+        return self._padded
 
 
 class EventStore:

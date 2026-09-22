@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import io
 import json
+import shutil
 import sys
 import tempfile
+import time
 import unittest
+import wave
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -52,10 +56,64 @@ class WorkerDeviceTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         return Path(temporary.name) / "events"
 
-    def test_alarm_player_plays_configured_wav_file(self) -> None:
-        audio_path = Path("warning.wav")
+    def _write_wave(self, name: str = "alarm.wav", seconds: float = 0.2) -> Path:
+        """写一个真的 PCM WAV —— 静音前导这种行为只有拿真文件才验得出来。"""
+        path = Path(tempfile.mkdtemp()) / name
+        self.addCleanup(shutil.rmtree, path.parent, True)
+        frames = int(44100 * seconds)
+        with wave.open(str(path), "wb") as clip:
+            clip.setnchannels(1)
+            clip.setsampwidth(2)
+            clip.setframerate(44100)
+            # 有内容的音频：480 Hz 方波，绝不会被误当成静音。
+            clip.writeframes(
+                b"".join(
+                    (10000 if (index // 45) % 2 else -10000).to_bytes(2, "little", signed=True)
+                    for index in range(frames)
+                )
+            )
+        return path
+
+    def test_the_alarm_is_played_from_memory_with_a_silent_lead_in(self) -> None:
+        """报警音前面要补一段静音。
+
+        空闲后音频设备唤醒的那几百毫秒里，音频是**直接丢掉**的 —— 用户听到的就是
+        「报警音从半中间开始，开头一两个词没了」。文件本身只有 80 ms 前导，来不及等
+        设备醒来，所以静音补在播放这一侧（也就顺带把播放变成纯内存操作：报警时磁盘
+        正忙着写取证截图）。
+        """
+        audio_path = self._write_wave()
         player = AlarmPlayer(audio_path)
-        winsound = Mock(SND_FILENAME=1, SND_NODEFAULT=2)
+        winsound = Mock(SND_FILENAME=1, SND_NODEFAULT=2, SND_MEMORY=4)
+
+        with patch.dict(sys.modules, {"winsound": winsound}):
+            player._play()
+
+        winsound.PlaySound.assert_called_once()
+        played, flags = winsound.PlaySound.call_args.args
+        self.assertEqual(flags, winsound.SND_MEMORY | winsound.SND_NODEFAULT)
+        self.assertIsInstance(played, bytes)
+
+        with wave.open(io.BytesIO(played), "rb") as padded:
+            self.assertEqual(padded.getframerate(), 44100, "格式不该被改动")
+            self.assertEqual(padded.getnchannels(), 1)
+            self.assertAlmostEqual(
+                padded.getnframes() / padded.getframerate(),
+                0.2 + AlarmPlayer.LEAD_IN_SECONDS,
+                places=2,
+                msg="补出来的总时长 = 静音 + 原音频",
+            )
+            head = np.frombuffer(
+                padded.readframes(int(padded.getframerate() * AlarmPlayer.LEAD_IN_SECONDS)),
+                dtype=np.int16,
+            )
+            self.assertEqual(int(np.abs(head).max()), 0, "开头那段必须是数字静音")
+
+    def test_a_missing_file_falls_back_to_playing_by_path(self) -> None:
+        """读不出来就按路径播 —— 这一步是保底，不能让报警彻底没声音。"""
+        audio_path = Path("does-not-exist.wav")
+        player = AlarmPlayer(audio_path)
+        winsound = Mock(SND_FILENAME=1, SND_NODEFAULT=2, SND_MEMORY=4)
 
         with patch.dict(sys.modules, {"winsound": winsound}):
             player._play()
@@ -66,14 +124,186 @@ class WorkerDeviceTests(unittest.TestCase):
         )
         self.assertFalse(player._is_playing)
 
-    def test_alarm_player_ignores_trigger_while_playing(self) -> None:
-        player = AlarmPlayer()
+    def test_a_truncated_playback_still_waits_for_the_real_duration(self) -> None:
+        """PlaySound 提前返回时，_emit 要等够音频的真实时长。
+
+        实测 winsound 大约每 5 次里有 1 次提前 1~2 秒返回（SND_MEMORY 与 SND_FILENAME
+        都一样），而那时声音还在响。信了它，下一个报警就会立刻开新的一遍 —— Windows
+        会把还在响的掐掉，现场听到的就是"多个目标报警时语音中断/故障"。
+        """
+        player = AlarmPlayer(self._write_wave(seconds=0.4))
+        player._padded_wave()  # 先把时长算出来
+        winsound = Mock(SND_FILENAME=1, SND_NODEFAULT=2, SND_MEMORY=4)
+        winsound.PlaySound.return_value = None  # 立刻返回，模拟提前返回
+
+        started = time.perf_counter()
+        with patch.object(AlarmPlayer, "LEAD_IN_SECONDS", 0.0), patch.dict(
+            sys.modules, {"winsound": winsound}
+        ):
+            player._emit(winsound)
+        elapsed = time.perf_counter() - started
+
+        self.assertGreaterEqual(
+            elapsed,
+            0.4,
+            "PlaySound 提前返回了，_emit 却也跟着提前放行 —— 下一遍会掐掉这一遍",
+        )
+
+    def test_an_unreadable_file_falls_back_to_trusting_play_sound(self) -> None:
+        """读不出时长时只能信 PlaySound 的返回（保底路径），但绝不能因此不发声。"""
+        player = AlarmPlayer(Path("does-not-exist.wav"))
+        winsound = Mock(SND_FILENAME=1, SND_NODEFAULT=2, SND_MEMORY=4)
+
+        with patch.dict(sys.modules, {"winsound": winsound}):
+            player._emit(winsound)
+
+        winsound.PlaySound.assert_called_once()
+        self.assertIsNone(player._duration_seconds)
+
+    def test_a_failed_play_is_retried_once(self) -> None:
+        """播放抛异常时重试一次 —— "没声音"是这里最不能接受的结局。
+
+        winsound 播不出来会抛 RuntimeError（端点被别的程序占着、设备刚被切走这类），
+        实测确认过它不会静默失败。
+        """
+        player = AlarmPlayer(self._write_wave(seconds=0.05))
+        winsound = Mock(SND_FILENAME=1, SND_NODEFAULT=2, SND_MEMORY=4)
+        winsound.PlaySound.side_effect = [RuntimeError("Failed to play sound"), None]
+
+        with patch.object(AlarmPlayer, "LEAD_IN_SECONDS", 0.0), patch.object(
+            AlarmPlayer, "RETRY_DELAY_SECONDS", 0.0
+        ), patch.dict(sys.modules, {"winsound": winsound}):
+            player._emit(winsound)
+
+        self.assertEqual(winsound.PlaySound.call_count, 2, "失败的播放应当重试一次")
+
+    def test_a_play_that_keeps_failing_does_not_crash_the_alarm(self) -> None:
+        """重试也不行就放弃这一遍，但异常不能逃出去（逃出去会让报警音线程静默死掉）。"""
+        player = AlarmPlayer(self._write_wave(seconds=0.05))
+        winsound = Mock(SND_FILENAME=1, SND_NODEFAULT=2, SND_MEMORY=4)
+        winsound.PlaySound.side_effect = RuntimeError("Failed to play sound")
+
+        with patch.object(AlarmPlayer, "LEAD_IN_SECONDS", 0.0), patch.object(
+            AlarmPlayer, "RETRY_DELAY_SECONDS", 0.0
+        ), patch.dict(sys.modules, {"winsound": winsound}):
+            player._play()
+
+        self.assertEqual(winsound.PlaySound.call_count, 2)
+        self.assertFalse(player._is_playing, "_is_playing 必须被清掉，否则之后再也不响")
+
+    def test_the_warm_up_plays_silence_to_wake_the_endpoint(self) -> None:
+        """开检测时先放一段听不见的静音，把音频端点叫醒。
+
+        现场那次「只有横幅没有语音」的日志里没有任何播放失败记录 —— 声音交给了系统但
+        没被听见，也就是输在设备这一层：空闲的端点还没醒。热身就是针对这一条。
+        """
+        player = AlarmPlayer(self._write_wave(seconds=0.05))
+        winsound = Mock(SND_FILENAME=1, SND_NODEFAULT=2, SND_MEMORY=4)
+
+        with patch.dict(sys.modules, {"winsound": winsound}):
+            player.warm_up()
+
+        winsound.PlaySound.assert_called_once()
+        played, flags = winsound.PlaySound.call_args.args
+        self.assertEqual(flags, winsound.SND_MEMORY | winsound.SND_NODEFAULT)
+        with wave.open(io.BytesIO(played), "rb") as silence:
+            samples = np.frombuffer(
+                silence.readframes(silence.getnframes()), dtype=np.int16
+            )
+        self.assertEqual(int(np.abs(samples).max()), 0, "热身必须是静音，不能吵人")
+        self.assertFalse(player._is_playing)
+
+    def test_the_warm_up_failure_is_not_fatal(self) -> None:
+        player = AlarmPlayer(Path("does-not-exist.wav"))
+        winsound = Mock(SND_FILENAME=1, SND_NODEFAULT=2, SND_MEMORY=4)
+        winsound.PlaySound.side_effect = RuntimeError("no audio device")
+
+        with patch.dict(sys.modules, {"winsound": winsound}):
+            player.warm_up()  # 不该抛
+
+        self.assertFalse(player._is_playing)
+
+    def test_the_warm_up_does_not_interrupt_a_playing_alarm(self) -> None:
+        player = AlarmPlayer(self._write_wave(seconds=0.05))
+        player._is_playing = True
+        winsound = Mock(SND_FILENAME=1, SND_NODEFAULT=2, SND_MEMORY=4)
+
+        with patch.dict(sys.modules, {"winsound": winsound}):
+            player.warm_up()
+
+        winsound.PlaySound.assert_not_called()
+
+    def test_the_padded_buffer_is_built_only_once(self) -> None:
+        """磁盘读一次就够：报警时磁盘往往正忙，别每响一次读一次。"""
+        audio_path = self._write_wave()
+        player = AlarmPlayer(audio_path)
+
+        first = player._padded_wave()
+        audio_path.unlink()
+        second = player._padded_wave()
+
+        self.assertIsNotNone(first)
+        self.assertIs(first, second)
+
+    def test_alarm_player_queues_instead_of_dropping_while_playing(self) -> None:
+        """播放期间的报警要被记下来等补响，而不是直接丢掉。
+
+        丢掉的话，多个目标在同一两秒里陆续报警时（现场实测节拍：0 秒、+2.1 秒、
+        +2.3 秒），第 2、3 个目标的语音完全没有声音 —— 现场看到的就是"语音播放
+        故障/中断"。
+        """
+        player = AlarmPlayer(Path("warning.wav"))
         player._is_playing = True
 
-        with patch("alarm_service.threading.Thread") as thread:
-            player.trigger()
+        player.trigger()
 
-        thread.assert_not_called()
+        self.assertIsNotNone(player._pending_since, "这次报警没有被记下来")
+        self.assertTrue(player._is_playing, "不应打断正在播的那一遍")
+
+    def _queued_player(self, *, age: float = 0.0, plays: int = 0) -> tuple[AlarmPlayer, Mock]:
+        """造一个「正在播放、期间来过一次报警」的状态，然后让 _play 走完。"""
+        player = AlarmPlayer(self._write_wave(seconds=0.05))
+        player._is_playing = True
+        player._consecutive_plays = plays
+        player._pending_since = time.monotonic() - age
+        winsound = Mock(SND_FILENAME=1, SND_NODEFAULT=2, SND_MEMORY=4)
+        with patch.object(AlarmPlayer, "LEAD_IN_SECONDS", 0.0), patch.dict(
+            sys.modules, {"winsound": winsound}
+        ):
+            player._play()
+        return player, winsound
+
+    def test_a_queued_alarm_is_played_again_right_after(self) -> None:
+        player, winsound = self._queued_player()
+
+        self.assertEqual(winsound.PlaySound.call_count, 2, "排队的那次报警要补响一遍")
+        self.assertFalse(player._is_playing)
+        self.assertIsNone(player._pending_since)
+
+    def test_a_stale_queued_alarm_is_not_replayed(self) -> None:
+        """补放几秒前的事没有意义 —— 人早走了，警报却突然响起来。"""
+        player, winsound = self._queued_player(age=AlarmPlayer.QUEUE_STALE_SECONDS + 1.0)
+
+        self.assertEqual(winsound.PlaySound.call_count, 1)
+        self.assertIsNone(player._pending_since)
+
+    def test_the_repeats_stop_at_the_cap(self) -> None:
+        """人不停闯进来时警报会一直响，但要有头。"""
+        player, winsound = self._queued_player(
+            plays=AlarmPlayer.MAX_CONSECUTIVE_PLAYS - 1
+        )
+
+        self.assertEqual(winsound.PlaySound.call_count, 1, "到上限就不该再补响")
+
+    def test_the_cap_is_per_burst_not_permanent(self) -> None:
+        """连播上限只管「一串」：播完且没有待补的报警就归零。
+
+        少了这一步，一次拥挤的报警之后警报会永久哑掉 —— 那比"响太多"严重得多。
+        """
+        player, _ = self._queued_player(plays=AlarmPlayer.MAX_CONSECUTIVE_PLAYS - 1)
+
+        self.assertEqual(player._consecutive_plays, 0)
+        self.assertFalse(player._is_playing)
 
     def test_event_store_folds_intrusion_session_updates(self) -> None:
         root = self.events_dir()

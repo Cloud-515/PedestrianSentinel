@@ -175,6 +175,11 @@ class DetectionWorker(QThread):
             )
             mode_label = self.policy.label if self.policy is not None else "标准模式"
             self.status_changed.emit(f"检测运行中：{mode_label}，推理设备: {self.device}")
+            # 音频设备空闲时会被系统挂起，而第一次报警往往就在这几秒内 —— 放一段听不见
+            # 的静音先把端点叫醒（见 AlarmPlayer.warm_up）。不阻塞检测：扔到线程里。
+            threading.Thread(
+                target=self.alarm_player.warm_up, daemon=True
+            ).start()
             while not self._stop_event.is_set():
                 with self._control_lock:
                     paused = self._paused
