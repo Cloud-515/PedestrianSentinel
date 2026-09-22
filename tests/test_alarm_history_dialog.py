@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QSplitter,
+    QStyleOptionViewItem,
     QWidget,
 )
 
@@ -63,10 +64,11 @@ class AlarmHistoryDialogTests(unittest.TestCase):
         mode: str = "monitor",
         alarm: bool = True,
         wall_time: str | None = None,
+        source: str = "rtsp://camera/live",
     ) -> AlarmEvent:
         """真写一条记录（含两张取证截图），跟检测线程落盘的那条路径一致。"""
         event = AlarmEvent(
-            source="rtsp://camera/live",
+            source=source,
             zone_name=zone,
             track_id=track,
             entered_at_seconds=1.0,
@@ -412,6 +414,9 @@ class AlarmHistoryDialogTests(unittest.TestCase):
 
         table = dialog.table
         table.scrollToTop()
+        # 十列都拖窄，保证右边一定剩下空白（补宽会先把空白吃掉，所以不能靠默认列宽）
+        for column in range(len(AlarmHistoryDialog.HEADERS)):
+            table.setColumnWidth(column, 40)
         self.app.processEvents()
         header = table.horizontalHeader()
         filler = AlarmHistoryDialog.FILLER_COLUMN
@@ -463,7 +468,7 @@ class AlarmHistoryDialogTests(unittest.TestCase):
         self.assertEqual(set(dialog.column_widths()), set(AlarmHistoryDialog.HEADERS))
 
     def test_filling_widens_a_truncated_column_before_the_filler(self) -> None:
-        """空白优先给"内容被截断"的列：视频源要能显示全，剩下的才给占位列。"""
+        """空白优先给「显示不全」的列，补到够显示为止，剩下的才给占位列。"""
         self.record(zone="北侧入口")
         dialog = AlarmHistoryDialog(
             self.store,
@@ -480,13 +485,62 @@ class AlarmHistoryDialogTests(unittest.TestCase):
 
         column = AlarmHistoryDialog.HEADERS.index("视频源")
         widened = dialog.table.columnWidth(column)
-        cap = dict(AlarmHistoryDialog.WIDENABLE_COLUMNS)["视频源"]
 
-        self.assertGreater(widened, 60, "被截断的列应该被补宽")
-        self.assertLessEqual(widened, cap, "补宽有上限")
-        self.assertGreater(
-            dialog._content_widths["视频源"], 60, "这条记录的视频源确实比 60 px 宽"
+        self.assertGreater(widened, 60, "显示不全的列应该被补宽")
+        self.assertGreaterEqual(
+            widened, dialog._content_widths["视频源"], "补宽要补到够显示"
         )
+        self.assertGreater(dialog._content_widths["视频源"], 60, "这条记录确实比 60 px 宽")
+
+    def test_the_longest_video_source_is_no_longer_elided(self) -> None:
+        """用户报的正是这个：放大之后「视频源」还被省略号截断。
+
+        判据交给 delegate 自己：`sizeHint` 就是视图用来判断「会不会省略」的那个宽度，
+        所以「列宽 ≥ sizeHint」等价于「这一格不再省略」。
+
+        窗口开到 3000 而不是 1920：测试环境没有中文字体，每个字都渲染成方块，量出来的
+        宽度比真实字体大得多（这条地址在真机上约 450 px，这里是 714 px），按真机的窗口
+        宽度根本装不下 —— 那是环境失真，不是程序的问题。
+        """
+        source = "rtsp://admin:FT0628591@192.168.1.244/Streaming/Channels/101"
+        self.record(zone="区域 1", source=source)
+        dialog = self.dialog()
+        dialog.resize(3000, 900)
+        dialog.show()
+        self.addCleanup(dialog.close)
+        self.app.processEvents()
+
+        table = dialog.table
+        column = AlarmHistoryDialog.HEADERS.index("视频源")
+        option = QStyleOptionViewItem()
+        option.initFrom(table)
+        option.font = table.font()
+        needed = table.itemDelegateForColumn(column).sizeHint(
+            option, table.model().index(0, column)
+        ).width()
+
+        self.assertGreater(needed, 300, "这条记录的视频源本来就该要很宽")
+        self.assertGreaterEqual(
+            table.columnWidth(column), needed, "补宽之后视频源仍然显示不全"
+        )
+
+    def test_a_long_video_source_is_elided_in_the_middle(self) -> None:
+        """补不下的长地址从中间省略：头尾都在，通道号看得见（省右边会把它吃掉）。"""
+        self.record(zone="区域 1")
+        dialog = self.dialog()
+        dialog.show()
+        self.addCleanup(dialog.close)
+        self.app.processEvents()
+
+        table = dialog.table
+        column = AlarmHistoryDialog.HEADERS.index("视频源")
+        delegate = table.itemDelegateForColumn(column)
+        option = QStyleOptionViewItem()
+        option.initFrom(table)
+        option.font = table.font()
+        delegate.initStyleOption(option, table.model().index(0, column))
+
+        self.assertEqual(option.textElideMode, Qt.TextElideMode.ElideMiddle)
 
     def test_the_widened_width_is_not_saved_as_a_user_width(self) -> None:
         """补宽出来的那部分不能记成"用户拖成这样"。
@@ -528,6 +582,33 @@ class AlarmHistoryDialogTests(unittest.TestCase):
             dialog.table.columnWidth(column), narrowed, "用户拖窄过的列又被自动放宽了"
         )
         self.assertEqual(dialog.column_widths()["视频源"], narrowed)
+
+    def test_a_column_the_user_widened_keeps_being_filled(self) -> None:
+        """反过来：用户自己拖宽想把长地址看清，这一列要继续跟着空白长。
+
+        原来是「拖过就再也不补宽」，于是「手动拖宽一点」这个动作反而让那一列从此长不
+        起来，越拖越看不全。
+        """
+        self.record(zone="北侧入口", source="rtsp://admin:FT0628591@192.168.1.244/x")
+        dialog = AlarmHistoryDialog(
+            self.store, self.store.resolve_screenshot, None, column_widths={"视频源": 60}
+        )
+        self.addCleanup(dialog.deleteLater)
+        dialog.resize(1200, 700)
+        dialog.show()
+        self.addCleanup(dialog.close)
+        self.app.processEvents()
+
+        column = AlarmHistoryDialog.HEADERS.index("视频源")
+        self.drag_boundary(dialog, column, 40)
+        dragged = dialog.table.columnWidth(column)
+
+        dialog.resize(1900, 700)  # 放大，多出空白
+        self.app.processEvents()
+
+        self.assertGreater(
+            dialog.table.columnWidth(column), dragged, "拖宽过的列不再被补宽了"
+        )
 
     def test_a_narrow_window_keeps_scrolling_instead_of_filling(self) -> None:
         """表装不下时占位列收到 0 宽，横向滚动范围仍然正好等于溢出的像素。"""

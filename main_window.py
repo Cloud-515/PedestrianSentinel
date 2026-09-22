@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
-from PySide6.QtCore import QSize, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtCore import QModelIndex, QSize, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QColor,
     QDesktopServices,
@@ -44,6 +44,9 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QSplitter,
     QStackedWidget,
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -1113,6 +1116,19 @@ def _configure_event_table(table: QTableWidget, headers: list[str]) -> None:
     )
 
 
+class MiddleElideDelegate(QStyledItemDelegate):
+    """放不下时从**中间**省略。
+
+    「视频源」是 ``rtsp://admin:FT0628591@192.168.1.244/Streaming/Channels/101`` 这种
+    地址，默认的「省略右边」一截就把通道号 —— 最有用的那一段 —— 吃掉了。中间省略之后
+    头尾都在，一眼能看出是哪个点位、哪个通道。放得下时完全没影响。
+    """
+
+    def initStyleOption(self, option: QStyleOptionViewItem, index: QModelIndex) -> None:
+        super().initStyleOption(option, index)
+        option.textElideMode = Qt.TextElideMode.ElideMiddle
+
+
 def _record_time(event: AlarmEvent) -> datetime | None:
     """记录时间（``wall_time``）解析成 datetime；认不出来返回 None。
 
@@ -1166,8 +1182,6 @@ class AlarmHistoryDialog(QDialog):
     # 右边会剩一块**没有 item 的空白**：隔行底色在那里断掉，看着像表没画完。占位列把它填
     # 掉，真实列的宽度一个不动。
     FILLER_COLUMN = len(HEADERS)
-    # 铺满时优先补宽的长文本列：(列名, 宽度上限)。时刻、时长这类列本来就够宽，不参与。
-    WIDENABLE_COLUMNS = (("视频源", 360), ("区域", 200), ("状态", 140))
     # 真实列的下限。表头的最小列宽被设成 0（见 _build_list_side），下限改由这里把守：
     # 列被拖成 0 宽就看不见也抓不回来了。
     MIN_COLUMN_WIDTH = 24
@@ -1277,7 +1291,11 @@ class AlarmHistoryDialog(QDialog):
         # 只有几像素时，占位列被顶到十几像素就会让列宽之和超过表宽，冒出一条本不该有的
         # 横向滚动条。设成 0，真实列的下限改由 MIN_COLUMN_WIDTH 把守。
         header.setMinimumSectionSize(0)
-        header.sectionResized.connect(self._on_section_resized)
+        # 「视频源」放不下时从中间省略（见 MiddleElideDelegate）：很长的 RTSP 地址里，
+        # 通道号在末尾，省略右边会把最有用的那一段吃掉。
+        self.table.setItemDelegateForColumn(
+            self.HEADERS.index("视频源"), MiddleElideDelegate(self.table)
+        )
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setMinimumHeight(220)
         # 按内容铺一遍时只看前 100 行：两千多条记录时它会逐行问 delegate，实测这一项在
@@ -1289,6 +1307,10 @@ class AlarmHistoryDialog(QDialog):
         # 读到的宽度是旧的（实测 638 vs 736），铺出来就是错的。
         header.geometriesChanged.connect(self._fit_columns)
         self._restore_column_widths()
+        # 连 sectionResized 必须放在恢复之后：恢复（以及「没存过宽度时按内容铺一遍」）会
+        # 连着触发一串 sectionResized，早接上就会把那些程序化的改动记成「用户拖的」——
+        # 一列被记成用户拖过，铺满时就不再给它补宽了。
+        header.sectionResized.connect(self._on_section_resized)
         layout.addWidget(self.table, 1)
 
         self.count_label = QLabel()
@@ -1326,35 +1348,43 @@ class AlarmHistoryDialog(QDialog):
     # -- 列宽铺满 -----------------------------------------------------------
 
     def _measure_content_widths(self) -> None:
-        """量一遍各长文本列「内容要多宽」，供铺满时补宽。
+        """量一遍每一列「内容要多宽」，供铺满时把显示不全的列补到够显示。
 
         用 QFontMetrics 直接量文字，不走 sizeHintForColumn：后者要过 delegate，两千多条
-        记录上每次缩放都算一遍太慢（实测：量六千多次文字宽度只要 9 ms）。只在读记录时算
-        一次，筛选变化不重算 —— 否则搜索框里每敲一个字都要多花一次，而且列宽会跟着搜索
-        词跳。
+        记录上每次缩放都算一遍太慢（实测：两万多次文字宽度约 30 ms，够便宜）。只在读记录
+        时算一次，筛选变化不重算 —— 否则搜索框里每敲一个字都要多花一次，列宽还会跟着
+        搜索词跳。
         """
         metrics = self.table.fontMetrics()
         header = self.table.horizontalHeader()
-        columns = {
-            name: self.HEADERS.index(name) for name, _cap in self.WIDENABLE_COLUMNS
-        }
-        widest = dict.fromkeys(columns, 0)
+        # 单元格的左右内边距：QCommonStyle 给 CT_ItemViewItem 加的就是这个
+        # （PM_FocusFrameHMargin + 1，左右各一份）。不能拿表头的 sectionSizeHint 减文字
+        # 宽度来推 —— 表头那一套内边距和单元格不是同一个数。
+        margin = (
+            self.table.style().pixelMetric(
+                QStyle.PixelMetric.PM_FocusFrameHMargin, None, self.table
+            )
+            + 1
+        )
+        padding = 2 * margin
+        widest = dict.fromkeys(self.HEADERS, 0)
         for event in self._events:
             row = self._row_values(event)
-            for name, column in columns.items():
+            for column, name in enumerate(self.HEADERS):
                 width = metrics.horizontalAdvance(row[column])
                 if width > widest[name]:
                     widest[name] = width
-        self._content_widths = {}
-        for name, _cap in self.WIDENABLE_COLUMNS:
-            column = columns[name]
-            # 表头自身的宽度里已经含了样式给的左右内边距，把内容比表头多出来的部分加上，
-            # 再留 8 px 余量：单元格的内边距与表头不一定完全一样，宁可宽一点也不截断。
-            padding = header.sectionSizeHint(column) - metrics.horizontalAdvance(name) + 8
-            self._content_widths[name] = max(0, padding) + widest[name]
+        self._content_widths = {
+            name: max(
+                # 表头文字自己也要放得下
+                header.sectionSizeHint(column),
+                padding + widest[name],
+            )
+            for column, name in enumerate(self.HEADERS)
+        }
 
     def _fit_columns(self) -> None:
-        """按表宽把列铺满：先给内容被截断的列补宽，剩下的交给末尾的占位列。
+        """按表宽把列铺满：先把显示不全的列补到够显示，剩下的交给末尾的占位列。
 
         每次都从**用户宽度**算起，不在上一次的结果上叠加 —— 否则窗口来回缩放会把补出来
         的宽度越滚越大。只由视口尺寸变化触发；拖动单条边界走 _on_section_resized，那条
@@ -1367,11 +1397,19 @@ class AlarmHistoryDialog(QDialog):
         widths = dict(self._user_widths)
         slack = viewport - sum(widths.values())
         if slack > 0:
-            for name, cap in self.WIDENABLE_COLUMNS:
-                if name in self._user_sized:
-                    continue
-                need = min(self._content_widths.get(name, 0), cap)
-                grow = min(slack, max(0, need - widths[name]))
+            # 先满足「差得少」的列：这样能整列显示全的列最多；补不动的长文本列（很长的
+            # RTSP 地址就是）拿剩下的。**没有上限** —— 空白本来就是白放着的，全给它也是
+            # 赚的，剩下的才轮到占位列。
+            deficits = {
+                name: self._content_widths.get(name, 0) - widths[name]
+                for name in self.HEADERS
+                if name not in self._user_sized
+            }
+            for name in sorted(
+                (item for item, need in deficits.items() if need > 0),
+                key=lambda item: deficits[item],
+            ):
+                grow = min(slack, deficits[name])
                 widths[name] += grow
                 slack -= grow
                 if slack <= 0:
@@ -1405,8 +1443,13 @@ class AlarmHistoryDialog(QDialog):
             finally:
                 self._fitting = False
         self._user_widths[name] = new
-        # 用户自己定过这一列，铺满时不再自动放宽它 —— 拖窄了又自己变宽，等于跟用户抢。
-        self._user_sized.add(name)
+        # 按拖动方向决定要不要继续自动补宽：**拖窄**了就不再补（用户就是要它窄），
+        # **拖宽**了继续跟着空白走 —— 否则「自己拖宽一点想把长地址看清」这个动作反而会
+        # 让这一列从此不再被补宽，越拖越看不全。
+        if new < old:
+            self._user_sized.add(name)
+        else:
+            self._user_sized.discard(name)
         filler = max(0, header.sectionSize(self.FILLER_COLUMN) - (new - old))
         self._fitting = True
         try:
