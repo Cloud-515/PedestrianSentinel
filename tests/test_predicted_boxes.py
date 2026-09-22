@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from functools import partial
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -217,15 +218,20 @@ class TrackerThresholdTests(unittest.TestCase):
 
 
 class BoxLabelTests(unittest.TestCase):
-    """标签与框型：分数是给人判断真假用的，必须一直都在。"""
+    """调试视图下的标签：打开「显示目标编号与置信度」之后，编号与分数一个都不能少。
+
+    排查「为什么老误报」靠的就是它们 —— 编号能和报警记录对上号，分数说明模型当时
+    有多确定。默认那版（只写「行人」「区域内 1.5秒」「闯入 2.0秒」）在
+    tests/test_label_overlay.py 里钉着，这里只管开开关之后的那一版。
+    """
 
     def test_label_shows_confidence(self) -> None:
-        self.assertEqual(DetectionEngine._box_label(9, 0.86, None), "ID:9 0.86")
-        self.assertEqual(DetectionEngine._box_label(9, 0.14, None), "ID:9 0.14")
-        self.assertEqual(
-            DetectionEngine._box_label(9, 0.14, 1.5), "ID:9 0.14 IN ZONE 1.500s"
-        )
-        self.assertEqual(DetectionEngine._box_label(None, None, None), "Person")
+        label = partial(DetectionEngine._box_label, show_details=True)
+
+        self.assertEqual(label(9, 0.86, None), "目标9 0.86")
+        self.assertEqual(label(9, 0.14, None), "目标9 0.14")
+        self.assertEqual(label(9, 0.14, 1.5), "目标9 0.14 区内1.5秒")
+        self.assertEqual(label(None, None, None), "人物")
 
     def test_predicted_frames_still_show_the_last_real_confidence(self) -> None:
         """低功耗模式下 3/4 的帧是预测帧，那些帧也得有分数。

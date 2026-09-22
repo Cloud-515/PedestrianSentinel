@@ -401,6 +401,10 @@ class AppConfig:
     # 「查看记录」弹窗里用户拖过的列宽（列名 → 像素）。它只是界面状态，但存下来才有
     # 意义：列宽是按现场要看的字段拖的，每次打开都回到默认宽度等于白拖一遍。
     history_column_widths: dict[str, int] = field(default_factory=dict)
+    # 画面上要不要显示「目标编号 + 置信度」这类机器信息。**默认不显示**：看画面的人
+    # 只需要判断是不是人、进没进区域、待了多久，编号与分数是排查「为什么老误报」时
+    # 才要看的（编号还能跟报警记录对上号）。
+    show_detection_details: bool = False
     version: int = CONFIG_VERSION
 
     @classmethod
@@ -503,6 +507,11 @@ class AppConfig:
             history_column_widths=_coerce_column_widths(
                 data.get("history_column_widths")
             ),
+            show_detection_details=_coerce_bool(
+                data.get("show_detection_details"),
+                False,
+                key="show_detection_details",
+            ),
             # 读进来的就是当前结构了（迁移在上面就地做掉），所以版本号按当前值写，
             # 而不是照抄文件里的旧值。
             version=CONFIG_VERSION,
@@ -537,6 +546,7 @@ class AppConfig:
             "notification_include_screenshot": self.notification_include_screenshot,
             "notification_in_video_mode": self.notification_in_video_mode,
             "history_column_widths": self.history_column_widths,
+            "show_detection_details": self.show_detection_details,
             "zones": [zone.to_dict() for zone in self.zones],
         }
 

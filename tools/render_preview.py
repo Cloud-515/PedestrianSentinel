@@ -109,6 +109,12 @@ def main() -> int:
     parser.add_argument("--weights", default="yolo11n.pt", help="检测权重")
     parser.add_argument("--device", default="cpu", help="推理设备")
     parser.add_argument(
+        "--details",
+        action="store_true",
+        help="按设置页里「显示目标编号与置信度」打开后的样子渲染"
+        "（默认是给看画面的人看的那版：行人 / 区域内 1.5秒 / 闯入 2.0秒）",
+    )
+    parser.add_argument(
         "--out",
         default=str(ROOT / "artifacts" / "preview" / "preview"),
         help="输出文件名前缀（默认落在已被忽略的 artifacts\\preview\\ 下）",
@@ -140,6 +146,8 @@ def main() -> int:
 
     zones = load_zones(Path(arguments.config), arguments.zones)
     engine = DetectionEngine(arguments.weights, zones, arguments.device)
+    # 标签写哪一版由这个开关决定（设置页里有同一项，见 DetectionEngine._box_label）。
+    engine.show_detection_details = arguments.details
     annotated, sessions = annotate_frame(engine, frame, zones, warmup_frames=warmup)
 
     Path(arguments.out).parent.mkdir(parents=True, exist_ok=True)

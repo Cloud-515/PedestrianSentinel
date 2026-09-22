@@ -281,6 +281,78 @@ class MainWindowRetentionTests(unittest.TestCase):
         self.assertTrue(self.window._usage_timer.isActive())
 
 
+class RecordingDetailsWorker(QObject):
+    """只记 ``set_show_details`` 的假检测线程（主窗口对它只做这两件事）。"""
+
+    def __init__(self, running: bool = True) -> None:
+        super().__init__()
+        self._running = running
+        self.details: list[bool] = []
+
+    def isRunning(self) -> bool:
+        return self._running
+
+    def set_show_details(self, value: bool) -> None:
+        self.details.append(value)
+
+
+class MainWindowLabelDetailTests(unittest.TestCase):
+    """设置页里的「显示目标编号与置信度」。
+
+    这一项和别的设置不同：它只改画面上那行字，没有理由等下一次启动 —— 勾上就该马上
+    看到效果，否则用户会以为开关坏了。所以除了「存得住」，还要验「推给了正在跑的检测」。
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.base = Path(temporary.name)
+        for name, path in (
+            ("CONFIG_PATH", self.base / "config.json"),
+            ("EVENTS_DIR", self.base / "events"),
+            ("PROFILES_DIR", self.base / "profiles"),
+        ):
+            patcher = patch.object(main_window, name, path)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.window = MainWindow()
+
+    def test_the_switch_is_off_on_a_fresh_install(self) -> None:
+        self.assertFalse(self.window.settings_panel.details_cb.isChecked())
+
+    def test_turning_it_on_is_written_to_the_config_file(self) -> None:
+        self.window.settings_panel.details_cb.setChecked(True)
+        self.window._save_config()
+
+        saved = json.loads((self.base / "config.json").read_text(encoding="utf-8"))
+        self.assertTrue(saved["show_detection_details"])
+
+        reopened = MainWindow()
+        self.assertTrue(reopened.settings_panel.details_cb.isChecked())
+
+    def test_turning_it_on_reaches_the_running_detection(self) -> None:
+        worker = RecordingDetailsWorker()
+        self.window.worker = worker
+
+        self.window.settings_panel.details_cb.setChecked(True)
+
+        self.assertEqual(worker.details, [True], "运行中的检测没收到这个开关")
+        self.assertTrue(self.window.config.show_detection_details)
+
+    def test_a_stopped_detection_is_not_touched_but_the_config_still_saves(self) -> None:
+        worker = RecordingDetailsWorker(running=False)
+        self.window.worker = worker
+
+        self.window.settings_panel.details_cb.setChecked(True)
+
+        self.assertEqual(worker.details, [], "没在跑的线程不该收到调用")
+        self.assertTrue(self.window.config.show_detection_details)
+
+
 class MainWindowAlarmHistoryTests(unittest.TestCase):
     """「查看记录」按钮要把主窗口的记录库交给查看器，而不是自己弹一张空表。"""
 

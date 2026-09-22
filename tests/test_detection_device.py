@@ -153,7 +153,7 @@ class DetectionDeviceTests(unittest.TestCase):
             frame = np.zeros((16, 16, 3), dtype=np.uint8)
             engine.process(frame, 0.0, "test.mp4")
 
-        yolo_factory.assert_called_once_with("model.pt")
+        yolo_factory.assert_called_once_with("model.pt", task="detect")
         model.assert_called_once_with(
             frame,
             classes=[0],
@@ -161,6 +161,24 @@ class DetectionDeviceTests(unittest.TestCase):
             device="cuda:1",
             conf=DetectionEngine.DETECTION_CONFIDENCE,
         )
+
+    def test_the_model_task_is_declared_instead_of_guessed(self) -> None:
+        """显式声明 task='detect'：ultralytics 只会**按文件名**猜任务。
+
+        低功耗那个模型是个目录 ``yolo11n_int8_openvino_model``，名字里没有 "detect"、
+        也没有 "-seg" 之类的字样，所以它猜不出来，在控制台打一条
+        「Unable to automatically guess model task」的 WARNING。它假设的 detect 恰好
+        是对的（`metadata.yaml` 里就写着 task: detect），所以这条警告**不影响功能** ——
+        但它看着像程序坏了，而现场排查的人得先花时间解释一遍。本程序只做行人检测框，
+        声明比让库猜更准确。
+        """
+        with (
+            patch("detection_engine.YOLO") as yolo_factory,
+            patch.object(DetectionEngine, "_new_tracker", return_value=Mock()),
+        ):
+            DetectionEngine("models/yolo11n_int8_openvino_model", [], "cpu")
+
+        self.assertEqual(yolo_factory.call_args.kwargs.get("task"), "detect")
 
     def test_process_can_skip_rendering_for_benchmarking(self) -> None:
         model = Mock(return_value=[object()])
@@ -430,11 +448,12 @@ class DetectionDeviceTests(unittest.TestCase):
         self.assertEqual(transitions[1].event.alarm_at_seconds, 2.0)
         self.assertEqual(transitions[-1].event.duration_seconds, 7.5)
 
-    def test_format_elapsed_uses_seconds_and_milliseconds(self) -> None:
-        self.assertEqual(DetectionEngine._format_elapsed(0), "0.000s")
-        self.assertEqual(DetectionEngine._format_elapsed(5.237), "5.237s")
-        self.assertEqual(DetectionEngine._format_elapsed(61.9), "61.900s")
-        self.assertEqual(DetectionEngine._format_elapsed(-1), "0.000s")
+    def test_format_dwell_uses_seconds_with_one_decimal(self) -> None:
+        """画在框上的秒数只到 0.1 秒：它是给人瞄一眼的，不是存档。"""
+        self.assertEqual(DetectionEngine._format_dwell(0), "0.0秒")
+        self.assertEqual(DetectionEngine._format_dwell(5.237), "5.2秒")
+        self.assertEqual(DetectionEngine._format_dwell(61.94), "61.9秒")
+        self.assertEqual(DetectionEngine._format_dwell(-1), "0.0秒")
 
     def test_process_displays_elapsed_time_and_restarts_after_exit(self) -> None:
         model = Mock(return_value=[object()])
@@ -464,8 +483,10 @@ class DetectionDeviceTests(unittest.TestCase):
             self.assertEqual(engine.entry_times, {})
             engine.process(frame, 20.0, "test.mp4")
 
-        labels = [call.args[1] for call in put_text.call_args_list if call.args[1].startswith("ID:")]
-        self.assertEqual(labels, ["ID:1 IN ZONE 0.000s", "ID:1 IN ZONE 0.000s"])
+        labels = [
+            call.args[1] for call in put_text.call_args_list if "区域内" in call.args[1]
+        ]
+        self.assertEqual(labels, ["目标1 区域内 0.0秒", "目标1 区域内 0.0秒"])
 
     def test_process_uses_longest_elapsed_time_for_overlapping_zones(self) -> None:
         model = Mock(return_value=[object()])
@@ -504,8 +525,10 @@ class DetectionDeviceTests(unittest.TestCase):
             engine.process(frame, 15.0, "test.mp4")
 
         self.assertEqual(set(engine.entry_times), {("区域A", 1), ("区域B", 1)})
-        labels = [call.args[1] for call in put_text.call_args_list if call.args[1].startswith("ID:")]
-        self.assertEqual(labels[-1], "ID:1 IN ZONE 5.000s")
+        labels = [
+            call.args[1] for call in put_text.call_args_list if "区域内" in call.args[1]
+        ]
+        self.assertEqual(labels[-1], "目标1 区域内 5.0秒")
         self.assertEqual(len(labels), 2)
 
 

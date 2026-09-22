@@ -438,6 +438,7 @@ class SettingsPanel(QGroupBox):
     prune_requested = Signal()
     notification_changed = Signal()
     notification_test_requested = Signal()
+    details_changed = Signal(bool)
 
     def __init__(self) -> None:
         super().__init__("设置")
@@ -452,9 +453,18 @@ class SettingsPanel(QGroupBox):
             "区域内的人反而检得更可靠（同样的输入像素全花在要害处），"
             "代价是区域外的行人不再画框。"
         )
+        self.details_cb = QCheckBox("显示目标编号与置信度")
+        self.details_cb.setToolTip(
+            "默认关闭：画面上只写给人看的三句话 ——「行人」「区域内 1.5秒」「闯入 2.0秒」，\n"
+            "看画面的人只需要判断是不是人、进没进区域、待了多久。\n"
+            "勾选后每行带上目标编号与置信度（例如「目标9 0.86 区内1.5秒」），"
+            "排查「为什么老误报」时用得上：\n"
+            "编号能和报警记录对上号，置信度低于 0.4 的框还会画得又细又暗，那些基本是误检。"
+        )
         layout.addWidget(self.video_radio)
         layout.addWidget(self.monitor_radio)
         layout.addWidget(self.cpu_low_power_cb)
+        layout.addWidget(self.details_cb)
         layout.addWidget(self._build_retention_box())
         layout.addWidget(self._build_notification_box())
         layout.addStretch()
@@ -462,6 +472,7 @@ class SettingsPanel(QGroupBox):
         layout.addWidget(self.back_btn)
         self.video_radio.toggled.connect(self._emit_mode)
         self.cpu_low_power_cb.toggled.connect(self.cpu_low_power_changed)
+        self.details_cb.toggled.connect(self.details_changed)
 
     def field_bindings(self) -> list[FieldBinding]:
         """本面板里那些「纯粹的设置项」的绑定表。
@@ -471,6 +482,7 @@ class SettingsPanel(QGroupBox):
         """
         return [
             checkbox_field("cpu_low_power_preset", self.cpu_low_power_cb),
+            checkbox_field("show_detection_details", self.details_cb),
             checkbox_field("screenshot_retention_enabled", self.retention_enabled_cb),
             spinbox_field("screenshot_retention_days", self.retention_days_spin),
             spinbox_field("screenshot_retention_mb", self.retention_mb_spin),
@@ -2174,6 +2186,7 @@ class MainWindow(QMainWindow):
         )
         self.settings_panel.mode_changed.connect(self._apply_operation_mode)
         self.settings_panel.cpu_low_power_changed.connect(self._on_setting_changed)
+        self.settings_panel.details_changed.connect(self._on_details_changed)
         self.settings_panel.retention_changed.connect(self._on_retention_changed)
         self.settings_panel.notification_changed.connect(self._on_setting_changed)
         self.settings_panel.prune_requested.connect(self._prune_now)
@@ -2593,6 +2606,17 @@ class MainWindow(QMainWindow):
         self._refresh_notification_status()
         self._schedule_config_save()
 
+    def _on_details_changed(self, enabled: bool) -> None:
+        """「显示目标编号与置信度」变了：存进配置，并**立刻**作用到正在跑的检测上。
+
+        这一项和别的设置不同，它只改画面上那行字，没有任何理由等下一次启动 —— 用户
+        勾上就是要马上看到效果，否则会以为开关坏了。其余设置（低功耗、设备）要等下次
+        启动，是因为它们决定了推理组件怎么加载。
+        """
+        self._on_setting_changed()
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.set_show_details(enabled)
+
     def _on_retention_changed(self, *ignored: object) -> None:
         """留存设置变了：同步配置，并重新统计占用。
 
@@ -2844,6 +2868,7 @@ class MainWindow(QMainWindow):
             zones=self.zones,
             event_store=self.event_store,
             policy=resolution.policy,
+            show_details=self.config.show_detection_details,
             parent=self,
         )
         self._connect_worker(self.worker)

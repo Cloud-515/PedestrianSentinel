@@ -52,6 +52,7 @@ class DetectionWorker(QThread):
         zones: list[ZoneDefinition],
         event_store: EventStore,
         policy: InferencePolicy | None = None,
+        show_details: bool = False,
         parent: Optional[object] = None,
     ) -> None:
         super().__init__(parent)
@@ -65,6 +66,8 @@ class DetectionWorker(QThread):
         self._stop_event = threading.Event()
         self._step_event = threading.Event()
         self._control_lock = threading.Lock()
+        # 画面上的标签要不要带目标编号与置信度（见 DetectionEngine._box_label）。
+        self._show_details = show_details
         # 「上一帧界面还没画完」的标志。跨线程信号是排队投递的，Qt 既不合并也不
         # 丢弃，所以界面跟不上时必须由发送端自己丢帧，否则队列会无上限增长。
         self._frame_pending = threading.Event()
@@ -134,6 +137,11 @@ class DetectionWorker(QThread):
         with self._control_lock:
             self._zones = [ZoneDefinition.from_dict(zone.to_dict()) for zone in zones]
 
+    def set_show_details(self, show_details: bool) -> None:
+        """画面标签要不要带目标编号与置信度。运行中改也立刻生效（下一帧就用新写法）。"""
+        with self._control_lock:
+            self._show_details = show_details
+
     def run(self) -> None:
         source = VideoSource(self.spec)
         self._step_event = threading.Event()
@@ -144,18 +152,25 @@ class DetectionWorker(QThread):
         self.status_changed.emit(f"正在加载模型，推理设备: {self.device}")
         reconnect_attempts = 0
         last_zones = list(self._zones)
+        last_show_details = self._show_details
         failed = False
         last_video_time: float | None = None
 
         try:
             engine = (
-                DetectionEngine(self.model_path, self._zones, self.device)
+                DetectionEngine(
+                    self.model_path,
+                    self._zones,
+                    self.device,
+                    show_detection_details=self._show_details,
+                )
                 if self.policy is None
                 else DetectionEngine(
                     self.model_path,
                     self._zones,
                     self.device,
                     self.policy,
+                    show_detection_details=self._show_details,
                 )
             )
             mode_label = self.policy.label if self.policy is not None else "标准模式"
@@ -166,9 +181,14 @@ class DetectionWorker(QThread):
                     loop_playback = self._loop_playback
                     speed = self._speed
                     zones = list(self._zones)
+                    show_details = self._show_details
                 if zones != last_zones:
                     engine.update_zones(zones)
                     last_zones = zones
+                if show_details != last_show_details:
+                    # 标签写法变了：不用重启检测，下一帧就用新写法画。
+                    engine.show_detection_details = show_details
+                    last_show_details = show_details
                 if paused and not self._step_event.is_set():
                     self.msleep(30)
                     continue

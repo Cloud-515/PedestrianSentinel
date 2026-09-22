@@ -152,7 +152,9 @@ class WorkerDeviceTests(unittest.TestCase):
         ):
             worker.run()
 
-        engine_factory.assert_called_once_with("model.pt", [], "cuda:0")
+        engine_factory.assert_called_once_with(
+            "model.pt", [], "cuda:0", show_detection_details=False
+        )
         self.assertTrue(FakeVideoSource.last_instance.closed)
         self.assertTrue(statuses[-1].startswith("检测错误:"))
         self.assertNotIn("检测已停止", statuses[-1])
@@ -186,7 +188,9 @@ class WorkerDeviceTests(unittest.TestCase):
         ):
             worker.run()
 
-        engine_factory.assert_called_once_with("model_openvino", [], "cpu", policy)
+        engine_factory.assert_called_once_with(
+            "model_openvino", [], "cpu", policy, show_detection_details=False
+        )
         self.assertTrue(statuses[-1].startswith("检测错误:"))
 
     def test_disarmed_worker_keeps_preview_without_detection_side_effects(self) -> None:

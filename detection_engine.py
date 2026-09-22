@@ -33,15 +33,26 @@ class DetectionEngine:
         zones: list[ZoneDefinition],
         device: str,
         policy: InferencePolicy | None = None,
+        show_detection_details: bool = False,
     ) -> None:
         self.policy = policy or InferencePolicy(model_path=model_path, device=device)
+        # 画面上的标签要不要带上目标编号与置信度。默认不带 —— 见 _box_label。
+        # 这个属性可以在运行中改（检测线程每帧都会读它），所以设置页勾上就立刻生效。
+        self.show_detection_details = show_detection_details
         logger.info(
             "Loading model: %s on device: %s (%s)",
             self.policy.model_path,
             self.policy.device,
             self.policy.label,
         )
-        self.model = YOLO(self.policy.model_path)
+        # task 必须显式声明。不声明时 ultralytics 会**按文件名猜**任务
+        # （见 nn/tasks.py 的 guess_model_task），而低功耗那个模型是个目录
+        # `yolo11n_int8_openvino_model` —— 名字里既没有 "detect" 也没有 "-seg" 之类
+        # 的字样，于是它猜不出来，在控制台打一条 "Unable to automatically guess model
+        # task" 的 WARNING。那条警告本身无害（它假设的 detect 恰好是对的），但它看着
+        # 像程序出了问题，而现场排查的人得先花时间解释一遍。本程序只做行人检测框，
+        # 声明 detect 比让库去猜更准确。
+        self.model = YOLO(self.policy.model_path, task="detect")
         self.device = self.policy.device
         self.tracker = self._new_tracker()
         self.zones = [ZoneDefinition.from_dict(zone.to_dict()) for zone in zones]
@@ -376,6 +387,13 @@ class DetectionEngine:
                 in_zone_ids,
                 in_zone_elapsed_seconds,
                 confidences=display_confidences,
+                # 「闯入」= 这个目标的会话已经真的报过警（响过铃、写过记录）。这是操作员
+                # 最需要一眼看出的分界，所以由引擎从会话状态里取，而不是让标注去猜。
+                alarmed_ids={
+                    track_id
+                    for (_, track_id), session in self.active_sessions.items()
+                    if session.event.alarmed
+                },
             )
         else:
             annotated = frame
@@ -528,10 +546,14 @@ class DetectionEngine:
                 self._last_confidence.pop(track_id, None)
 
     @staticmethod
-    def _format_elapsed(seconds: float) -> str:
-        total_milliseconds = max(0, int(seconds * 1000))
-        whole_seconds, milliseconds = divmod(total_milliseconds, 1000)
-        return f"{whole_seconds}.{milliseconds:03d}s"
+    def _format_dwell(seconds: float) -> str:
+        """区域内已经待了多久：``1.5秒``。
+
+        只到 0.1 秒。报警记录里的时长是三位小数 —— 那是存档，要能跟取证截图对上；而
+        画在框上的数字是给人瞄一眼的，小数点后三位在活动画面上根本来不及看，只是让
+        标签更长、更容易和别人的撞上。
+        """
+        return f"{max(0.0, seconds):.1f}秒"
 
     @staticmethod
     def _contains(zone: ZoneDefinition, point: tuple[float, float]) -> bool:
@@ -546,6 +568,7 @@ class DetectionEngine:
         in_zone_elapsed_seconds: dict[Hashable, float],
         *,
         confidences: list[float | None] | None = None,
+        alarmed_ids: set[Hashable] | None = None,
     ) -> np.ndarray:
         """按「地面 → 行人 → 信息」的层次画这一帧。
 
@@ -567,6 +590,13 @@ class DetectionEngine:
         也正因如此，这里**不再按帧区分「预测 / 检出」的画法**：那种样式会在 4 帧里
         闪 3 次，而它想表达的信息（这一帧是否真检出）对看画面的人没什么用 —— 判断
         真假靠的是分数高低，判断该不该报警的活儿在会话逻辑里。
+
+        标签是**先全部排好版、再一起画**的（``_layout_labels``）：一行字挨着一行字时，
+        按框的顺序各自往自己框上一贴，几行字就会叠成一团黑。先算位置才能让它们互相
+        让开，而只有先知道所有标签的尺寸才谈得上让位。
+
+        标签写什么由 ``show_detection_details`` 决定（见 ``_box_label``）：默认只写
+        给人看的那三种状态，打开开关才带上目标编号与置信度。
         """
         annotated = frame.copy()
         track_ids = self._track_ids(detections)
@@ -579,14 +609,23 @@ class DetectionEngine:
         self._draw_ground_zones(annotated, in_zone_ids)
         self._restore_people(annotated, frame, boxes)
 
+        # 区域名先画、并占住自己的位置：它是画面里固定的地标，而框标签是每帧都在动的
+        # 东西 —— 让动的躲开静的，反过来做的话名字会被来回路过的人反复盖住。
+        occupied: list[tuple[int, int, int, int]] = []
         for zone in self.zones:
             if len(zone.polygon) >= 2:
                 # 区域名属于信息层，画在遮挡之后 —— 画在前面的话，路过的人会把名字
                 # 擦掉一块，看着像渲染出错。
-                self._draw_zone_name(
+                rect = self._draw_zone_name(
                     annotated, zone, np.asarray(zone.polygon, dtype=np.float32)
                 )
+                if rect is not None:
+                    occupied.append(rect)
 
+        scale = self._label_scale(annotated.shape[0])
+        labels: list[
+            tuple[tuple[int, int, int, int], str, tuple[int, int], tuple[int, int, int]]
+        ] = []
         for index, (x1, y1, x2, y2) in enumerate(boxes):
             track_id = track_ids[index] if index < len(track_ids) else None
             confidence = confidences[index] if index < len(confidences) else None
@@ -602,21 +641,27 @@ class DetectionEngine:
                 cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 1)
             else:
                 cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
-            label = self._box_label(
+            text = self._box_label(
                 track_id,
                 confidence,
                 in_zone_elapsed_seconds.get(track_id) if inside else None,
+                alarmed=track_id in (alarmed_ids or ()),
+                show_details=self.show_detection_details,
             )
-            cv2.putText(
-                annotated,
-                label,
-                (x1, max(20, y1 - 8)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                color,
-                2,
-                cv2.LINE_AA,
-            )
+            labels.append(((x1, y1, x2, y2), text, self._label_plate_size(text, scale), color))
+
+        # 大的框（离相机近的人）先选位置：一个近处的人被挤掉标签，比远处的人被挤更难看。
+        labels.sort(
+            key=lambda item: (item[0][2] - item[0][0]) * (item[0][3] - item[0][1]),
+            reverse=True,
+        )
+        placements = self._layout_labels(
+            [(box, size) for box, _, size, _ in labels],
+            (annotated.shape[1], annotated.shape[0]),
+            occupied,
+        )
+        for (_, text, _, color), rect in zip(labels, placements):
+            self._draw_label(annotated, text, rect, color, scale)
         return annotated
 
     @staticmethod
@@ -624,20 +669,215 @@ class DetectionEngine:
         track_id: Hashable | None,
         confidence: float | None,
         in_zone_seconds: float | None,
+        *,
+        alarmed: bool = False,
+        show_details: bool = False,
     ) -> str:
-        """框上那行字：``ID:9 0.86 IN ZONE 1.500s``。
+        """框上那行字。默认是给**看画面的人**看的：``行人``／``目标9 区域内 1.5秒``／``目标9 闯入 2.0秒``。
 
-        置信度写在标签里是这套标注的信息核心：它直接说明模型对这张框有多确定
-        （0.9 是真的人，0.15 是在猜），弱框因此凭数字就能认出来。只有连"最后一次
-        真实检出"都没有（追踪器给了 ID 却从没被推理见过，正常路径下不会出现）时才
-        没有数字。
+        看画面的人要判断的只有三件事 —— 是不是人、进没进警戒区、待了多久（该不该
+        抬头看一眼）。置信度回答不了其中任何一个，所以默认不显示。
+
+        三种状态的差别就是操作员要不要管：
+
+        * ``行人``：在区域外，只是画面里的一个人；
+        * ``目标9 区域内 1.5秒``：进了警戒区、还在计时，没到停留阈值（还没响过铃）；
+        * ``目标9 闯入 2.0秒``：已经越过阈值、**真的报过警**（响铃 + 写记录 + 存取证截图）。
+
+        **进了区域就带上编号**：报警记录里写的是「目标 9」，取证截图上如果同时有几个人
+        在区域内，只有编号能说明哪一行字对应记录里的那个目标 —— 没有编号的框（追踪器
+        还没认下来的）本来就不会被判进区域，所以区域内的编号一定拿得到。
+
+        ``show_details``（设置页里的「显示目标编号与置信度」）打开后回到工程视角：
+        ``目标9 0.86 区内1.5秒``。排查「为什么老误报」时要的就是这几个数 —— 编号能
+        和报警记录对上，而置信度直接说明模型有多确定（低于 0.4 的框还会画得又细又暗）。
         """
-        label = f"ID:{track_id}" if track_id is not None else "Person"
+        if not show_details:
+            if in_zone_seconds is None or track_id is None:
+                return "行人"
+            state = "闯入" if alarmed else "区域内"
+            return f"目标{track_id} {state} {DetectionEngine._format_dwell(in_zone_seconds)}"
+        label = f"目标{track_id}" if track_id is not None else "人物"
         if confidence is not None:
             label += f" {confidence:.2f}"
         if in_zone_seconds is not None:
-            label += f" IN ZONE {DetectionEngine._format_elapsed(in_zone_seconds)}"
+            label += f" 区内{DetectionEngine._format_dwell(in_zone_seconds)}"
         return label
+
+    # 标签的画法。这几条都是为了"一眼看清"，不是装饰：
+    #
+    # * **中文靠 cv2 内置的 Unicode 字体**（opencv 5.0 的 `Built-in Unicode font: YES`）。
+    #   原来的 Hershey 字体只有 ASCII，所以标签只能是英文；换成中文不需要字体文件、
+    #   PIL 或新依赖。**降级 opencv 之前先确认这一条**（降下去中文会变成乱码方块），
+    #   tests/test_label_overlay.py 里有测试钉住它。
+    # * **字号跟着画面高度走**：标注是烧进原始分辨率的帧里的，1080p 上 0.55 的话，画面
+    #   一缩小到窗口里这行字就只有几个像素高。按帧高算，换个分辨率看到的字一样大。
+    # * **文字垫一块深色底**：标签会落在沥青、地砖、人身上，只靠字的颜色总有一半场合
+    #   读不出来（区域名用黑描边解决同一件事，这里用的是垫底）。
+    # * **相互不重叠**：见 _layout_labels。
+    LABEL_FONT = cv2.FONT_HERSHEY_SIMPLEX
+    LABEL_THICKNESS = 2
+    LABEL_PADDING_X = 5
+    LABEL_PADDING_Y = 3
+    # 标签与它所属的框之间的间距，也是让位时一步的高度增量。
+    LABEL_GAP = 4
+    # 两个标签之间至少留出的空隙。
+    LABEL_MARGIN = 2
+    # 上下让位最多走几步；再多说明这块地方实在挤不下，接受重叠比让标签飞远更可读。
+    LABEL_MAX_STEPS = 8
+    LABEL_PLATE_ALPHA = 0.62
+    LABEL_MIN_SCALE = 0.55
+    LABEL_MAX_SCALE = 1.0
+    # 字号 = 帧高 / 这个数（夹在 MIN/MAX 之间）。1080p 上是 0.9，720p 上是 0.6。
+    LABEL_SCALE_REFERENCE_HEIGHT = 1200
+    # 区域名比框标签小一点、也固定不缩放：它是画面里的地标，不该跟人争注意力。
+    ZONE_NAME_SCALE = 0.65
+    # 区域名在顶点上方留出的距离。
+    ZONE_NAME_GAP = 8
+
+    @classmethod
+    def _label_scale(cls, frame_height: int) -> float:
+        scale = frame_height / cls.LABEL_SCALE_REFERENCE_HEIGHT
+        return min(cls.LABEL_MAX_SCALE, max(cls.LABEL_MIN_SCALE, scale))
+
+    @classmethod
+    def _label_plate_size(cls, text: str, scale: float) -> tuple[int, int]:
+        """标签垫底块的尺寸（已经含内边距）。
+
+        文字画在 ``(x + LABEL_PADDING_X, y + LABEL_PADDING_Y + 字身高)`` —— cv2 的
+        y 是**基线**，不是上边，所以基线要往下让出字身高，否则字会飘到垫底块外面。
+        """
+        (text_width, text_height), baseline = cv2.getTextSize(
+            text, cls.LABEL_FONT, scale, cls.LABEL_THICKNESS
+        )
+        return (
+            text_width + 2 * cls.LABEL_PADDING_X,
+            text_height + baseline + 2 * cls.LABEL_PADDING_Y,
+        )
+
+    @staticmethod
+    def _rects_overlap(
+        first: tuple[int, int, int, int],
+        second: tuple[int, int, int, int],
+        margin: int = 0,
+    ) -> bool:
+        """两个矩形是否相交（``margin`` 是要求的最小间隔）。"""
+        first_x, first_y, first_width, first_height = first
+        second_x, second_y, second_width, second_height = second
+        return (
+            first_x - margin < second_x + second_width
+            and second_x - margin < first_x + first_width
+            and first_y - margin < second_y + second_height
+            and second_y - margin < first_y + first_height
+        )
+
+    @classmethod
+    def _collisions(
+        cls,
+        rect: tuple[int, int, int, int],
+        taken: list[tuple[int, int, int, int]],
+    ) -> int:
+        """这块地方压住了几个已经放好的标签（0 = 完全空着）。"""
+        return sum(1 for other in taken if cls._rects_overlap(rect, other, cls.LABEL_MARGIN))
+
+    @classmethod
+    def _layout_labels(
+        cls,
+        entries: list[tuple[tuple[int, int, int, int], tuple[int, int]]],
+        frame_size: tuple[int, int],
+        occupied: list[tuple[int, int, int, int]] | None = None,
+    ) -> list[tuple[int, int, int, int]]:
+        """给每个标签找一块地方，返回各自的垫底矩形（左上角 + 宽高），顺序与入参一致。
+
+        ``entries`` 是 ``(框, 标签尺寸)``；``occupied`` 是**先到先得**的既有矩形（区域名
+        就是按这个先占住的 —— 名字被框标签盖住一次，那个区域在哪就说不清了）。
+
+        位置优先「框正上方」（那里最空），其次框内上沿、框内下沿、框正下方；四处都撞上
+        别人时，就在框上方那条线上**上下交替让位**，一步一个行高。
+
+        让位只动纵向、横向一律不挪：标签横向离开自己的框以后，看的人就得猜这行字是谁
+        的，那是比重叠更糟的事。最坏情况（画面里挤了太多人）会放弃让位、接受重叠 ——
+        信息少一行也比让某个人完全没有标签强，但即便如此也要挑**压到别人最少**的那个
+        位置，而不是所有人叠在同一处。
+        """
+        frame_width, frame_height = frame_size
+        taken = list(occupied or [])
+        placements: list[tuple[int, int, int, int]] = []
+
+        for box, (label_width, label_height) in entries:
+            x1, y1, _, y2 = box
+            x = min(max(0, x1), max(0, frame_width - label_width))
+            step = label_height + cls.LABEL_GAP
+
+            def clamp_y(value: int) -> int:
+                return min(max(0, value), max(0, frame_height - label_height))
+
+            base = clamp_y(y1 - cls.LABEL_GAP - label_height)
+            wanted = [
+                base,
+                clamp_y(y1 + cls.LABEL_GAP),
+                clamp_y(y2 - label_height - cls.LABEL_GAP),
+                clamp_y(y2 + cls.LABEL_GAP),
+            ]
+            # 让位：从首选位置上下交替走，越走越远。
+            for hop in range(1, cls.LABEL_MAX_STEPS + 1):
+                wanted.append(clamp_y(base - hop * step))
+                wanted.append(clamp_y(base + hop * step))
+            candidates: list[int] = []
+            for y in wanted:
+                if y not in candidates:
+                    candidates.append(y)
+
+            def rect_at(y: int) -> tuple[int, int, int, int]:
+                return (x, y, label_width, label_height)
+
+            placed: int | None = None
+            for y in candidates:
+                if cls._collisions(rect_at(y), taken) == 0:
+                    placed = y
+                    break
+            if placed is None:
+                # 一个空位都没有：挑压得最少的，同样少时挑离首选位置最近的 ——
+                # 重叠已经不可避免，至少别让所有标签叠在同一处。
+                placed = min(
+                    candidates,
+                    key=lambda y: (cls._collisions(rect_at(y), taken), abs(y - base)),
+                )
+            rect = rect_at(placed)
+            taken.append(rect)
+            placements.append(rect)
+        return placements
+
+    @classmethod
+    def _draw_label(
+        cls,
+        annotated: np.ndarray,
+        text: str,
+        rect: tuple[int, int, int, int],
+        color: tuple[int, int, int],
+        scale: float,
+    ) -> None:
+        """画一块垫底 + 一行标签。rect 由 _layout_labels 定好，这里只管画。"""
+        x, y, width, height = rect
+        region = annotated[y : y + height, x : x + width]
+        if region.size:
+            plate = np.zeros_like(region)
+            cv2.addWeighted(
+                plate, cls.LABEL_PLATE_ALPHA, region, 1.0 - cls.LABEL_PLATE_ALPHA, 0, region
+            )
+        (_, text_height), _ = cv2.getTextSize(
+            text, cls.LABEL_FONT, scale, cls.LABEL_THICKNESS
+        )
+        cv2.putText(
+            annotated,
+            text,
+            (x + cls.LABEL_PADDING_X, y + cls.LABEL_PADDING_Y + text_height),
+            cls.LABEL_FONT,
+            scale,
+            color,
+            cls.LABEL_THICKNESS,
+            cv2.LINE_AA,
+        )
 
     # 贴地渲染的参数。
     #
@@ -769,24 +1009,31 @@ class DetectionEngine:
         annotated: np.ndarray,
         zone: ZoneDefinition,
         polygon: np.ndarray,
-    ) -> None:
+    ) -> tuple[int, int, int, int] | None:
+        """画区域名，并返回它占住的矩形（框标签据此让位）。
+
+        名字用的是和框标签同一套画法（深色垫底 + 区域色文字），不是原来那种「黑描边 +
+        彩色字」：名字落在自己区域的贴地面和边带上 —— 红色区域里一个红描黑边的名字，
+        实地看就是一团红，而垫底在任何背景上都一样清楚。
+        """
+        if not zone.name:
+            return None
         height, width = annotated.shape[:2]
-        # 顶点可能在画面外（区域允许拖出边缘），名字要夹回画面内，否则整行字都看不见。
-        x = min(max(4, int(polygon[0][0])), max(4, width - 8))
-        y = min(max(18, int(polygon[0][1]) - 8), max(18, height - 6))
-        # 先画一遍深色粗体当描边：名字会落在各种背景上（深色沥青、浅色地砖），
-        # 只有一种颜色时总有一半场合看不清。
-        for color, thickness in (((0, 0, 0), 4), (self._bgr(zone.color), 2)):
-            cv2.putText(
-                annotated,
-                zone.name,
-                (x, y),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
-                color,
-                thickness,
-                cv2.LINE_AA,
-            )
+        (text_width, text_height), baseline = cv2.getTextSize(
+            zone.name, self.LABEL_FONT, self.ZONE_NAME_SCALE, self.LABEL_THICKNESS
+        )
+        plate_width = text_width + 2 * self.LABEL_PADDING_X
+        plate_height = text_height + baseline + 2 * self.LABEL_PADDING_Y
+        # 名字挂在区域的第一个顶点上（略高一点）。顶点可能在画面外（区域允许拖出边缘），
+        # 所以整块垫底要夹回画面内，否则整行字都看不见。
+        x = min(max(0, int(polygon[0][0])), max(0, width - plate_width))
+        y = min(
+            max(0, int(polygon[0][1]) - self.ZONE_NAME_GAP - text_height - self.LABEL_PADDING_Y),
+            max(0, height - plate_height),
+        )
+        rect = (x, y, plate_width, plate_height)
+        self._draw_label(annotated, zone.name, rect, self._bgr(zone.color), self.ZONE_NAME_SCALE)
+        return rect
 
     def _restore_people(
         self,

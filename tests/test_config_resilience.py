@@ -251,6 +251,27 @@ class FieldCoercionTests(unittest.TestCase):
         restored = AppConfig.from_dict(config.to_dict())
         self.assertEqual(restored.history_column_widths, {"区域": 260, "记录时间": 180})
 
+    def test_detection_details_are_off_by_default_and_round_trip(self) -> None:
+        """画面上那行「目标编号 / 置信度」默认不显示。
+
+        默认开着的话，看画面的人第一眼看到的就是一串他不需要的数字（而且行更长、
+        更容易和别人的标签挤在一起）—— 那是工程视角，不是监控视角。
+        """
+        self.assertFalse(AppConfig.from_dict({}).show_detection_details)
+        self.assertFalse(AppConfig.from_dict(base_config()).show_detection_details)
+
+        config = AppConfig.from_dict({**base_config(), "show_detection_details": True})
+
+        self.assertTrue(config.show_detection_details)
+        self.assertTrue(AppConfig.from_dict(config.to_dict()).show_detection_details)
+
+    def test_a_broken_details_switch_falls_back_to_off(self) -> None:
+        config = AppConfig.from_dict(
+            {**base_config(), "show_detection_details": "是的"}
+        )
+
+        self.assertFalse(config.show_detection_details)
+
     def test_column_widths_are_dropped_one_by_one_when_broken(self) -> None:
         """这是程序自己写的界面状态，坏条目丢掉就行 —— 宽度随时还能拖回来。"""
         config = AppConfig.from_dict(
