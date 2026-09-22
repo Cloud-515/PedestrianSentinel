@@ -657,7 +657,7 @@ def main() -> int:
         return 1
 
     try:
-        from main_window import MainWindow
+        from main_window import MainWindow, install_shift_wheel_scroll
     except ModuleNotFoundError as error:
         print(
             f"缺少运行依赖 {error.name!r}。请运行: pip install -r requirements.txt",
@@ -667,6 +667,8 @@ def main() -> int:
 
     application = QApplication(sys.argv)
     application.setApplicationName("行人警戒区域监控")
+    # Shift+滚轮 → 横向滚动（Qt 部件默认没这条约定）。装在应用上就覆盖所有列表与表格。
+    install_shift_wheel_scroll(application)
     window = MainWindow()
     window.show()
     return application.exec()

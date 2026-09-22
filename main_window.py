@@ -8,16 +8,29 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
-from PySide6.QtCore import QModelIndex, QSize, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtCore import (
+    QEvent,
+    QModelIndex,
+    QObject,
+    QPoint,
+    QSize,
+    Qt,
+    QThread,
+    QTimer,
+    QUrl,
+    Signal,
+)
 from PySide6.QtGui import (
     QColor,
     QDesktopServices,
     QKeyEvent,
     QPixmap,
     QResizeEvent,
+    QWheelEvent,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QAbstractScrollArea,
     QApplication,
     QButtonGroup,
     QCheckBox,
@@ -40,6 +53,8 @@ from PySide6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QScrollArea,
+    QScroller,
+    QScrollerProperties,
     QSizePolicy,
     QSlider,
     QSpinBox,
@@ -105,6 +120,107 @@ APP_DIR = app_paths.APP_DIR
 CONFIG_PATH = app_paths.data("config.json")
 EVENTS_DIR = app_paths.data("events")
 PROFILES_DIR = app_paths.data("profiles")
+
+
+# ---------------------------------------------------------------------------
+# 输入方式：触摸滑动、Shift + 滚轮
+# ---------------------------------------------------------------------------
+
+def enable_touch_scrolling(*areas: QAbstractScrollArea) -> None:
+    """让这些区域可以用手指拖着滚（触摸屏、带触摸的工控一体机）。
+
+    Qt 的部件默认不认触摸拖动：手指按住一拖，事件落到控件上就变成鼠标拖动 —— 在表格里
+    是「选中了一行」，在滚动区里什么也不做（实测）。``QScroller`` 把**单指拖动**接管成
+    带惯性的滚动。
+
+    只抓 ``TouchGesture``，不抓 ``LeftMouseButtonGesture``：后者会让鼠标按住拖动也变成
+    滚动，那会破坏表格里拖选，更会破坏视频画面上按住拖动加点、拖顶点这些画区域的操作。
+    单指点一下（没有拖动）不会被接管，仍旧是普通的点击。
+    """
+    for area in areas:
+        viewport = area.viewport()
+        QScroller.grabGesture(viewport, QScroller.ScrollerGestureType.TouchGesture)
+        scroller = QScroller.scroller(viewport)
+        properties = scroller.scrollerProperties()
+        # 斜着拖的时候锁住先动的那个方向：不然表格会跟着左右晃，横向一格一格地跑。
+        properties.setScrollMetric(
+            QScrollerProperties.ScrollMetric.AxisLockThreshold, 0.2
+        )
+        scroller.setScrollerProperties(properties)
+
+
+class ShiftWheelScrollsSideways(QObject):
+    """按住 Shift 滚轮 → 横向滚动（Windows 上几乎所有列表/表格都是这个约定）。
+
+    Qt 的部件默认没有这条：实测 Shift+滚轮与普通滚轮一样只滚纵向。做法是把纵向的滚动量
+    搬成横向、去掉 Shift 再发给同一个控件，让 Qt 自己按它那套换算去滚 —— 这样手感与
+    普通滚轮一致，也自动兼顾了触摸板的像素级滚动。
+
+    没有横向可滚时**放行**，仍旧纵向滚：否则窗口够宽、列都放得下的时候，Shift+滚轮会
+    变成什么都不动。
+    """
+
+    def eventFilter(self, watched: object, event: QEvent) -> bool:
+        if event.type() != QEvent.Type.Wheel:
+            return False
+        if not event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+            return False
+        area = _enclosing_scroll_area(watched)
+        if area is None:
+            return False
+        bar = area.horizontalScrollBar()
+        if bar is None or bar.maximum() <= bar.minimum():
+            return False
+        sideways = _sideways_wheel(event)
+        if sideways is None:
+            return False
+        QApplication.sendEvent(watched, sideways)
+        return True
+
+
+def install_shift_wheel_scroll(application: QApplication) -> ShiftWheelScrollsSideways:
+    """装上 Shift+滚轮横向滚动（应用级，一次覆盖所有列表、表格与滚动区）。
+
+    返回过滤器本身：它挂在 application 名下（父子关系），不会被垃圾回收 —— 过滤器对象
+    一旦被回收，事件就再也不经过它，而且没有任何报错。
+    """
+    scroll_filter = ShiftWheelScrollsSideways(application)
+    application.installEventFilter(scroll_filter)
+    return scroll_filter
+
+
+def _enclosing_scroll_area(watched: object) -> QAbstractScrollArea | None:
+    """滚轮事件是发给内容控件（视口）的，往上找它属于哪个滚动区域。"""
+    if isinstance(watched, QAbstractScrollArea):
+        return watched
+    parent = watched.parent() if isinstance(watched, QObject) else None
+    while parent is not None:
+        if isinstance(parent, QAbstractScrollArea):
+            return parent
+        parent = parent.parent()
+    return None
+
+
+def _sideways_wheel(event: QWheelEvent) -> QWheelEvent | None:
+    """把纵向的滚动量搬到横向；没有量可搬时返回 None。"""
+    pixel = event.pixelDelta()
+    angle = event.angleDelta()
+    if pixel.y():
+        pixel = QPoint(pixel.y(), 0)
+    if angle.y():
+        angle = QPoint(angle.y(), 0)
+    if pixel.isNull() and angle.isNull():
+        return None
+    return QWheelEvent(
+        event.position(),
+        event.globalPosition(),
+        pixel,
+        angle,
+        event.buttons(),
+        Qt.KeyboardModifier.NoModifier,
+        event.phase(),
+        event.inverted(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -698,6 +814,9 @@ class ZonePanel(QGroupBox):
         hint.setStyleSheet("color: #7A8A99; font-size: 10px;")
         layout.addWidget(hint)
 
+        # 配置组与区域两个列表：触摸屏上用手指标着滚（列表长了才划得动）
+        enable_touch_scrolling(self.profile_list, self.zone_list)
+
         self._current_color = "#E53935"
 
     def _pick_color(self) -> None:
@@ -1268,6 +1387,8 @@ class AlarmHistoryDialog(QDialog):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self._build_list_side())
         splitter.addWidget(self._build_detail_side())
+        # 左边记录表、右边详情与取证图：触摸屏上都能用手指拖着滚
+        enable_touch_scrolling(self.table, self.details_scroll)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
         splitter.setSizes([int(self.width() * 0.6), int(self.width() * 0.4)])
@@ -1775,6 +1896,8 @@ class EventPanel(QGroupBox):
         self.table = QTableWidget(0, len(self.HEADERS))
         self._rows_by_session: dict[str, int] = {}
         _configure_event_table(self.table, self.HEADERS)
+        # 触摸屏上手指在表上直接拖着滚（面板这张表最长，手指划比重拖滚动条自然）
+        enable_touch_scrolling(self.table)
         # 面板只有四百来像素宽，装不下十一个按内容铺开的列，所以这里固定按内容铺满，
         # 让「退出时刻」吸收多余宽度（查看器那边才是可拖的）。
         header = self.table.horizontalHeader()
@@ -1928,14 +2051,16 @@ class MainWindow(QMainWindow):
         self.sidebar_pages.addWidget(home_content)
         self.sidebar_pages.addWidget(settings_content)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(self.sidebar_pages)
-        scroll.setMinimumWidth(420)
+        self.sidebar_scroll = QScrollArea()
+        self.sidebar_scroll.setWidgetResizable(True)
+        self.sidebar_scroll.setWidget(self.sidebar_pages)
+        self.sidebar_scroll.setMinimumWidth(420)
+        # 侧栏是最需要手指滑动的地方：面板竖着叠，窗口矮时要滚半天
+        enable_touch_scrolling(self.sidebar_scroll)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self.video_widget)
-        splitter.addWidget(scroll)
+        splitter.addWidget(self.sidebar_scroll)
         splitter.setStretchFactor(0, 4)
         splitter.setStretchFactor(1, 2)
         splitter.setSizes([850, 430])
@@ -2477,7 +2602,6 @@ class MainWindow(QMainWindow):
         del ignored
         self._on_setting_changed()
         self._usage_timer.start()
-
     def _log_effective_settings(self) -> None:
         """把这次真正生效的设置记进日志。
 
