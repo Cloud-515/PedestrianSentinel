@@ -376,6 +376,11 @@ class WriteAssetManifestTests(unittest.TestCase):
 
     def test_flag_is_handled_before_any_gui_starts(self) -> None:
         """现场跑这条命令时不该弹出窗口、也不该去 import PySide6。"""
+        # main() 会装一个「未捕获异常就弹窗」的 excepthook，那是**进程级**的全局状态：
+        # 不还原的话，后面任何一个在事件循环里抛异常的测试都会走进那个模态弹窗，
+        # 然后永远卡在那里（`test_touch_and_wheel` 就是这么挂住的 —— 栈里是
+        # main._hook → QMessageBox.exec() 被 processEvents 反复重入）。
+        self.addCleanup(setattr, sys, "excepthook", sys.excepthook)
         with (
             patch.object(sys, "argv", ["main.py", "--write-asset-manifest"]),
             contextlib.redirect_stdout(io.StringIO()),

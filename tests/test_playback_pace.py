@@ -15,18 +15,46 @@
 from __future__ import annotations
 
 import tempfile
-import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import cv2
 import numpy as np
 
+import video_source
 from video_source import VideoSource, VideoSourceSpec
 
 FPS = 30.0
 FRAMES = 90
 SIZE = (64, 48)
+
+
+class FakeClock:
+    """受控时钟，替换 video_source 眼里的 time 模块（只换它一个）。
+
+    「跟得上就不跳帧」原来靠**真实睡眠**来构造（每帧只花掉间隔的五分之一），但那是拿
+    操作系统的调度准时性做断言：机器一忙就会假失败（这台机器上实测闪过两次，一次看到
+    白跳了 4 帧）。改成自己推时钟 —— 同样测那段算术，但确定性、瞬间完成，也不再碰
+    真实的全局 time（只把 video_source.time 换掉，pytest 自己用的时钟不受影响）。
+    """
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def time(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        """``time.sleep`` 会让时钟前进，这里照做 —— 否则 pace() 里「等一下再对齐」那段
+        算术就复现不出来了（真实睡眠里时钟确实在走）。"""
+        self.now += max(0.0, seconds)
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
 
 
 def write_clip(directory: Path) -> Path:
@@ -65,24 +93,31 @@ class PlaybackPaceTests(unittest.TestCase):
         self.assertEqual(source.pace(), 0)
 
     def test_a_consumer_that_keeps_up_never_skips(self) -> None:
+        """消费者每帧只用掉间隔五分之一时，一帧都不该跳。"""
         source = self.source()
-        source.pace()
-        for _ in range(5):
-            ok, _, _ = source.read()
-            self.assertTrue(ok)
-            # 每帧只花掉间隔的五分之一，剩下的时间应当由 pace 睡掉。
-            time.sleep(1.0 / FPS / 5)
-            self.assertEqual(source.pace(), 0, "跟得上就不该跳帧")
+        clock = FakeClock()
+
+        with patch.object(video_source, "time", clock):
+            source.pace()  # 第一次只建立锚点
+            for _ in range(5):
+                ok, _, _ = source.read()
+                self.assertTrue(ok)
+                # 每帧只花掉间隔的五分之一，剩下的时间由 pace 睡掉（假时钟跟着走）。
+                clock.advance(1.0 / FPS / 5)
+                self.assertEqual(source.pace(), 0, "跟得上就不该跳帧")
 
     def test_a_slow_consumer_skips_ahead_to_keep_the_speed(self) -> None:
         """推理比帧间隔慢时：跳到「现在该到的位置」，播放速度不被拉慢。"""
         source = self.source()
-        source.pace()
-        ok, _, _ = source.read()
-        self.assertTrue(ok)
+        clock = FakeClock()
 
-        time.sleep(0.5)  # 模拟一帧推理花了半秒
-        skipped = source.pace()
+        with patch.object(video_source, "time", clock):
+            source.pace()
+            ok, _, _ = source.read()
+            self.assertTrue(ok)
+
+            clock.advance(0.5)  # 模拟一帧推理花了半秒
+            skipped = source.pace()
 
         # 半秒 = 15 帧 @30fps；容差与取整允许差一两帧。
         self.assertGreaterEqual(skipped, 13)
@@ -96,12 +131,15 @@ class PlaybackPaceTests(unittest.TestCase):
     def test_speed_multiplies_the_target_position(self) -> None:
         """2 倍速时，同样的墙钟应当推进两倍的视频位置。"""
         source = self.source(speed=2.0)
-        source.pace()
-        ok, _, _ = source.read()
-        self.assertTrue(ok)
+        clock = FakeClock()
 
-        time.sleep(0.25)
-        skipped = source.pace()
+        with patch.object(video_source, "time", clock):
+            source.pace()
+            ok, _, _ = source.read()
+            self.assertTrue(ok)
+
+            clock.advance(0.25)
+            skipped = source.pace()
 
         self.assertGreaterEqual(skipped, 12, "2 倍速下 0.25 秒应当跳掉约 15 帧")
         self.assertLessEqual(skipped, 18)
@@ -109,28 +147,34 @@ class PlaybackPaceTests(unittest.TestCase):
     def test_resuming_from_pause_does_not_jump_forward(self) -> None:
         """暂停期间墙钟还在走，恢复播放时不能把这段算成「落后」。"""
         source = self.source()
-        source.pace()
-        source.set_paused(True)
-        ok, _, _ = source.read()
-        self.assertFalse(ok, "暂停时读不到帧")
+        clock = FakeClock()
 
-        time.sleep(0.4)  # 暂停期间的发呆
-        source.set_paused(False)
+        with patch.object(video_source, "time", clock):
+            source.pace()
+            source.set_paused(True)
+            ok, _, _ = source.read()
+            self.assertFalse(ok, "暂停时读不到帧")
 
-        self.assertEqual(source.pace(), 0, "恢复播放的第一帧不该跳")
-        ok, _, _ = source.read()
-        self.assertTrue(ok)
+            clock.advance(0.4)  # 暂停期间的发呆
+            source.set_paused(False)
+
+            self.assertEqual(source.pace(), 0, "恢复播放的第一帧不该跳")
+            ok, _, _ = source.read()
+            self.assertTrue(ok)
 
     def test_changing_speed_does_not_jump_forward(self) -> None:
         source = self.source(speed=0.5)
-        source.pace()
-        ok, _, _ = source.read()
-        self.assertTrue(ok)
+        clock = FakeClock()
 
-        time.sleep(0.3)
-        source.spec.speed = 4.0  # 播放中就改了速度
+        with patch.object(video_source, "time", clock):
+            source.pace()
+            ok, _, _ = source.read()
+            self.assertTrue(ok)
 
-        self.assertEqual(source.pace(), 0, "改速度那一下只重新起算，不跳帧")
+            clock.advance(0.3)
+            source.spec.speed = 4.0  # 播放中就改了速度
+
+            self.assertEqual(source.pace(), 0, "改速度那一下只重新起算，不跳帧")
 
     def test_a_monitor_source_is_never_paced(self) -> None:
         """摄像头/流没有「位置」可对齐：pace 必须是空操作。"""
